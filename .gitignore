@@ -1,0 +1,6 @@
+__pycache__/
+.env
+output/
+CodeWalker-master/
+compiled_cw/
+webgl_viewer/assets/

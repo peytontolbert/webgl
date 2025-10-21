@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GTA5 Terrain Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+        }
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #controls {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 5px;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
+        .control-group {
+            margin: 10px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+        }
+        select, input {
+            width: 100%;
+            padding: 5px;
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas"></canvas>
+    <div id="controls">
+        <div class="control-group">
+            <label for="wireframe">Wireframe Mode</label>
+            <input type="checkbox" id="wireframe">
+        </div>
+        <div class="control-group">
+            <label for="textureQuality">Texture Quality</label>
+            <select id="textureQuality">
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label for="lodLevel">LOD Level</label>
+            <select id="lodLevel">
+                <option value="0">Full Detail</option>
+                <option value="1">Medium</option>
+                <option value="2">Low</option>
+            </select>
+        </div>
+    </div>
+    <script type="module" src="js/main.js"></script>
+</body>
+</html> 

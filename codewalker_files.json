@@ -1,0 +1,582 @@
+{
+    "CodeWalker.Core": {
+        "Utils": {
+            "files": [
+                {
+                    "name": "Xml.cs",
+                    "size": "19KB",
+                    "lines": 528
+                },
+                {
+                    "name": "Vectors.cs",
+                    "size": "13KB",
+                    "lines": 431
+                },
+                {
+                    "name": "Utils.cs",
+                    "size": "9.1KB",
+                    "lines": 310
+                },
+                {
+                    "name": "TriangleBVH.cs",
+                    "size": "6.8KB",
+                    "lines": 219
+                },
+                {
+                    "name": "Quaternions.cs",
+                    "size": "2.6KB",
+                    "lines": 86
+                },
+                {
+                    "name": "Matrices.cs",
+                    "size": "2.2KB",
+                    "lines": 57
+                },
+                {
+                    "name": "FbxConverter.cs",
+                    "size": "37KB",
+                    "lines": 994
+                },
+                {
+                    "name": "Fbx.cs",
+                    "size": "66KB",
+                    "lines": 1878
+                },
+                {
+                    "name": "Cache.cs",
+                    "size": "4.7KB",
+                    "lines": 154
+                },
+                {
+                    "name": "BoundingBoxes.cs",
+                    "size": "1.2KB",
+                    "lines": 40
+                }
+            ]
+        },
+        "GameFiles": {
+            "Utils": {
+                "files": [
+                    {
+                        "name": "Jenk.cs",
+                        "size": "6.5KB",
+                        "lines": 266
+                    },
+                    {
+                        "name": "GTAKeys.cs",
+                        "size": "89KB",
+                        "lines": 1472
+                    },
+                    {
+                        "name": "GTACrypto.cs",
+                        "size": "17KB",
+                        "lines": 430
+                    },
+                    {
+                        "name": "Data.cs",
+                        "size": "12KB",
+                        "lines": 484
+                    },
+                    {
+                        "name": "DDSIO.cs",
+                        "size": "121KB",
+                        "lines": 2805
+                    }
+                ]
+            },
+            "Resources": {
+                "files": [
+                    {
+                        "name": "WaypointRecord.cs",
+                        "size": "5.7KB",
+                        "lines": 174
+                    },
+                    {
+                        "name": "VertexType.cs",
+                        "size": "5.5KB",
+                        "lines": 196
+                    },
+                    {
+                        "name": "VehicleRecord.cs",
+                        "size": "9.3KB",
+                        "lines": 276
+                    },
+                    {
+                        "name": "Texture.cs",
+                        "size": "50KB",
+                        "lines": 1392
+                    },
+                    {
+                        "name": "ShaderParams.cs",
+                        "size": "65KB",
+                        "lines": 1714
+                    },
+                    {
+                        "name": "ResourceFile.cs",
+                        "size": "5.2KB",
+                        "lines": 150
+                    },
+                    {
+                        "name": "ResourceData.cs",
+                        "size": "24KB",
+                        "lines": 787
+                    },
+                    {
+                        "name": "ResourceBuilder.cs",
+                        "size": "27KB",
+                        "lines": 690
+                    },
+                    {
+                        "name": "ResourceBaseTypes.cs",
+                        "size": "51KB",
+                        "lines": 1825
+                    },
+                    {
+                        "name": "ResourceAnalyzer.cs",
+                        "size": "5.3KB",
+                        "lines": 151
+                    },
+                    {
+                        "name": "Particle.cs",
+                        "size": "258KB",
+                        "lines": 6167
+                    },
+                    {
+                        "name": "Node.cs",
+                        "size": "24KB",
+                        "lines": 573
+                    },
+                    {
+                        "name": "Nav.cs",
+                        "size": "41KB",
+                        "lines": 1144
+                    },
+                    {
+                        "name": "Frag.cs",
+                        "size": "184KB",
+                        "lines": 4439
+                    },
+                    {
+                        "name": "Filter.cs",
+                        "size": "18KB",
+                        "lines": 455
+                    },
+                    {
+                        "name": "Expression.cs",
+                        "size": "64KB",
+                        "lines": 1651
+                    },
+                    {
+                        "name": "Drawable.cs",
+                        "size": "271KB",
+                        "lines": 7093
+                    },
+                    {
+                        "name": "Clothes.cs",
+                        "size": "108KB",
+                        "lines": 2644
+                    },
+                    {
+                        "name": "Clip.cs",
+                        "size": "160KB",
+                        "lines": 4467
+                    },
+                    {
+                        "name": "Bounds.cs",
+                        "size": "206KB",
+                        "lines": 5488
+                    }
+                ]
+            },
+            "MetaTypes": {
+                "files": [
+                    {
+                        "name": "XmlRbf.cs",
+                        "size": "6.6KB",
+                        "lines": 207
+                    },
+                    {
+                        "name": "XmlPso.cs",
+                        "size": "50KB",
+                        "lines": 1292
+                    },
+                    {
+                        "name": "XmlMeta.cs",
+                        "size": "48KB",
+                        "lines": 1313
+                    },
+                    {
+                        "name": "Rbf.cs",
+                        "size": "16KB",
+                        "lines": 443
+                    },
+                    {
+                        "name": "PsoTypes.cs",
+                        "size": "1.5MB",
+                        "lines": null
+                    },
+                    {
+                        "name": "PsoBuilder.cs",
+                        "size": "17KB",
+                        "lines": 505
+                    },
+                    {
+                        "name": "Pso.cs",
+                        "size": "33KB",
+                        "lines": 1088
+                    },
+                    {
+                        "name": "MetaXml.cs",
+                        "size": "98KB",
+                        "lines": 2310
+                    },
+                    {
+                        "name": "MetaTypes.cs",
+                        "size": "331KB",
+                        "lines": 6594
+                    },
+                    {
+                        "name": "MetaNames.cs",
+                        "size": "849KB",
+                        "lines": 20659
+                    },
+                    {
+                        "name": "MetaBuilder.cs",
+                        "size": "15KB",
+                        "lines": 473
+                    },
+                    {
+                        "name": "Meta.cs",
+                        "size": "42KB",
+                        "lines": 1231
+                    },
+                    {
+                        "name": "Archetype.cs",
+                        "size": "35KB",
+                        "lines": 1051
+                    }
+                ]
+            },
+            "FileTypes": {
+                "files": [
+                    {
+                        "name": "YwrFile.cs",
+                        "size": "2.4KB",
+                        "lines": 112
+                    },
+                    {
+                        "name": "YvrFile.cs",
+                        "size": "2.3KB",
+                        "lines": 111
+                    },
+                    {
+                        "name": "YtypFile.cs",
+                        "size": "14KB",
+                        "lines": 405
+                    },
+                    {
+                        "name": "YtdFile.cs",
+                        "size": "3.4KB",
+                        "lines": 149
+                    },
+                    {
+                        "name": "YptFile.cs",
+                        "size": "6.3KB",
+                        "lines": 244
+                    },
+                    {
+                        "name": "YpdbFile.cs",
+                        "size": "12KB",
+                        "lines": 412
+                    },
+                    {
+                        "name": "YnvFile.cs",
+                        "size": "53KB",
+                        "lines": 1365
+                    },
+                    {
+                        "name": "YndFile.cs",
+                        "size": "59KB",
+                        "lines": 1915
+                    },
+                    {
+                        "name": "YmtFile.cs",
+                        "size": "9.2KB",
+                        "lines": 325
+                    },
+                    {
+                        "name": "YmfFile.cs",
+                        "size": "5.6KB",
+                        "lines": 190
+                    },
+                    {
+                        "name": "YmapFile.cs",
+                        "size": "131KB",
+                        "lines": 3662
+                    },
+                    {
+                        "name": "YldFile.cs",
+                        "size": "3.3KB",
+                        "lines": 134
+                    },
+                    {
+                        "name": "YftFile.cs",
+                        "size": "3.5KB",
+                        "lines": 154
+                    },
+                    {
+                        "name": "YfdFile.cs",
+                        "size": "2.5KB",
+                        "lines": 98
+                    },
+                    {
+                        "name": "YedFile.cs",
+                        "size": "2.9KB",
+                        "lines": 126
+                    },
+                    {
+                        "name": "YdrFile.cs",
+                        "size": "3.4KB",
+                        "lines": 154
+                    },
+                    {
+                        "name": "YddFile.cs",
+                        "size": "4.8KB",
+                        "lines": 183
+                    },
+                    {
+                        "name": "YcdFile.cs",
+                        "size": "11KB",
+                        "lines": 356
+                    },
+                    {
+                        "name": "YbnFile.cs",
+                        "size": "5.2KB",
+                        "lines": 211
+                    },
+                    {
+                        "name": "WatermapFile.cs",
+                        "size": "18KB",
+                        "lines": 551
+                    },
+                    {
+                        "name": "VehiclesFile.cs",
+                        "size": "25KB",
+                        "lines": 402
+                    },
+                    {
+                        "name": "VehicleLayoutsFile.cs",
+                        "size": "890B",
+                        "lines": 38
+                    },
+                    {
+                        "name": "Stats.cs",
+                        "size": "1.9KB",
+                        "lines": 85
+                    },
+                    {
+                        "name": "RelFile.cs",
+                        "size": "1.1MB",
+                        "lines": null
+                    },
+                    {
+                        "name": "PedsFile.cs",
+                        "size": "16KB",
+                        "lines": 348
+                    },
+                    {
+                        "name": "PedFile.cs",
+                        "size": "2.7KB",
+                        "lines": 125
+                    },
+                    {
+                        "name": "MrfFile.cs",
+                        "size": "202KB",
+                        "lines": 5614
+                    },
+                    {
+                        "name": "JPsoFile.cs",
+                        "size": "920B",
+                        "lines": 49
+                    },
+                    {
+                        "name": "HeightmapFile.cs",
+                        "size": "11KB",
+                        "lines": 363
+                    },
+                    {
+                        "name": "Gxt2File.cs",
+                        "size": "7.3KB",
+                        "lines": 261
+                    },
+                    {
+                        "name": "GtxdFile.cs",
+                        "size": "5.5KB",
+                        "lines": 161
+                    },
+                    {
+                        "name": "FxcFile.cs",
+                        "size": "63KB",
+                        "lines": 1897
+                    },
+                    {
+                        "name": "DlcSetupFile.cs",
+                        "size": "3.2KB",
+                        "lines": 84
+                    },
+                    {
+                        "name": "DlcContentFile.cs",
+                        "size": "15KB",
+                        "lines": 432
+                    },
+                    {
+                        "name": "DistantLightsFile.cs",
+                        "size": "9.8KB",
+                        "lines": 327
+                    },
+                    {
+                        "name": "CutFile.cs",
+                        "size": "66KB",
+                        "lines": 1275
+                    },
+                    {
+                        "name": "CarVariationsFile.cs",
+                        "size": "8.5KB",
+                        "lines": 262
+                    },
+                    {
+                        "name": "CarModColsFile.cs",
+                        "size": "6.5KB",
+                        "lines": 212
+                    },
+                    {
+                        "name": "CarColsFile.cs",
+                        "size": "47KB",
+                        "lines": 1279
+                    },
+                    {
+                        "name": "CacheDatFile.cs",
+                        "size": "40KB",
+                        "lines": 1075
+                    },
+                    {
+                        "name": "AwcFile.cs",
+                        "size": "108KB",
+                        "lines": 3170
+                    }
+                ]
+            },
+            "files": [
+                {
+                    "name": "RpfManager.cs",
+                    "size": "20KB",
+                    "lines": 526
+                },
+                {
+                    "name": "RpfFile.cs",
+                    "size": "99KB",
+                    "lines": 2807
+                },
+                {
+                    "name": "GameFileCache.cs",
+                    "size": "235KB",
+                    "lines": 5995
+                },
+                {
+                    "name": "GameFile.cs",
+                    "size": "2.4KB",
+                    "lines": 109
+                }
+            ]
+        },
+        "World": {
+            "files": [
+                {
+                    "name": "Weather.cs",
+                    "size": "26KB",
+                    "lines": 570
+                },
+                {
+                    "name": "Weapon.cs",
+                    "size": "2.0KB",
+                    "lines": 71
+                },
+                {
+                    "name": "Watermaps.cs",
+                    "size": "9.6KB",
+                    "lines": 291
+                },
+                {
+                    "name": "Water.cs",
+                    "size": "7.6KB",
+                    "lines": 237
+                },
+                {
+                    "name": "Vehicle.cs",
+                    "size": "3.6KB",
+                    "lines": 103
+                },
+                {
+                    "name": "Trains.cs",
+                    "size": "12KB",
+                    "lines": 437
+                },
+                {
+                    "name": "TimecycleMods.cs",
+                    "size": "4.6KB",
+                    "lines": 149
+                },
+                {
+                    "name": "Timecycle.cs",
+                    "size": "4.3KB",
+                    "lines": 125
+                },
+                {
+                    "name": "Space.cs",
+                    "size": "84KB",
+                    "lines": 2415
+                },
+                {
+                    "name": "Scenarios.cs",
+                    "size": "77KB",
+                    "lines": 2210
+                },
+                {
+                    "name": "PopZones.cs",
+                    "size": "5.6KB",
+                    "lines": 207
+                },
+                {
+                    "name": "Ped.cs",
+                    "size": "11KB",
+                    "lines": 307
+                },
+                {
+                    "name": "Heightmaps.cs",
+                    "size": "5.0KB",
+                    "lines": 171
+                },
+                {
+                    "name": "Entity.cs",
+                    "size": "6.6KB",
+                    "lines": 199
+                },
+                {
+                    "name": "Clouds.cs",
+                    "size": "19KB",
+                    "lines": 460
+                },
+                {
+                    "name": "Camera.cs",
+                    "size": "14KB",
+                    "lines": 382
+                },
+                {
+                    "name": "AudioZones.cs",
+                    "size": "12KB",
+                    "lines": 355
+                }
+            ]
+        }
+    }
+} 
