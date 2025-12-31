@@ -1,7 +1,7 @@
 numpy>=1.19.0
 matplotlib>=3.3.0
-pathlib>=1.0.1
-argparse>=1.4.0
 python-dotenv>=0.15.0
+Pillow>=9.0.0
+opencv-python>=4.5.0
+# Python.NET is required for the CodeWalker/.NET integration path (primarily Windows).
 pythonnet>=2.5.2; sys_platform == 'win32'
-shutil>=0.1.0 

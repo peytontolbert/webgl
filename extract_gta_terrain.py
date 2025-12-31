@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 dotenv.load_dotenv()
+dotenv.load_dotenv(dotenv_path=Path(__file__).resolve().parent / "env.local", override=False)
 
 def main():
     """Main function to extract and visualize GTA 5 terrain"""

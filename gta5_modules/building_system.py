@@ -37,7 +37,7 @@ class BuildingData:
     name: str
     model_name: str
     position: np.ndarray  # (x, y, z)
-    rotation: np.ndarray  # (rx, ry, rz)
+    rotation: np.ndarray  # quaternion (w, x, y, z)
     scale: np.ndarray     # (sx, sy, sz)
     flags: int
     lod_dist: float
@@ -227,19 +227,30 @@ class BuildingSystem:
 
     def align_to_normal(self, rotation: np.ndarray, normal: np.ndarray) -> np.ndarray:
         """Align building rotation to terrain normal using optimized quaternion operations"""
+        if normal is None:
+            return rotation
+        n = np.asarray(normal, dtype=np.float32)
+        nn = float(np.linalg.norm(n))
+        if nn == 0.0:
+            return rotation
+        n = n / nn
+
         # Convert quaternion to rotation matrix
         q = self._quaternion_from_float_array(rotation)
         R = self._quaternion_as_rotation_matrix(q)
         
         # Get up vector from rotation matrix
-        up = R[:, 2]
+        up = R[:3, 2]
         
         # Calculate rotation to align with normal
-        rotation_axis = np.cross(up, normal)
-        rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+        rotation_axis = np.cross(up, n)
+        axis_len = float(np.linalg.norm(rotation_axis))
+        if axis_len == 0.0:
+            return rotation
+        rotation_axis = rotation_axis / axis_len
         
         # Calculate rotation angle
-        cos_angle = np.dot(up, normal)
+        cos_angle = float(np.dot(up, n))
         angle = math.acos(np.clip(cos_angle, -1.0, 1.0))
         
         # Create rotation quaternion
@@ -350,7 +361,9 @@ class BuildingSystem:
             ], dtype=np.float32)
             
             # Extract rotation
+            # CodeWalker entity rotation is a quaternion (typically XYZW). Store as (WXYZ)
             rotation = np.array([
+                getattr(entity.Rotation, 'W', 1),
                 getattr(entity.Rotation, 'X', 0),
                 getattr(entity.Rotation, 'Y', 0),
                 getattr(entity.Rotation, 'Z', 0)

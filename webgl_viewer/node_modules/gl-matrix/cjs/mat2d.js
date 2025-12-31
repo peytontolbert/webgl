@@ -1,41 +1,36 @@
 "use strict";
 
-function _typeof(obj) { "@babel/helpers - typeof"; if (typeof Symbol === "function" && typeof Symbol.iterator === "symbol") { _typeof = function _typeof(obj) { return typeof obj; }; } else { _typeof = function _typeof(obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; }; } return _typeof(obj); }
-
+function _typeof(o) { "@babel/helpers - typeof"; return _typeof = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator ? function (o) { return typeof o; } : function (o) { return o && "function" == typeof Symbol && o.constructor === Symbol && o !== Symbol.prototype ? "symbol" : typeof o; }, _typeof(o); }
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-exports.create = create;
+exports.add = add;
 exports.clone = clone;
 exports.copy = copy;
-exports.identity = identity;
-exports.fromValues = fromValues;
-exports.set = set;
-exports.invert = invert;
+exports.create = create;
 exports.determinant = determinant;
-exports.multiply = multiply;
-exports.rotate = rotate;
-exports.scale = scale;
-exports.translate = translate;
+exports.equals = equals;
+exports.exactEquals = exactEquals;
+exports.frob = frob;
 exports.fromRotation = fromRotation;
 exports.fromScaling = fromScaling;
 exports.fromTranslation = fromTranslation;
-exports.str = str;
-exports.frob = frob;
-exports.add = add;
-exports.subtract = subtract;
+exports.fromValues = fromValues;
+exports.identity = identity;
+exports.invert = invert;
+exports.mul = void 0;
+exports.multiply = multiply;
 exports.multiplyScalar = multiplyScalar;
 exports.multiplyScalarAndAdd = multiplyScalarAndAdd;
-exports.exactEquals = exactEquals;
-exports.equals = equals;
-exports.sub = exports.mul = void 0;
-
+exports.rotate = rotate;
+exports.scale = scale;
+exports.set = set;
+exports.str = str;
+exports.sub = void 0;
+exports.subtract = subtract;
+exports.translate = translate;
 var glMatrix = _interopRequireWildcard(require("./common.js"));
-
-function _getRequireWildcardCache(nodeInterop) { if (typeof WeakMap !== "function") return null; var cacheBabelInterop = new WeakMap(); var cacheNodeInterop = new WeakMap(); return (_getRequireWildcardCache = function _getRequireWildcardCache(nodeInterop) { return nodeInterop ? cacheNodeInterop : cacheBabelInterop; })(nodeInterop); }
-
-function _interopRequireWildcard(obj, nodeInterop) { if (!nodeInterop && obj && obj.__esModule) { return obj; } if (obj === null || _typeof(obj) !== "object" && typeof obj !== "function") { return { "default": obj }; } var cache = _getRequireWildcardCache(nodeInterop); if (cache && cache.has(obj)) { return cache.get(obj); } var newObj = {}; var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor; for (var key in obj) { if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) { var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null; if (desc && (desc.get || desc.set)) { Object.defineProperty(newObj, key, desc); } else { newObj[key] = obj[key]; } } } newObj["default"] = obj; if (cache) { cache.set(obj, newObj); } return newObj; }
-
+function _interopRequireWildcard(e, t) { if ("function" == typeof WeakMap) var r = new WeakMap(), n = new WeakMap(); return (_interopRequireWildcard = function _interopRequireWildcard(e, t) { if (!t && e && e.__esModule) return e; var o, i, f = { __proto__: null, "default": e }; if (null === e || "object" != _typeof(e) && "function" != typeof e) return f; if (o = t ? n : r) { if (o.has(e)) return o.get(e); o.set(e, f); } for (var _t in e) "default" !== _t && {}.hasOwnProperty.call(e, _t) && ((i = (o = Object.defineProperty) && Object.getOwnPropertyDescriptor(e, _t)) && (i.get || i.set) ? o(f, _t, i) : f[_t] = e[_t]); return f; })(e, t); }
 /**
  * 2x3 Matrix
  * @module mat2d
@@ -62,26 +57,23 @@ function _interopRequireWildcard(obj, nodeInterop) { if (!nodeInterop && obj && 
  */
 function create() {
   var out = new glMatrix.ARRAY_TYPE(6);
-
   if (glMatrix.ARRAY_TYPE != Float32Array) {
     out[1] = 0;
     out[2] = 0;
     out[4] = 0;
     out[5] = 0;
   }
-
   out[0] = 1;
   out[3] = 1;
   return out;
 }
+
 /**
  * Creates a new mat2d initialized with values from an existing matrix
  *
  * @param {ReadonlyMat2d} a matrix to clone
  * @returns {mat2d} a new 2x3 matrix
  */
-
-
 function clone(a) {
   var out = new glMatrix.ARRAY_TYPE(6);
   out[0] = a[0];
@@ -92,6 +84,7 @@ function clone(a) {
   out[5] = a[5];
   return out;
 }
+
 /**
  * Copy the values from one mat2d to another
  *
@@ -99,8 +92,6 @@ function clone(a) {
  * @param {ReadonlyMat2d} a the source matrix
  * @returns {mat2d} out
  */
-
-
 function copy(out, a) {
   out[0] = a[0];
   out[1] = a[1];
@@ -110,14 +101,13 @@ function copy(out, a) {
   out[5] = a[5];
   return out;
 }
+
 /**
  * Set a mat2d to the identity matrix
  *
  * @param {mat2d} out the receiving matrix
  * @returns {mat2d} out
  */
-
-
 function identity(out) {
   out[0] = 1;
   out[1] = 0;
@@ -127,6 +117,7 @@ function identity(out) {
   out[5] = 0;
   return out;
 }
+
 /**
  * Create a new mat2d with the given values
  *
@@ -138,8 +129,6 @@ function identity(out) {
  * @param {Number} ty Component TY (index 5)
  * @returns {mat2d} A new mat2d
  */
-
-
 function fromValues(a, b, c, d, tx, ty) {
   var out = new glMatrix.ARRAY_TYPE(6);
   out[0] = a;
@@ -150,6 +139,7 @@ function fromValues(a, b, c, d, tx, ty) {
   out[5] = ty;
   return out;
 }
+
 /**
  * Set the components of a mat2d to the given values
  *
@@ -162,8 +152,6 @@ function fromValues(a, b, c, d, tx, ty) {
  * @param {Number} ty Component TY (index 5)
  * @returns {mat2d} out
  */
-
-
 function set(out, a, b, c, d, tx, ty) {
   out[0] = a;
   out[1] = b;
@@ -173,28 +161,25 @@ function set(out, a, b, c, d, tx, ty) {
   out[5] = ty;
   return out;
 }
+
 /**
  * Inverts a mat2d
  *
  * @param {mat2d} out the receiving matrix
  * @param {ReadonlyMat2d} a the source matrix
- * @returns {mat2d} out
+ * @returns {mat2d | null} out, or null if source matrix is not invertible
  */
-
-
 function invert(out, a) {
   var aa = a[0],
-      ab = a[1],
-      ac = a[2],
-      ad = a[3];
+    ab = a[1],
+    ac = a[2],
+    ad = a[3];
   var atx = a[4],
-      aty = a[5];
+    aty = a[5];
   var det = aa * ad - ab * ac;
-
   if (!det) {
     return null;
   }
-
   det = 1.0 / det;
   out[0] = ad * det;
   out[1] = -ab * det;
@@ -204,17 +189,17 @@ function invert(out, a) {
   out[5] = (ab * atx - aa * aty) * det;
   return out;
 }
+
 /**
  * Calculates the determinant of a mat2d
  *
  * @param {ReadonlyMat2d} a the source matrix
  * @returns {Number} determinant of a
  */
-
-
 function determinant(a) {
   return a[0] * a[3] - a[1] * a[2];
 }
+
 /**
  * Multiplies two mat2d's
  *
@@ -223,21 +208,19 @@ function determinant(a) {
  * @param {ReadonlyMat2d} b the second operand
  * @returns {mat2d} out
  */
-
-
 function multiply(out, a, b) {
   var a0 = a[0],
-      a1 = a[1],
-      a2 = a[2],
-      a3 = a[3],
-      a4 = a[4],
-      a5 = a[5];
+    a1 = a[1],
+    a2 = a[2],
+    a3 = a[3],
+    a4 = a[4],
+    a5 = a[5];
   var b0 = b[0],
-      b1 = b[1],
-      b2 = b[2],
-      b3 = b[3],
-      b4 = b[4],
-      b5 = b[5];
+    b1 = b[1],
+    b2 = b[2],
+    b3 = b[3],
+    b4 = b[4],
+    b5 = b[5];
   out[0] = a0 * b0 + a2 * b1;
   out[1] = a1 * b0 + a3 * b1;
   out[2] = a0 * b2 + a2 * b3;
@@ -246,6 +229,7 @@ function multiply(out, a, b) {
   out[5] = a1 * b4 + a3 * b5 + a5;
   return out;
 }
+
 /**
  * Rotates a mat2d by the given angle
  *
@@ -254,15 +238,13 @@ function multiply(out, a, b) {
  * @param {Number} rad the angle to rotate the matrix by
  * @returns {mat2d} out
  */
-
-
 function rotate(out, a, rad) {
   var a0 = a[0],
-      a1 = a[1],
-      a2 = a[2],
-      a3 = a[3],
-      a4 = a[4],
-      a5 = a[5];
+    a1 = a[1],
+    a2 = a[2],
+    a3 = a[3],
+    a4 = a[4],
+    a5 = a[5];
   var s = Math.sin(rad);
   var c = Math.cos(rad);
   out[0] = a0 * c + a2 * s;
@@ -273,6 +255,7 @@ function rotate(out, a, rad) {
   out[5] = a5;
   return out;
 }
+
 /**
  * Scales the mat2d by the dimensions in the given vec2
  *
@@ -281,17 +264,15 @@ function rotate(out, a, rad) {
  * @param {ReadonlyVec2} v the vec2 to scale the matrix by
  * @returns {mat2d} out
  **/
-
-
 function scale(out, a, v) {
   var a0 = a[0],
-      a1 = a[1],
-      a2 = a[2],
-      a3 = a[3],
-      a4 = a[4],
-      a5 = a[5];
+    a1 = a[1],
+    a2 = a[2],
+    a3 = a[3],
+    a4 = a[4],
+    a5 = a[5];
   var v0 = v[0],
-      v1 = v[1];
+    v1 = v[1];
   out[0] = a0 * v0;
   out[1] = a1 * v0;
   out[2] = a2 * v1;
@@ -300,6 +281,7 @@ function scale(out, a, v) {
   out[5] = a5;
   return out;
 }
+
 /**
  * Translates the mat2d by the dimensions in the given vec2
  *
@@ -308,17 +290,15 @@ function scale(out, a, v) {
  * @param {ReadonlyVec2} v the vec2 to translate the matrix by
  * @returns {mat2d} out
  **/
-
-
 function translate(out, a, v) {
   var a0 = a[0],
-      a1 = a[1],
-      a2 = a[2],
-      a3 = a[3],
-      a4 = a[4],
-      a5 = a[5];
+    a1 = a[1],
+    a2 = a[2],
+    a3 = a[3],
+    a4 = a[4],
+    a5 = a[5];
   var v0 = v[0],
-      v1 = v[1];
+    v1 = v[1];
   out[0] = a0;
   out[1] = a1;
   out[2] = a2;
@@ -327,6 +307,7 @@ function translate(out, a, v) {
   out[5] = a1 * v0 + a3 * v1 + a5;
   return out;
 }
+
 /**
  * Creates a matrix from a given angle
  * This is equivalent to (but much faster than):
@@ -338,11 +319,9 @@ function translate(out, a, v) {
  * @param {Number} rad the angle to rotate the matrix by
  * @returns {mat2d} out
  */
-
-
 function fromRotation(out, rad) {
   var s = Math.sin(rad),
-      c = Math.cos(rad);
+    c = Math.cos(rad);
   out[0] = c;
   out[1] = s;
   out[2] = -s;
@@ -351,6 +330,7 @@ function fromRotation(out, rad) {
   out[5] = 0;
   return out;
 }
+
 /**
  * Creates a matrix from a vector scaling
  * This is equivalent to (but much faster than):
@@ -362,8 +342,6 @@ function fromRotation(out, rad) {
  * @param {ReadonlyVec2} v Scaling vector
  * @returns {mat2d} out
  */
-
-
 function fromScaling(out, v) {
   out[0] = v[0];
   out[1] = 0;
@@ -373,6 +351,7 @@ function fromScaling(out, v) {
   out[5] = 0;
   return out;
 }
+
 /**
  * Creates a matrix from a vector translation
  * This is equivalent to (but much faster than):
@@ -384,8 +363,6 @@ function fromScaling(out, v) {
  * @param {ReadonlyVec2} v Translation vector
  * @returns {mat2d} out
  */
-
-
 function fromTranslation(out, v) {
   out[0] = 1;
   out[1] = 0;
@@ -395,28 +372,27 @@ function fromTranslation(out, v) {
   out[5] = v[1];
   return out;
 }
+
 /**
  * Returns a string representation of a mat2d
  *
  * @param {ReadonlyMat2d} a matrix to represent as a string
  * @returns {String} string representation of the matrix
  */
-
-
 function str(a) {
   return "mat2d(" + a[0] + ", " + a[1] + ", " + a[2] + ", " + a[3] + ", " + a[4] + ", " + a[5] + ")";
 }
+
 /**
  * Returns Frobenius norm of a mat2d
  *
  * @param {ReadonlyMat2d} a the matrix to calculate Frobenius norm of
  * @returns {Number} Frobenius norm
  */
-
-
 function frob(a) {
-  return Math.hypot(a[0], a[1], a[2], a[3], a[4], a[5], 1);
+  return Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2] + a[3] * a[3] + a[4] * a[4] + a[5] * a[5] + 1);
 }
+
 /**
  * Adds two mat2d's
  *
@@ -425,8 +401,6 @@ function frob(a) {
  * @param {ReadonlyMat2d} b the second operand
  * @returns {mat2d} out
  */
-
-
 function add(out, a, b) {
   out[0] = a[0] + b[0];
   out[1] = a[1] + b[1];
@@ -436,6 +410,7 @@ function add(out, a, b) {
   out[5] = a[5] + b[5];
   return out;
 }
+
 /**
  * Subtracts matrix b from matrix a
  *
@@ -444,8 +419,6 @@ function add(out, a, b) {
  * @param {ReadonlyMat2d} b the second operand
  * @returns {mat2d} out
  */
-
-
 function subtract(out, a, b) {
   out[0] = a[0] - b[0];
   out[1] = a[1] - b[1];
@@ -455,6 +428,7 @@ function subtract(out, a, b) {
   out[5] = a[5] - b[5];
   return out;
 }
+
 /**
  * Multiply each element of the matrix by a scalar.
  *
@@ -463,8 +437,6 @@ function subtract(out, a, b) {
  * @param {Number} b amount to scale the matrix's elements by
  * @returns {mat2d} out
  */
-
-
 function multiplyScalar(out, a, b) {
   out[0] = a[0] * b;
   out[1] = a[1] * b;
@@ -474,6 +446,7 @@ function multiplyScalar(out, a, b) {
   out[5] = a[5] * b;
   return out;
 }
+
 /**
  * Adds two mat2d's after multiplying each element of the second operand by a scalar value.
  *
@@ -483,8 +456,6 @@ function multiplyScalar(out, a, b) {
  * @param {Number} scale the amount to scale b's elements by before adding
  * @returns {mat2d} out
  */
-
-
 function multiplyScalarAndAdd(out, a, b, scale) {
   out[0] = a[0] + b[0] * scale;
   out[1] = a[1] + b[1] * scale;
@@ -494,6 +465,7 @@ function multiplyScalarAndAdd(out, a, b, scale) {
   out[5] = a[5] + b[5] * scale;
   return out;
 }
+
 /**
  * Returns whether or not the matrices have exactly the same elements in the same position (when compared with ===)
  *
@@ -501,11 +473,10 @@ function multiplyScalarAndAdd(out, a, b, scale) {
  * @param {ReadonlyMat2d} b The second matrix.
  * @returns {Boolean} True if the matrices are equal, false otherwise.
  */
-
-
 function exactEquals(a, b) {
   return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3] && a[4] === b[4] && a[5] === b[5];
 }
+
 /**
  * Returns whether or not the matrices have approximately the same elements in the same position.
  *
@@ -513,35 +484,30 @@ function exactEquals(a, b) {
  * @param {ReadonlyMat2d} b The second matrix.
  * @returns {Boolean} True if the matrices are equal, false otherwise.
  */
-
-
 function equals(a, b) {
   var a0 = a[0],
-      a1 = a[1],
-      a2 = a[2],
-      a3 = a[3],
-      a4 = a[4],
-      a5 = a[5];
+    a1 = a[1],
+    a2 = a[2],
+    a3 = a[3],
+    a4 = a[4],
+    a5 = a[5];
   var b0 = b[0],
-      b1 = b[1],
-      b2 = b[2],
-      b3 = b[3],
-      b4 = b[4],
-      b5 = b[5];
+    b1 = b[1],
+    b2 = b[2],
+    b3 = b[3],
+    b4 = b[4],
+    b5 = b[5];
   return Math.abs(a0 - b0) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a0), Math.abs(b0)) && Math.abs(a1 - b1) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a1), Math.abs(b1)) && Math.abs(a2 - b2) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a2), Math.abs(b2)) && Math.abs(a3 - b3) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a3), Math.abs(b3)) && Math.abs(a4 - b4) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a4), Math.abs(b4)) && Math.abs(a5 - b5) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a5), Math.abs(b5));
 }
+
 /**
  * Alias for {@link mat2d.multiply}
  * @function
  */
+var mul = exports.mul = multiply;
 
-
-var mul = multiply;
 /**
  * Alias for {@link mat2d.subtract}
  * @function
  */
-
-exports.mul = mul;
-var sub = subtract;
-exports.sub = sub;
+var sub = exports.sub = subtract;

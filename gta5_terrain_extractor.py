@@ -13,10 +13,6 @@ import argparse
 import dotenv
 from pathlib import Path
 
-from gta5_modules.terrain_system import TerrainSystem
-from gta5_modules.building_system import BuildingSystem
-from gta5_modules.dll_manager import DllManager
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 dotenv.load_dotenv()
+dotenv.load_dotenv(dotenv_path=Path(__file__).resolve().parent / "env.local", override=False)
 
 def main():
     """Main function"""
@@ -34,6 +31,24 @@ def main():
     parser.add_argument('--output-dir', default='output', help='Output directory')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
+
+    # This project has two modes:
+    # - WebGL viewer (`webgl_viewer_old/`) which is cross-platform and uses prebuilt assets.
+    # - Extraction pipeline which relies on Python.NET + CodeWalker DLLs (Windows/.NET focused).
+    #
+    # On Linux/macOS, importing the CodeWalker integration modules will typically fail because
+    # `clr` (pythonnet) isn't available. Give a clear message instead of a stack trace.
+    if sys.platform != "win32":
+        logger.error("Terrain extraction requires the CodeWalker/.NET integration path (Windows-focused).")
+        logger.info("On Linux, you can still run the viewer using the prebuilt assets:")
+        logger.info("  cd webgl_viewer_old && npm run dev")
+        logger.info("If you want extraction on Linux, we'd need to implement/finish a pure-Python RPF pipeline.")
+        return False
+
+    # Import Windows-only integration modules lazily so `--help` and other operations don't crash.
+    from gta5_modules.terrain_system import TerrainSystem
+    from gta5_modules.building_system import BuildingSystem
+    from gta5_modules.dll_manager import DllManager
     
     # Set debug mode if requested
     if args.debug:
@@ -42,7 +57,8 @@ def main():
     start_time = time.time()
     
     # Get game path from environment variable or command line
-    game_path = args.game_path or os.getenv('gta5_path')
+    # Support both keys used across the repo/docs.
+    game_path = args.game_path or os.getenv('gta5_path') or os.getenv('gta_location')
     if not game_path:
         # Try to find GTA5 in common locations
         common_paths = [

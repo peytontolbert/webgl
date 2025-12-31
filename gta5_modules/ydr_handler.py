@@ -112,7 +112,9 @@ class YdrHandler:
         """Load YDR file with enhanced processing"""
         try:
             # Read raw YDR data
-            ydr_data = self.rpf_reader.read_file(path)
+            # `RpfReader` provides `get_file_data(path)` which supports both RPF entry paths
+            # (via CodeWalker RpfManager) and can be adapted for local-file reads in tooling.
+            ydr_data = self.rpf_reader.get_file_data(path)
             if not ydr_data:
                 return False
                 

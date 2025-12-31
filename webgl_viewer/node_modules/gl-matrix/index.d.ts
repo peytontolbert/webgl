@@ -1,24 +1,29 @@
 declare module "gl-matrix" {
 
+interface IndexedCollection extends Iterable<number> {
+    readonly length: number;
+    [index: number]: number;
+}
+
 // prettier-ignore
 export type mat2 =
   | [number, number, 
      number, number]
-  | Float32Array;
+  | IndexedCollection;
 
 // prettier-ignore
 export type mat2d =
   | [number, number, 
      number, number, 
      number, number]
-  | Float32Array;
+  | IndexedCollection;
 
 // prettier-ignore
 export type mat3 =
   | [number, number, number, 
      number, number, number, 
      number, number, number]
-  | Float32Array;
+  | IndexedCollection;
 
 // prettier-ignore
 export type mat4 =
@@ -26,19 +31,19 @@ export type mat4 =
      number, number, number, number,
      number, number, number, number,
      number, number, number, number]
-  | Float32Array;
+  | IndexedCollection;
 
-export type quat = [number, number, number, number] | Float32Array;
+export type quat = [number, number, number, number] | IndexedCollection;
 
 // prettier-ignore
 export type quat2 =
   | [number, number, number, number, 
     number, number, number, number]
-  | Float32Array;
+  | IndexedCollection;
 
-export type vec2 = [number, number] | Float32Array;
-export type vec3 = [number, number, number] | Float32Array;
-export type vec4 = [number, number, number, number] | Float32Array;
+export type vec2 = [number, number] | IndexedCollection;
+export type vec3 = [number, number, number] | IndexedCollection;
+export type vec4 = [number, number, number, number] | IndexedCollection;
 
 // prettier-ignore
 export type ReadonlyMat2 =
@@ -46,7 +51,7 @@ export type ReadonlyMat2 =
       number, number,
       number, number
     ]
-  | Float32Array;
+  | IndexedCollection;
 
 // prettier-ignore
 export type ReadonlyMat2d =
@@ -55,7 +60,7 @@ export type ReadonlyMat2d =
       number, number,
       number, number
     ]
-  | Float32Array;
+  | IndexedCollection;
 
 // prettier-ignore
 export type ReadonlyMat3 =
@@ -64,7 +69,7 @@ export type ReadonlyMat3 =
       number, number, number,
       number, number, number
     ]
-  | Float32Array;
+  | IndexedCollection;
 
 // prettier-ignore
 export type ReadonlyMat4 =
@@ -74,29 +79,36 @@ export type ReadonlyMat4 =
       number, number, number, number,
       number, number, number, number
     ]
-  | Float32Array;
+  | IndexedCollection;
 
 export type ReadonlyQuat =
   | readonly [number, number, number, number]
-  | Float32Array;
+  | IndexedCollection;
 
 export type ReadonlyQuat2 =
   | readonly [number, number, number, number, number, number, number, number]
-  | Float32Array;
+  | IndexedCollection;
 
-export type ReadonlyVec2 = readonly [number, number] | Float32Array;
-export type ReadonlyVec3 = readonly [number, number, number] | Float32Array;
+export type ReadonlyVec2 = readonly [number, number] | IndexedCollection;
+export type ReadonlyVec3 = readonly [number, number, number] | IndexedCollection;
 export type ReadonlyVec4 =
   | readonly [number, number, number, number]
-  | Float32Array;
+  | IndexedCollection;
 
-export module glMatrix {
+export namespace glMatrix {
+    /**
+     * Symmetric round
+     * see https://www.npmjs.com/package/round-half-up-symmetric#user-content-detailed-background
+     *
+     * @param {Number} a value to round
+     */
+    export function round(a: number): number;
     /**
      * Sets the type of array used when creating new vectors and matrices
      *
      * @param {Float32ArrayConstructor | ArrayConstructor} type Array type, such as Float32Array or Array
      */
-    export function setMatrixArrayType(type: ArrayConstructor | Float32ArrayConstructor): void;
+    export function setMatrixArrayType(type: Float32ArrayConstructor | ArrayConstructor): void;
     /**
      * Convert Degree To Radian
      *
@@ -104,24 +116,32 @@ export module glMatrix {
      */
     export function toRadian(a: number): number;
     /**
+     * Convert Radian To Degree
+     *
+     * @param {Number} a Angle in Radians
+     */
+    export function toDegree(a: number): number;
+    /**
      * Tests whether or not the arguments have approximately the same value, within an absolute
      * or relative tolerance of glMatrix.EPSILON (an absolute tolerance is used for values less
      * than or equal to 1.0, and a relative tolerance is used for larger values)
      *
-     * @param {Number} a The first number to test.
-     * @param {Number} b The second number to test.
+     * @param {Number} a          The first number to test.
+     * @param {Number} b          The second number to test.
+     * @param {Number} tolerance  Absolute or relative tolerance (default glMatrix.EPSILON)
      * @returns {Boolean} True if the numbers are approximately equal, false otherwise.
      */
-    export function equals(a: number, b: number): boolean;
+    export function equals(a: number, b: number, tolerance?: number): boolean;
     /**
      * Common utilities
      * @module glMatrix
      */
     export const EPSILON: 0.000001;
     export let ARRAY_TYPE: ArrayConstructor | Float32ArrayConstructor;
-    export const RANDOM: () => number;
+    export let RANDOM: () => number;
+    export let ANGLE_ORDER: string;
 }
-export module mat2 {
+export namespace mat2 {
     /**
      * 2x2 Matrix
      * @module mat2
@@ -188,9 +208,9 @@ export module mat2 {
      *
      * @param {mat2} out the receiving matrix
      * @param {ReadonlyMat2} a the source matrix
-     * @returns {mat2} out
+     * @returns {mat2 | null} out, or null if source matrix is not invertible
      */
-    export function invert(out: mat2, a: ReadonlyMat2): mat2;
+    export function invert(out: mat2, a: ReadonlyMat2): mat2 | null;
     /**
      * Calculates the adjugate of a mat2
      *
@@ -351,7 +371,7 @@ export module mat2 {
      */
     export function sub(out: mat2, a: ReadonlyMat2, b: ReadonlyMat2): mat2;
 }
-export module mat2d {
+export namespace mat2d {
     /**
      * 2x3 Matrix
      * @module mat2d
@@ -428,9 +448,9 @@ export module mat2d {
      *
      * @param {mat2d} out the receiving matrix
      * @param {ReadonlyMat2d} a the source matrix
-     * @returns {mat2d} out
+     * @returns {mat2d | null} out, or null if source matrix is not invertible
      */
-    export function invert(out: mat2d, a: ReadonlyMat2d): mat2d;
+    export function invert(out: mat2d, a: ReadonlyMat2d): mat2d | null;
     /**
      * Calculates the determinant of a mat2d
      *
@@ -596,7 +616,7 @@ export module mat2d {
      */
     export function sub(out: mat2d, a: ReadonlyMat2d, b: ReadonlyMat2d): mat2d;
 }
-export module mat3 {
+export namespace mat3 {
     /**
      * 3x3 Matrix
      * @module mat3
@@ -681,9 +701,9 @@ export module mat3 {
      *
      * @param {mat3} out the receiving matrix
      * @param {ReadonlyMat3} a the source matrix
-     * @returns {mat3} out
+     * @returns {mat3 | null} out, or null if source matrix is not invertible
      */
-    export function invert(out: mat3, a: ReadonlyMat3): mat3;
+    export function invert(out: mat3, a: ReadonlyMat3): mat3 | null;
     /**
      * Calculates the adjugate of a mat3
      *
@@ -730,7 +750,7 @@ export module mat3 {
      * Scales the mat3 by the dimensions in the given vec2
      *
      * @param {mat3} out the receiving matrix
-     * @param {ReadonlyMat3} a the matrix to rotate
+     * @param {ReadonlyMat3} a the matrix to scale
      * @param {ReadonlyVec2} v the vec2 to scale the matrix by
      * @returns {mat3} out
      **/
@@ -892,7 +912,7 @@ export module mat3 {
      */
     export function sub(out: mat3, a: ReadonlyMat3, b: ReadonlyMat3): mat3;
 }
-export module mat4 {
+export namespace mat4 {
     /**
      * 4x4 Matrix<br>Format: column-major, when typed out it looks like row-major<br>The matrices are being post multiplied.
      * @module mat4
@@ -983,9 +1003,9 @@ export module mat4 {
      *
      * @param {mat4} out the receiving matrix
      * @param {ReadonlyMat4} a the source matrix
-     * @returns {mat4} out
+     * @returns {mat4 | null} out, or null if source matrix is not invertible
      */
-    export function invert(out: mat4, a: ReadonlyMat4): mat4;
+    export function invert(out: mat4, a: ReadonlyMat4): mat4 | null;
     /**
      * Calculates the adjugate of a mat4
      *
@@ -1143,17 +1163,17 @@ export module mat4 {
      * This is equivalent to (but much faster than):
      *
      *     mat4.identity(dest);
-     *     mat4.translate(dest, vec);
+     *     mat4.translate(dest, dest, vec);
      *     let quatMat = mat4.create();
-     *     quat4.toMat4(quat, quatMat);
-     *     mat4.multiply(dest, quatMat);
+     *     mat4.fromQuat(quatMat, quat);
+     *     mat4.multiply(dest, dest, quatMat);
      *
      * @param {mat4} out mat4 receiving operation result
-     * @param {quat4} q Rotation quaternion
+     * @param {quat} q Rotation quaternion
      * @param {ReadonlyVec3} v Translation vector
      * @returns {mat4} out
      */
-    export function fromRotationTranslation(out: mat4, q: any, v: ReadonlyVec3): mat4;
+    export function fromRotationTranslation(out: mat4, q: quat, v: ReadonlyVec3): mat4;
     /**
      * Creates a new mat4 from a dual quat.
      *
@@ -1175,7 +1195,7 @@ export module mat4 {
     /**
      * Returns the scaling factor component of a transformation
      *  matrix. If a matrix is built with fromRotationTranslationScale
-     *  with a normalized Quaternion paramter, the returned vector will be
+     *  with a normalized Quaternion parameter, the returned vector will be
      *  the same as the scaling vector
      *  originally supplied.
      * @param  {vec3} out Vector to receive scaling factor component
@@ -1194,44 +1214,54 @@ export module mat4 {
      */
     export function getRotation(out: quat, mat: ReadonlyMat4): quat;
     /**
+     * Decomposes a transformation matrix into its rotation, translation
+     * and scale components. Returns only the rotation component
+     * @param  {quat} out_r Quaternion to receive the rotation component
+     * @param  {vec3} out_t Vector to receive the translation vector
+     * @param  {vec3} out_s Vector to receive the scaling factor
+     * @param  {ReadonlyMat4} mat Matrix to be decomposed (input)
+     * @returns {quat} out_r
+     */
+    export function decompose(out_r: quat, out_t: vec3, out_s: vec3, mat: ReadonlyMat4): quat;
+    /**
      * Creates a matrix from a quaternion rotation, vector translation and vector scale
      * This is equivalent to (but much faster than):
      *
      *     mat4.identity(dest);
-     *     mat4.translate(dest, vec);
+     *     mat4.translate(dest, dest, vec);
      *     let quatMat = mat4.create();
-     *     quat4.toMat4(quat, quatMat);
-     *     mat4.multiply(dest, quatMat);
-     *     mat4.scale(dest, scale)
+     *     mat4.fromQuat(quatMat, quat);
+     *     mat4.multiply(dest, dest, quatMat);
+     *     mat4.scale(dest, dest, scale)
      *
      * @param {mat4} out mat4 receiving operation result
-     * @param {quat4} q Rotation quaternion
+     * @param {quat} q Rotation quaternion
      * @param {ReadonlyVec3} v Translation vector
      * @param {ReadonlyVec3} s Scaling vector
      * @returns {mat4} out
      */
-    export function fromRotationTranslationScale(out: mat4, q: any, v: ReadonlyVec3, s: ReadonlyVec3): mat4;
+    export function fromRotationTranslationScale(out: mat4, q: quat, v: ReadonlyVec3, s: ReadonlyVec3): mat4;
     /**
      * Creates a matrix from a quaternion rotation, vector translation and vector scale, rotating and scaling around the given origin
      * This is equivalent to (but much faster than):
      *
      *     mat4.identity(dest);
-     *     mat4.translate(dest, vec);
-     *     mat4.translate(dest, origin);
+     *     mat4.translate(dest, dest, vec);
+     *     mat4.translate(dest, dest, origin);
      *     let quatMat = mat4.create();
-     *     quat4.toMat4(quat, quatMat);
-     *     mat4.multiply(dest, quatMat);
-     *     mat4.scale(dest, scale)
-     *     mat4.translate(dest, negativeOrigin);
+     *     mat4.fromQuat(quatMat, quat);
+     *     mat4.multiply(dest, dest, quatMat);
+     *     mat4.scale(dest, dest, scale)
+     *     mat4.translate(dest, dest, negativeOrigin);
      *
      * @param {mat4} out mat4 receiving operation result
-     * @param {quat4} q Rotation quaternion
+     * @param {quat} q Rotation quaternion
      * @param {ReadonlyVec3} v Translation vector
      * @param {ReadonlyVec3} s Scaling vector
      * @param {ReadonlyVec3} o The origin vector around which to scale and rotate
      * @returns {mat4} out
      */
-    export function fromRotationTranslationScaleOrigin(out: mat4, q: any, v: ReadonlyVec3, s: ReadonlyVec3, o: ReadonlyVec3): mat4;
+    export function fromRotationTranslationScaleOrigin(out: mat4, q: quat, v: ReadonlyVec3, s: ReadonlyVec3, o: ReadonlyVec3): mat4;
     /**
      * Calculates a 4x4 matrix from the given quaternion
      *
@@ -1340,11 +1370,11 @@ export module mat4 {
      *
      * @param {mat4} out mat4 frustum matrix will be written into
      * @param {ReadonlyVec3} eye Position of the viewer
-     * @param {ReadonlyVec3} center Point the viewer is looking at
+     * @param {ReadonlyVec3} target Point the viewer is looking at
      * @param {ReadonlyVec3} up vec3 pointing up
      * @returns {mat4} out
      */
-    export function targetTo(out: mat4, eye: ReadonlyVec3, target: any, up: ReadonlyVec3): mat4;
+    export function targetTo(out: mat4, eye: ReadonlyVec3, target: ReadonlyVec3, up: ReadonlyVec3): mat4;
     /**
      * Returns a string representation of a mat4
      *
@@ -1460,7 +1490,7 @@ export module mat4 {
      */
     export function sub(out: mat4, a: ReadonlyMat4, b: ReadonlyMat4): mat4;
 }
-export module vec3 {
+export namespace vec3 {
     /**
      * 3 Dimensional Vector
      * @module vec3
@@ -1583,7 +1613,7 @@ export module vec3 {
      */
     export function max(out: vec3, a: ReadonlyVec3, b: ReadonlyVec3): vec3;
     /**
-     * Math.round the components of a vec3
+     * symmetric round the components of a vec3
      *
      * @param {vec3} out the receiving vector
      * @param {ReadonlyVec3} a vector to round
@@ -1684,6 +1714,16 @@ export module vec3 {
      */
     export function lerp(out: vec3, a: ReadonlyVec3, b: ReadonlyVec3, t: number): vec3;
     /**
+     * Performs a spherical linear interpolation between two vec3's
+     *
+     * @param {vec3} out the receiving vector
+     * @param {ReadonlyVec3} a the first operand
+     * @param {ReadonlyVec3} b the second operand
+     * @param {Number} t interpolation amount, in the range [0-1], between the two inputs
+     * @returns {vec3} out
+     */
+    export function slerp(out: vec3, a: ReadonlyVec3, b: ReadonlyVec3, t: number): vec3;
+    /**
      * Performs a hermite interpolation with two control points
      *
      * @param {vec3} out the receiving vector
@@ -1711,7 +1751,7 @@ export module vec3 {
      * Generates a random vector with the given scale
      *
      * @param {vec3} out the receiving vector
-     * @param {Number} [scale] Length of the resulting vector. If ommitted, a unit vector will be returned
+     * @param {Number} [scale] Length of the resulting vector. If omitted, a unit vector will be returned
      * @returns {vec3} out
      */
     export function random(out: vec3, scale?: number): vec3;
@@ -1740,7 +1780,7 @@ export module vec3 {
      *
      * @param {vec3} out the receiving vector
      * @param {ReadonlyVec3} a the vector to transform
-     * @param {ReadonlyQuat} q quaternion to transform with
+     * @param {ReadonlyQuat} q normalized quaternion to transform with
      * @returns {vec3} out
      */
     export function transformQuat(out: vec3, a: ReadonlyVec3, q: ReadonlyQuat): vec3;
@@ -1867,7 +1907,7 @@ export module vec3 {
     export function sqrLen(a: ReadonlyVec3): number;
     export function forEach(a: any, stride: any, offset: any, count: any, fn: any, arg: any): any;
 }
-export module vec4 {
+export namespace vec4 {
     /**
      * 4 Dimensional Vector
      * @module vec4
@@ -1985,7 +2025,7 @@ export module vec4 {
      */
     export function max(out: vec4, a: ReadonlyVec4, b: ReadonlyVec4): vec4;
     /**
-     * Math.round the components of a vec4
+     * symmetric round the components of a vec4
      *
      * @param {vec4} out the receiving vector
      * @param {ReadonlyVec4} a vector to round
@@ -2076,13 +2116,13 @@ export module vec4 {
     /**
      * Returns the cross-product of three vectors in a 4-dimensional space
      *
-     * @param {ReadonlyVec4} result the receiving vector
-     * @param {ReadonlyVec4} U the first vector
-     * @param {ReadonlyVec4} V the second vector
-     * @param {ReadonlyVec4} W the third vector
+     * @param {ReadonlyVec4} out the receiving vector
+     * @param {ReadonlyVec4} u the first vector
+     * @param {ReadonlyVec4} v the second vector
+     * @param {ReadonlyVec4} w the third vector
      * @returns {vec4} result
      */
-    export function cross(out: any, u: any, v: any, w: any): vec4;
+    export function cross(out: ReadonlyVec4, u: ReadonlyVec4, v: ReadonlyVec4, w: ReadonlyVec4): vec4;
     /**
      * Performs a linear interpolation between two vec4's
      *
@@ -2097,7 +2137,7 @@ export module vec4 {
      * Generates a random vector with the given scale
      *
      * @param {vec4} out the receiving vector
-     * @param {Number} [scale] Length of the resulting vector. If ommitted, a unit vector will be returned
+     * @param {Number} [scale] Length of the resulting vector. If omitted, a unit vector will be returned
      * @returns {vec4} out
      */
     export function random(out: vec4, scale?: number): vec4;
@@ -2115,7 +2155,7 @@ export module vec4 {
      *
      * @param {vec4} out the receiving vector
      * @param {ReadonlyVec4} a the vector to transform
-     * @param {ReadonlyQuat} q quaternion to transform with
+     * @param {ReadonlyQuat} q normalized quaternion to transform with
      * @returns {vec4} out
      */
     export function transformQuat(out: vec4, a: ReadonlyVec4, q: ReadonlyQuat): vec4;
@@ -2208,9 +2248,9 @@ export module vec4 {
     export function sqrLen(a: ReadonlyVec4): number;
     export function forEach(a: any, stride: any, offset: any, count: any, fn: any, arg: any): any;
 }
-export module quat {
+export namespace quat {
     /**
-     * Quaternion
+     * Quaternion in the format XYZW
      * @module quat
      */
     /**
@@ -2376,23 +2416,34 @@ export module quat {
      */
     export function fromMat3(out: quat, m: ReadonlyMat3): quat;
     /**
-     * Creates a quaternion from the given euler angle x, y, z.
+     * Creates a quaternion from the given euler angle x, y, z using the provided intrinsic order for the conversion.
      *
      * @param {quat} out the receiving quaternion
-     * @param {x} Angle to rotate around X axis in degrees.
-     * @param {y} Angle to rotate around Y axis in degrees.
-     * @param {z} Angle to rotate around Z axis in degrees.
+     * @param {Number} x Angle to rotate around X axis in degrees.
+     * @param {Number} y Angle to rotate around Y axis in degrees.
+     * @param {Number} z Angle to rotate around Z axis in degrees.
+     * @param {'xyz'|'xzy'|'yxz'|'yzx'|'zxy'|'zyx'} order Intrinsic order for conversion, default is zyx.
      * @returns {quat} out
      * @function
      */
-    export function fromEuler(out: quat, x: any, y: any, z: any): quat;
+    export function fromEuler(out: quat, x: number, y: number, z: number, order?: "xyz" | "xzy" | "yxz" | "yzx" | "zxy" | "zyx"): quat;
     /**
-     * Returns a string representation of a quatenion
+     * Returns a string representation of a quaternion
      *
      * @param {ReadonlyQuat} a vector to represent as a string
      * @returns {String} string representation of the vector
      */
     export function str(a: ReadonlyQuat): string;
+    /**
+     * Returns whether or not the quaternions point approximately to the same direction.
+     *
+     * Both quaternions are assumed to be unit length.
+     *
+     * @param {ReadonlyQuat} a The first unit quaternion.
+     * @param {ReadonlyQuat} b The second unit quaternion.
+     * @returns {Boolean} True if the quaternions are equal, false otherwise.
+     */
+    export function equals(a: ReadonlyQuat, b: ReadonlyQuat): boolean;
     /**
      * Creates a new quat initialized with values from an existing quaternion
      *
@@ -2524,20 +2575,12 @@ export module quat {
      * @returns {Boolean} True if the vectors are equal, false otherwise.
      */
     export const exactEquals: typeof vec4.exactEquals;
-    /**
-     * Returns whether or not the quaternions have approximately the same elements in the same position.
-     *
-     * @param {ReadonlyQuat} a The first vector.
-     * @param {ReadonlyQuat} b The second vector.
-     * @returns {Boolean} True if the vectors are equal, false otherwise.
-     */
-    export const equals: typeof vec4.equals;
     export function rotationTo(out: any, a: any, b: any): any;
     export function sqlerp(out: any, a: any, b: any, c: any, d: any, t: any): any;
     export function setAxes(out: any, view: any, right: any, up: any): vec4;
 
 }
-export module quat2 {
+export namespace quat2 {
     /**
      * Dual Quaternion<br>
      * Format: [real, dual]<br>
@@ -2593,7 +2636,7 @@ export module quat2 {
      *
      * @param {ReadonlyQuat2} dual quaternion receiving operation result
      * @param {ReadonlyQuat} q a normalized quaternion
-     * @param {ReadonlyVec3} t tranlation vector
+     * @param {ReadonlyVec3} t translation vector
      * @returns {quat2} dual quaternion receiving operation result
      * @function
      */
@@ -2811,7 +2854,7 @@ export module quat2 {
      */
     export function normalize(out: quat2, a: ReadonlyQuat2): quat2;
     /**
-     * Returns a string representation of a dual quatenion
+     * Returns a string representation of a dual quaternion
      *
      * @param {ReadonlyQuat2} a dual quaternion to represent as a string
      * @returns {String} string representation of the dual quat
@@ -2894,7 +2937,7 @@ export module quat2 {
      */
     export const sqrLen: typeof vec4.squaredLength;
 }
-export module vec2 {
+export namespace vec2 {
     /**
      * 2 Dimensional Vector
      * @module vec2
@@ -3008,7 +3051,7 @@ export module vec2 {
      */
     export function max(out: vec2, a: ReadonlyVec2, b: ReadonlyVec2): vec2;
     /**
-     * Math.round the components of a vec2
+     * symmetric round the components of a vec2
      *
      * @param {vec2} out the receiving vector
      * @param {ReadonlyVec2} a vector to round
@@ -3120,7 +3163,7 @@ export module vec2 {
      * Generates a random vector with the given scale
      *
      * @param {vec2} out the receiving vector
-     * @param {Number} [scale] Length of the resulting vector. If ommitted, a unit vector will be returned
+     * @param {Number} [scale] Length of the resulting vector. If omitted, a unit vector will be returned
      * @returns {vec2} out
      */
     export function random(out: vec2, scale?: number): vec2;
@@ -3173,12 +3216,20 @@ export module vec2 {
      */
     export function rotate(out: vec2, a: ReadonlyVec2, b: ReadonlyVec2, rad: number): vec2;
     /**
-     * Get the angle between two 2D vectors
+     * Get the smallest angle between two 2D vectors
      * @param {ReadonlyVec2} a The first operand
      * @param {ReadonlyVec2} b The second operand
      * @returns {Number} The angle in radians
      */
     export function angle(a: ReadonlyVec2, b: ReadonlyVec2): number;
+    /**
+     * Get the signed angle in the interval [-pi,pi] between two 2D vectors (positive if `a` is to the right of `b`)
+     *
+     * @param {ReadonlyVec2} a The first vector
+     * @param {ReadonlyVec2} b The second vector
+     * @returns {number} The signed angle in radians
+     */
+    export function signedAngle(a: ReadonlyVec2, b: ReadonlyVec2): number;
     /**
      * Set the components of a vec2 to zero
      *

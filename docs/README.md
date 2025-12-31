@@ -21,9 +21,10 @@ To get started with the GTA 5 Terrain Extractor, follow these steps:
    pip install -r requirements.txt
    ```
 
-2. Set up your environment variables in a `.env` file:
+2. Set up your environment variables in a `.env` file (or `env.local` for Linux servers / environments that block dotfiles):
    ```
    gta_location="C:\Path\To\GTA5"
+   gta5_path="C:\Path\To\GTA5"   # alias used by some scripts
    codewalker_map="Path\To\CodeWalker-master"
    ```
 
@@ -43,6 +44,12 @@ To get started with the GTA 5 Terrain Extractor, follow these steps:
    ```
 
 For detailed instructions, see the [Terrain Extraction Guide](terrain_extraction_guide.md).
+
+## Extraction completeness checklist
+
+If you are rebuilding the full map dataset (heightmap + placements + archetypes + models + collisions + textures), use:
+
+- `docs/extraction_pipeline_checklist.md`
 
 ## Implementation Approach
 

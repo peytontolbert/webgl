@@ -163,6 +163,59 @@ class RpfReader:
             logger.error(f"Failed to get texture {path}: {e}")
             return None
 
+    def get_ytd_textures(self, ytd_file: Any) -> Dict[str, Tuple[np.ndarray, str]]:
+        """
+        Extract textures from an already-loaded CodeWalker YtdFile (or similar) into numpy arrays.
+
+        Returns:
+            Dict[name -> (image_uint8[h,w,c], format_string)]
+
+        Notes:
+        - `CodeWalker.Core`'s `DDSIO.GetPixels(texture, mip)` generally returns decompressed RGBA bytes.
+        - This method is used by exporters (e.g. `export_drawables_for_chunk.py`) that already have a
+          loaded YTD via `GameFileCache.GetYtd(hash)`.
+        """
+        out: Dict[str, Tuple[np.ndarray, str]] = {}
+        try:
+            texdict = getattr(ytd_file, "TextureDict", None)
+            textures_arr = getattr(texdict, "Textures", None) if texdict is not None else None
+            data_items = getattr(textures_arr, "data_items", None) if textures_arr is not None else None
+            if not data_items:
+                return out
+
+            for tex in list(data_items):
+                try:
+                    name = str(getattr(tex, "Name", "") or "")
+                    width = int(getattr(tex, "Width", 0) or 0)
+                    height = int(getattr(tex, "Height", 0) or 0)
+                    fmt = str(getattr(getattr(tex, "Format", None), "ToString", lambda: getattr(tex, "Format", ""))())
+                    if not name or width <= 0 or height <= 0:
+                        continue
+
+                    pixels_net = self.dll_manager.DDSIO.GetPixels(tex, 0)
+                    if not pixels_net:
+                        continue
+                    pixels = bytes(pixels_net)
+
+                    # Best-effort reshape. Prefer RGBA if sizes match.
+                    if len(pixels) == width * height * 4:
+                        arr = np.frombuffer(pixels, dtype=np.uint8).reshape((height, width, 4))
+                    elif len(pixels) == width * height * 3:
+                        arr = np.frombuffer(pixels, dtype=np.uint8).reshape((height, width, 3))
+                    else:
+                        # Fallback: let PIL interpret as RGBA; if this fails we skip the texture.
+                        img = Image.frombytes("RGBA", (width, height), pixels)
+                        arr = np.asarray(img, dtype=np.uint8)
+
+                    out[name] = (arr, fmt)
+                except Exception:
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error extracting YTD textures: {e}")
+
+        return out
+
     def get_file_data(self, file_path: str) -> Optional[bytes]:
         """
         Get raw file data from RPF archive

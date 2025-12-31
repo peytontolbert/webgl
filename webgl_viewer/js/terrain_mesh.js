@@ -6,7 +6,8 @@ export class TerrainMesh {
         this.indexBuffer = null;
         this.vertexCount = 0;
         this.indexCount = 0;
-        this.vertexStride = 32; // 3(pos) + 3(normal) + 2(texcoord) + 2(texcoord1) + 2(texcoord2) + 2(color0)
+        // Interleaved layout: position(3) + normal(3) + texcoord(2) = 8 floats = 32 bytes.
+        this.vertexStride = 32;
     }
 
     createFromHeightmap(width, height, bounds) {
@@ -103,27 +104,24 @@ export class TerrainMesh {
         this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
         this.gl.bufferData(this.gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), this.gl.STATIC_DRAW);
 
-        // Set vertex attributes
+        // Set vertex attributes: only the attributes that exist in our buffer.
+        // (Older versions of the shader used extra attributes that were never populated.)
         const positionLoc = this.gl.getAttribLocation(this.program.program, 'aPosition');
         const normalLoc = this.gl.getAttribLocation(this.program.program, 'aNormal');
         const texcoordLoc = this.gl.getAttribLocation(this.program.program, 'aTexcoord');
-        const texcoord1Loc = this.gl.getAttribLocation(this.program.program, 'aTexcoord1');
-        const texcoord2Loc = this.gl.getAttribLocation(this.program.program, 'aTexcoord2');
-        const color0Loc = this.gl.getAttribLocation(this.program.program, 'aColor0');
 
-        this.gl.enableVertexAttribArray(positionLoc);
-        this.gl.enableVertexAttribArray(normalLoc);
-        this.gl.enableVertexAttribArray(texcoordLoc);
-        this.gl.enableVertexAttribArray(texcoord1Loc);
-        this.gl.enableVertexAttribArray(texcoord2Loc);
-        this.gl.enableVertexAttribArray(color0Loc);
-
-        this.gl.vertexAttribPointer(positionLoc, 3, this.gl.FLOAT, false, this.vertexStride, 0);
-        this.gl.vertexAttribPointer(normalLoc, 3, this.gl.FLOAT, false, this.vertexStride, 12);
-        this.gl.vertexAttribPointer(texcoordLoc, 2, this.gl.FLOAT, false, this.vertexStride, 24);
-        this.gl.vertexAttribPointer(texcoord1Loc, 2, this.gl.FLOAT, false, this.vertexStride, 32);
-        this.gl.vertexAttribPointer(texcoord2Loc, 2, this.gl.FLOAT, false, this.vertexStride, 40);
-        this.gl.vertexAttribPointer(color0Loc, 2, this.gl.FLOAT, false, this.vertexStride, 48);
+        if (positionLoc >= 0) {
+            this.gl.enableVertexAttribArray(positionLoc);
+            this.gl.vertexAttribPointer(positionLoc, 3, this.gl.FLOAT, false, this.vertexStride, 0);
+        }
+        if (normalLoc >= 0) {
+            this.gl.enableVertexAttribArray(normalLoc);
+            this.gl.vertexAttribPointer(normalLoc, 3, this.gl.FLOAT, false, this.vertexStride, 12);
+        }
+        if (texcoordLoc >= 0) {
+            this.gl.enableVertexAttribArray(texcoordLoc);
+            this.gl.vertexAttribPointer(texcoordLoc, 2, this.gl.FLOAT, false, this.vertexStride, 24);
+        }
 
         this.vertexCount = vertices.length / 3;
         this.indexCount = indices.length;

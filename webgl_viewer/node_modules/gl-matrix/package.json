@@ -1,10 +1,11 @@
 {
-  "version": "3.4.3",
+  "version": "3.4.4",
   "name": "gl-matrix",
   "description": "Javascript Matrix and Vector library for High Performance WebGL apps",
   "sideEffects": false,
   "main": "cjs/index.js",
   "module": "esm/index.js",
+  "types": "dist/index.d.ts",
   "homepage": "http://glmatrix.net",
   "license": "MIT",
   "bugs": {

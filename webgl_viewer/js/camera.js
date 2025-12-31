@@ -46,6 +46,36 @@ export class Camera {
         this.updateProjectionMatrix();
     }
 
+    /**
+     * Hard-set camera pose.
+     * @param {number[]} positionVec3
+     * @param {number[]} targetVec3
+     */
+    setLookAt(positionVec3, targetVec3) {
+        if (positionVec3 && positionVec3.length >= 3) {
+            this.position[0] = Number(positionVec3[0]) || 0;
+            this.position[1] = Number(positionVec3[1]) || 0;
+            this.position[2] = Number(positionVec3[2]) || 0;
+        }
+        if (targetVec3 && targetVec3.length >= 3) {
+            this.target[0] = Number(targetVec3[0]) || 0;
+            this.target[1] = Number(targetVec3[1]) || 0;
+            this.target[2] = Number(targetVec3[2]) || 0;
+        }
+        this.updateViewMatrix();
+    }
+
+    /**
+     * Update zoom bounds based on a scene "diameter" in world units.
+     * Keeps scroll zoom sane when the scene scale changes.
+     */
+    setZoomBoundsForSceneDiameter(diameter) {
+        const d = Number(diameter);
+        if (!Number.isFinite(d) || d <= 0) return;
+        this.minZoom = Math.max(50.0, d * 0.05);
+        this.maxZoom = Math.max(this.minZoom * 2.0, d * 2.5);
+    }
+
     updateViewMatrix() {
         // Create view matrix looking from position to target
         glMatrix.mat4.lookAt(

@@ -3,6 +3,10 @@
 ## Overview
 This documentation provides a comprehensive reference for CodeWalker's systems and their Python implementations.
 
+## FiveM integration helpers
+
+- [AI bot bridge (CLI control)](server/ai_bot_bridge.md): Control a real FiveM client from an external CLI/AI process via FXServer HTTP + client events.
+
 ## Core Systems
 1. [Core Systems](core_systems.md)
    - YMAP System

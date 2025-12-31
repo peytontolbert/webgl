@@ -8,9 +8,11 @@ import os
 import struct
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, TYPE_CHECKING
 import logging
-from .dll_manager import DllManager
+
+if TYPE_CHECKING:
+    from .dll_manager import DllManager  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +54,7 @@ class Bounds:
 class HeightmapFile:
     """Handles reading and parsing GTA5 heightmap files"""
     
-    def __init__(self, data: bytes, dll_manager: Optional[DllManager] = None):
+    def __init__(self, data: bytes, dll_manager: Optional["DllManager"] = None):
         """
         Initialize heightmap file from raw data
         
@@ -78,7 +80,7 @@ class HeightmapFile:
             logger.warning("No DLL manager available, using Python implementation")
             self._parse_data(data)
     
-    def _parse_with_dll(self, data: bytes, dll_manager: DllManager):
+    def _parse_with_dll(self, data: bytes, dll_manager: "DllManager"):
         """Parse the heightmap file data using CodeWalker DLL"""
         try:
             # Create CodeWalker HeightmapFile instance
@@ -181,28 +183,45 @@ class HeightmapFile:
             # Calculate header size including compression headers if needed
             header_size = 44  # Base header size
             
-            # Read data length - this is a uint32 value
-            self.data_len = struct.unpack(f"{self.endianness}I", data[40:44])[0]
-            if self.data_len == 0:
-                # If data length is 0, calculate it from file size
-                self.data_len = len(data) - header_size  # Base header size
-            logger.info(f"Data length: {self.data_len}")
-            
-            if self.compressed:
-                header_size += self.height * 8  # Each compression header is 8 bytes
+            # Read Length field (uint32 at offset 40).
+            #
+            # IMPORTANT: This matches CodeWalker.Core's HeightmapFile.cs:
+            # - After reading the base 44-byte header, CodeWalker expects:
+            #     Length == (file_size - current_position)
+            #   where current_position is 44.
+            # - If Compressed > 0, CodeWalker then reads (Height * 8) bytes of CompHeaders
+            #   and subtracts that from Length to get the actual data section length.
+            self.length = struct.unpack(f"{self.endianness}I", data[40:44])[0]
+            if self.length == 0:
+                self.length = len(data) - 44
+            remaining_after_base_header = len(data) - 44
+            if self.length != remaining_after_base_header:
+                logger.warning(
+                    f"Length field {self.length} does not match remaining bytes {remaining_after_base_header} after base header"
+                )
+
+            # Read compression headers if needed
+            self.comp_headers = []
+            comp_headers_size = (self.height * 8) if self.compressed else 0
+            header_size = 44 + comp_headers_size
+            logger.info(f"Length field (post-header bytes): {self.length}")
             logger.info(f"Header size: {header_size} bytes")
-            
+
             # Validate file size
             if len(data) < header_size:
                 raise ValueError(f"File too small for compression headers. Need {header_size} bytes but got {len(data)}")
+
+            # Data section length, matching CodeWalker:
+            # dlen = Length - (Height * 8) when compressed, else dlen = Length.
+            data_section_len = int(self.length - comp_headers_size)
+            available_data_section = len(data) - header_size
+            if data_section_len != available_data_section:
+                logger.warning(
+                    f"Heightmap data section length mismatch: expected {data_section_len}, available {available_data_section}. "
+                    f"Using available."
+                )
+                data_section_len = available_data_section
             
-            # Validate data length
-            if self.data_len > len(data) - header_size:
-                logger.warning(f"Data length {self.data_len} exceeds available data {len(data) - header_size}, adjusting...")
-                self.data_len = len(data) - header_size
-            
-            # Read compression headers if needed
-            self.comp_headers = []
             if self.compressed:
                 offset = 44  # Start after base header
                 for i in range(self.height):
@@ -214,42 +233,46 @@ class HeightmapFile:
                     self.comp_headers.append(header)
                     offset += 8
             
-            # Read height data
+            # Read height data (match CodeWalker indexing).
             if self.compressed:
-                # For compressed data, we need to read from the data section
-                data_section = data[header_size:]
+                # For compressed data, read from the data section
+                data_section = data[header_size:header_size + data_section_len]
                 
                 # Allocate flat arrays like CodeWalker
                 self.max_heights = np.zeros(self.width * self.height, dtype=np.uint8)
                 self.min_heights = np.zeros(self.width * self.height, dtype=np.uint8)
                 
-                # Read max heights
-                for y in range(self.height):
-                    header = self.comp_headers[y]
-                    for i in range(header.count):
-                        x = header.start + i
-                        if x < self.width:  # Ensure we don't write beyond array bounds
-                            idx = y * self.width + x  # Match CodeWalker's flat array indexing
-                            data_idx = header.data_offset + i
-                            if data_idx < len(data_section):
-                                self.max_heights[idx] = data_section[data_idx]
-                
-                # Read min heights
+                # CodeWalker uses:
+                #   h2off = dlen/2
+                #   o = h.DataOffset + x
                 h2off = len(data_section) // 2
                 for y in range(self.height):
-                    header = self.comp_headers[y]
-                    for i in range(header.count):
-                        x = header.start + i
-                        if x < self.width:  # Ensure we don't write beyond array bounds
-                            idx = y * self.width + x  # Match CodeWalker's flat array indexing
-                            data_idx = h2off + header.data_offset + i
-                            if data_idx < len(data_section):
-                                self.min_heights[idx] = data_section[data_idx]
+                    h = self.comp_headers[y]
+                    # Clamp count to width bounds
+                    count = int(h.count)
+                    start = int(h.start)
+                    for i in range(count):
+                        x = start + i
+                        if x < 0 or x >= self.width:
+                            continue
+                        idx = y * self.width + x
+                        o = int(h.data_offset) + x
+                        if 0 <= o < len(data_section) and 0 <= o + h2off < len(data_section):
+                            self.max_heights[idx] = data_section[o]
+                            self.min_heights[idx] = data_section[o + h2off]
+                
             else:
                 # For uncompressed data, read directly from data section
-                data_section = data[header_size:]
-                self.max_heights = np.frombuffer(data_section[:self.data_len], dtype=np.uint8)
-                self.min_heights = np.frombuffer(data_section[self.data_len:], dtype=np.uint8)
+                data_section = data[44:44 + int(self.length)]
+                self.max_heights = np.frombuffer(data_section, dtype=np.uint8)
+                self.min_heights = np.frombuffer(data_section, dtype=np.uint8)
+
+            # Normalize internal representation: always store as (H, W) arrays.
+            # Some code paths historically used flat arrays; many helpers assume 2D indexing.
+            if self.max_heights is not None and self.max_heights.ndim == 1:
+                self.max_heights = self.max_heights.reshape((self.height, self.width))
+            if self.min_heights is not None and self.min_heights.ndim == 1:
+                self.min_heights = self.min_heights.reshape((self.height, self.width))
             
             logger.info("Successfully parsed heightmap data")
             

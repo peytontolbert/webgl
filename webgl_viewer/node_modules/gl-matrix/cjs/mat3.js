@@ -1,48 +1,43 @@
 "use strict";
 
-function _typeof(obj) { "@babel/helpers - typeof"; if (typeof Symbol === "function" && typeof Symbol.iterator === "symbol") { _typeof = function _typeof(obj) { return typeof obj; }; } else { _typeof = function _typeof(obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; }; } return _typeof(obj); }
-
+function _typeof(o) { "@babel/helpers - typeof"; return _typeof = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator ? function (o) { return typeof o; } : function (o) { return o && "function" == typeof Symbol && o.constructor === Symbol && o !== Symbol.prototype ? "symbol" : typeof o; }, _typeof(o); }
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-exports.create = create;
-exports.fromMat4 = fromMat4;
+exports.add = add;
+exports.adjoint = adjoint;
 exports.clone = clone;
 exports.copy = copy;
-exports.fromValues = fromValues;
-exports.set = set;
-exports.identity = identity;
-exports.transpose = transpose;
-exports.invert = invert;
-exports.adjoint = adjoint;
+exports.create = create;
 exports.determinant = determinant;
-exports.multiply = multiply;
-exports.translate = translate;
-exports.rotate = rotate;
-exports.scale = scale;
-exports.fromTranslation = fromTranslation;
+exports.equals = equals;
+exports.exactEquals = exactEquals;
+exports.frob = frob;
+exports.fromMat2d = fromMat2d;
+exports.fromMat4 = fromMat4;
+exports.fromQuat = fromQuat;
 exports.fromRotation = fromRotation;
 exports.fromScaling = fromScaling;
-exports.fromMat2d = fromMat2d;
-exports.fromQuat = fromQuat;
-exports.normalFromMat4 = normalFromMat4;
-exports.projection = projection;
-exports.str = str;
-exports.frob = frob;
-exports.add = add;
-exports.subtract = subtract;
+exports.fromTranslation = fromTranslation;
+exports.fromValues = fromValues;
+exports.identity = identity;
+exports.invert = invert;
+exports.mul = void 0;
+exports.multiply = multiply;
 exports.multiplyScalar = multiplyScalar;
 exports.multiplyScalarAndAdd = multiplyScalarAndAdd;
-exports.exactEquals = exactEquals;
-exports.equals = equals;
-exports.sub = exports.mul = void 0;
-
+exports.normalFromMat4 = normalFromMat4;
+exports.projection = projection;
+exports.rotate = rotate;
+exports.scale = scale;
+exports.set = set;
+exports.str = str;
+exports.sub = void 0;
+exports.subtract = subtract;
+exports.translate = translate;
+exports.transpose = transpose;
 var glMatrix = _interopRequireWildcard(require("./common.js"));
-
-function _getRequireWildcardCache(nodeInterop) { if (typeof WeakMap !== "function") return null; var cacheBabelInterop = new WeakMap(); var cacheNodeInterop = new WeakMap(); return (_getRequireWildcardCache = function _getRequireWildcardCache(nodeInterop) { return nodeInterop ? cacheNodeInterop : cacheBabelInterop; })(nodeInterop); }
-
-function _interopRequireWildcard(obj, nodeInterop) { if (!nodeInterop && obj && obj.__esModule) { return obj; } if (obj === null || _typeof(obj) !== "object" && typeof obj !== "function") { return { "default": obj }; } var cache = _getRequireWildcardCache(nodeInterop); if (cache && cache.has(obj)) { return cache.get(obj); } var newObj = {}; var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor; for (var key in obj) { if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) { var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null; if (desc && (desc.get || desc.set)) { Object.defineProperty(newObj, key, desc); } else { newObj[key] = obj[key]; } } } newObj["default"] = obj; if (cache) { cache.set(obj, newObj); } return newObj; }
-
+function _interopRequireWildcard(e, t) { if ("function" == typeof WeakMap) var r = new WeakMap(), n = new WeakMap(); return (_interopRequireWildcard = function _interopRequireWildcard(e, t) { if (!t && e && e.__esModule) return e; var o, i, f = { __proto__: null, "default": e }; if (null === e || "object" != _typeof(e) && "function" != typeof e) return f; if (o = t ? n : r) { if (o.has(e)) return o.get(e); o.set(e, f); } for (var _t in e) "default" !== _t && {}.hasOwnProperty.call(e, _t) && ((i = (o = Object.defineProperty) && Object.getOwnPropertyDescriptor(e, _t)) && (i.get || i.set) ? o(f, _t, i) : f[_t] = e[_t]); return f; })(e, t); }
 /**
  * 3x3 Matrix
  * @module mat3
@@ -55,7 +50,6 @@ function _interopRequireWildcard(obj, nodeInterop) { if (!nodeInterop && obj && 
  */
 function create() {
   var out = new glMatrix.ARRAY_TYPE(9);
-
   if (glMatrix.ARRAY_TYPE != Float32Array) {
     out[1] = 0;
     out[2] = 0;
@@ -64,12 +58,12 @@ function create() {
     out[6] = 0;
     out[7] = 0;
   }
-
   out[0] = 1;
   out[4] = 1;
   out[8] = 1;
   return out;
 }
+
 /**
  * Copies the upper-left 3x3 values into the given mat3.
  *
@@ -77,8 +71,6 @@ function create() {
  * @param {ReadonlyMat4} a   the source 4x4 matrix
  * @returns {mat3} out
  */
-
-
 function fromMat4(out, a) {
   out[0] = a[0];
   out[1] = a[1];
@@ -91,14 +83,13 @@ function fromMat4(out, a) {
   out[8] = a[10];
   return out;
 }
+
 /**
  * Creates a new mat3 initialized with values from an existing matrix
  *
  * @param {ReadonlyMat3} a matrix to clone
  * @returns {mat3} a new 3x3 matrix
  */
-
-
 function clone(a) {
   var out = new glMatrix.ARRAY_TYPE(9);
   out[0] = a[0];
@@ -112,6 +103,7 @@ function clone(a) {
   out[8] = a[8];
   return out;
 }
+
 /**
  * Copy the values from one mat3 to another
  *
@@ -119,8 +111,6 @@ function clone(a) {
  * @param {ReadonlyMat3} a the source matrix
  * @returns {mat3} out
  */
-
-
 function copy(out, a) {
   out[0] = a[0];
   out[1] = a[1];
@@ -133,6 +123,7 @@ function copy(out, a) {
   out[8] = a[8];
   return out;
 }
+
 /**
  * Create a new mat3 with the given values
  *
@@ -147,8 +138,6 @@ function copy(out, a) {
  * @param {Number} m22 Component in column 2, row 2 position (index 8)
  * @returns {mat3} A new mat3
  */
-
-
 function fromValues(m00, m01, m02, m10, m11, m12, m20, m21, m22) {
   var out = new glMatrix.ARRAY_TYPE(9);
   out[0] = m00;
@@ -162,6 +151,7 @@ function fromValues(m00, m01, m02, m10, m11, m12, m20, m21, m22) {
   out[8] = m22;
   return out;
 }
+
 /**
  * Set the components of a mat3 to the given values
  *
@@ -177,8 +167,6 @@ function fromValues(m00, m01, m02, m10, m11, m12, m20, m21, m22) {
  * @param {Number} m22 Component in column 2, row 2 position (index 8)
  * @returns {mat3} out
  */
-
-
 function set(out, m00, m01, m02, m10, m11, m12, m20, m21, m22) {
   out[0] = m00;
   out[1] = m01;
@@ -191,14 +179,13 @@ function set(out, m00, m01, m02, m10, m11, m12, m20, m21, m22) {
   out[8] = m22;
   return out;
 }
+
 /**
  * Set a mat3 to the identity matrix
  *
  * @param {mat3} out the receiving matrix
  * @returns {mat3} out
  */
-
-
 function identity(out) {
   out[0] = 1;
   out[1] = 0;
@@ -211,6 +198,7 @@ function identity(out) {
   out[8] = 1;
   return out;
 }
+
 /**
  * Transpose the values of a mat3
  *
@@ -218,14 +206,12 @@ function identity(out) {
  * @param {ReadonlyMat3} a the source matrix
  * @returns {mat3} out
  */
-
-
 function transpose(out, a) {
   // If we are transposing ourselves we can skip a few steps but have to cache some values
   if (out === a) {
     var a01 = a[1],
-        a02 = a[2],
-        a12 = a[5];
+      a02 = a[2],
+      a12 = a[5];
     out[1] = a[3];
     out[2] = a[6];
     out[3] = a01;
@@ -243,38 +229,35 @@ function transpose(out, a) {
     out[7] = a[5];
     out[8] = a[8];
   }
-
   return out;
 }
+
 /**
  * Inverts a mat3
  *
  * @param {mat3} out the receiving matrix
  * @param {ReadonlyMat3} a the source matrix
- * @returns {mat3} out
+ * @returns {mat3 | null} out, or null if source matrix is not invertible
  */
-
-
 function invert(out, a) {
   var a00 = a[0],
-      a01 = a[1],
-      a02 = a[2];
+    a01 = a[1],
+    a02 = a[2];
   var a10 = a[3],
-      a11 = a[4],
-      a12 = a[5];
+    a11 = a[4],
+    a12 = a[5];
   var a20 = a[6],
-      a21 = a[7],
-      a22 = a[8];
+    a21 = a[7],
+    a22 = a[8];
   var b01 = a22 * a11 - a12 * a21;
   var b11 = -a22 * a10 + a12 * a20;
-  var b21 = a21 * a10 - a11 * a20; // Calculate the determinant
+  var b21 = a21 * a10 - a11 * a20;
 
+  // Calculate the determinant
   var det = a00 * b01 + a01 * b11 + a02 * b21;
-
   if (!det) {
     return null;
   }
-
   det = 1.0 / det;
   out[0] = b01 * det;
   out[1] = (-a22 * a01 + a02 * a21) * det;
@@ -287,6 +270,7 @@ function invert(out, a) {
   out[8] = (a11 * a00 - a01 * a10) * det;
   return out;
 }
+
 /**
  * Calculates the adjugate of a mat3
  *
@@ -294,18 +278,16 @@ function invert(out, a) {
  * @param {ReadonlyMat3} a the source matrix
  * @returns {mat3} out
  */
-
-
 function adjoint(out, a) {
   var a00 = a[0],
-      a01 = a[1],
-      a02 = a[2];
+    a01 = a[1],
+    a02 = a[2];
   var a10 = a[3],
-      a11 = a[4],
-      a12 = a[5];
+    a11 = a[4],
+    a12 = a[5];
   var a20 = a[6],
-      a21 = a[7],
-      a22 = a[8];
+    a21 = a[7],
+    a22 = a[8];
   out[0] = a11 * a22 - a12 * a21;
   out[1] = a02 * a21 - a01 * a22;
   out[2] = a01 * a12 - a02 * a11;
@@ -317,26 +299,26 @@ function adjoint(out, a) {
   out[8] = a00 * a11 - a01 * a10;
   return out;
 }
+
 /**
  * Calculates the determinant of a mat3
  *
  * @param {ReadonlyMat3} a the source matrix
  * @returns {Number} determinant of a
  */
-
-
 function determinant(a) {
   var a00 = a[0],
-      a01 = a[1],
-      a02 = a[2];
+    a01 = a[1],
+    a02 = a[2];
   var a10 = a[3],
-      a11 = a[4],
-      a12 = a[5];
+    a11 = a[4],
+    a12 = a[5];
   var a20 = a[6],
-      a21 = a[7],
-      a22 = a[8];
+    a21 = a[7],
+    a22 = a[8];
   return a00 * (a22 * a11 - a12 * a21) + a01 * (-a22 * a10 + a12 * a20) + a02 * (a21 * a10 - a11 * a20);
 }
+
 /**
  * Multiplies two mat3's
  *
@@ -345,27 +327,25 @@ function determinant(a) {
  * @param {ReadonlyMat3} b the second operand
  * @returns {mat3} out
  */
-
-
 function multiply(out, a, b) {
   var a00 = a[0],
-      a01 = a[1],
-      a02 = a[2];
+    a01 = a[1],
+    a02 = a[2];
   var a10 = a[3],
-      a11 = a[4],
-      a12 = a[5];
+    a11 = a[4],
+    a12 = a[5];
   var a20 = a[6],
-      a21 = a[7],
-      a22 = a[8];
+    a21 = a[7],
+    a22 = a[8];
   var b00 = b[0],
-      b01 = b[1],
-      b02 = b[2];
+    b01 = b[1],
+    b02 = b[2];
   var b10 = b[3],
-      b11 = b[4],
-      b12 = b[5];
+    b11 = b[4],
+    b12 = b[5];
   var b20 = b[6],
-      b21 = b[7],
-      b22 = b[8];
+    b21 = b[7],
+    b22 = b[8];
   out[0] = b00 * a00 + b01 * a10 + b02 * a20;
   out[1] = b00 * a01 + b01 * a11 + b02 * a21;
   out[2] = b00 * a02 + b01 * a12 + b02 * a22;
@@ -377,6 +357,7 @@ function multiply(out, a, b) {
   out[8] = b20 * a02 + b21 * a12 + b22 * a22;
   return out;
 }
+
 /**
  * Translate a mat3 by the given vector
  *
@@ -385,20 +366,18 @@ function multiply(out, a, b) {
  * @param {ReadonlyVec2} v vector to translate by
  * @returns {mat3} out
  */
-
-
 function translate(out, a, v) {
   var a00 = a[0],
-      a01 = a[1],
-      a02 = a[2],
-      a10 = a[3],
-      a11 = a[4],
-      a12 = a[5],
-      a20 = a[6],
-      a21 = a[7],
-      a22 = a[8],
-      x = v[0],
-      y = v[1];
+    a01 = a[1],
+    a02 = a[2],
+    a10 = a[3],
+    a11 = a[4],
+    a12 = a[5],
+    a20 = a[6],
+    a21 = a[7],
+    a22 = a[8],
+    x = v[0],
+    y = v[1];
   out[0] = a00;
   out[1] = a01;
   out[2] = a02;
@@ -410,6 +389,7 @@ function translate(out, a, v) {
   out[8] = x * a02 + y * a12 + a22;
   return out;
 }
+
 /**
  * Rotates a mat3 by the given angle
  *
@@ -418,20 +398,18 @@ function translate(out, a, v) {
  * @param {Number} rad the angle to rotate the matrix by
  * @returns {mat3} out
  */
-
-
 function rotate(out, a, rad) {
   var a00 = a[0],
-      a01 = a[1],
-      a02 = a[2],
-      a10 = a[3],
-      a11 = a[4],
-      a12 = a[5],
-      a20 = a[6],
-      a21 = a[7],
-      a22 = a[8],
-      s = Math.sin(rad),
-      c = Math.cos(rad);
+    a01 = a[1],
+    a02 = a[2],
+    a10 = a[3],
+    a11 = a[4],
+    a12 = a[5],
+    a20 = a[6],
+    a21 = a[7],
+    a22 = a[8],
+    s = Math.sin(rad),
+    c = Math.cos(rad);
   out[0] = c * a00 + s * a10;
   out[1] = c * a01 + s * a11;
   out[2] = c * a02 + s * a12;
@@ -443,19 +421,18 @@ function rotate(out, a, rad) {
   out[8] = a22;
   return out;
 }
+
 /**
  * Scales the mat3 by the dimensions in the given vec2
  *
  * @param {mat3} out the receiving matrix
- * @param {ReadonlyMat3} a the matrix to rotate
+ * @param {ReadonlyMat3} a the matrix to scale
  * @param {ReadonlyVec2} v the vec2 to scale the matrix by
  * @returns {mat3} out
  **/
-
-
 function scale(out, a, v) {
   var x = v[0],
-      y = v[1];
+    y = v[1];
   out[0] = x * a[0];
   out[1] = x * a[1];
   out[2] = x * a[2];
@@ -467,6 +444,7 @@ function scale(out, a, v) {
   out[8] = a[8];
   return out;
 }
+
 /**
  * Creates a matrix from a vector translation
  * This is equivalent to (but much faster than):
@@ -478,8 +456,6 @@ function scale(out, a, v) {
  * @param {ReadonlyVec2} v Translation vector
  * @returns {mat3} out
  */
-
-
 function fromTranslation(out, v) {
   out[0] = 1;
   out[1] = 0;
@@ -492,6 +468,7 @@ function fromTranslation(out, v) {
   out[8] = 1;
   return out;
 }
+
 /**
  * Creates a matrix from a given angle
  * This is equivalent to (but much faster than):
@@ -503,11 +480,9 @@ function fromTranslation(out, v) {
  * @param {Number} rad the angle to rotate the matrix by
  * @returns {mat3} out
  */
-
-
 function fromRotation(out, rad) {
   var s = Math.sin(rad),
-      c = Math.cos(rad);
+    c = Math.cos(rad);
   out[0] = c;
   out[1] = s;
   out[2] = 0;
@@ -519,6 +494,7 @@ function fromRotation(out, rad) {
   out[8] = 1;
   return out;
 }
+
 /**
  * Creates a matrix from a vector scaling
  * This is equivalent to (but much faster than):
@@ -530,8 +506,6 @@ function fromRotation(out, rad) {
  * @param {ReadonlyVec2} v Scaling vector
  * @returns {mat3} out
  */
-
-
 function fromScaling(out, v) {
   out[0] = v[0];
   out[1] = 0;
@@ -544,6 +518,7 @@ function fromScaling(out, v) {
   out[8] = 1;
   return out;
 }
+
 /**
  * Copies the values from a mat2d into a mat3
  *
@@ -551,8 +526,6 @@ function fromScaling(out, v) {
  * @param {ReadonlyMat2d} a the matrix to copy
  * @returns {mat3} out
  **/
-
-
 function fromMat2d(out, a) {
   out[0] = a[0];
   out[1] = a[1];
@@ -565,6 +538,7 @@ function fromMat2d(out, a) {
   out[8] = 1;
   return out;
 }
+
 /**
  * Calculates a 3x3 matrix from the given quaternion
  *
@@ -573,13 +547,11 @@ function fromMat2d(out, a) {
  *
  * @returns {mat3} out
  */
-
-
 function fromQuat(out, q) {
   var x = q[0],
-      y = q[1],
-      z = q[2],
-      w = q[3];
+    y = q[1],
+    z = q[2],
+    w = q[3];
   var x2 = x + x;
   var y2 = y + y;
   var z2 = z + z;
@@ -603,6 +575,7 @@ function fromQuat(out, q) {
   out[8] = 1 - xx - yy;
   return out;
 }
+
 /**
  * Calculates a 3x3 normal matrix (transpose inverse) from the 4x4 matrix
  *
@@ -611,25 +584,23 @@ function fromQuat(out, q) {
  *
  * @returns {mat3} out
  */
-
-
 function normalFromMat4(out, a) {
   var a00 = a[0],
-      a01 = a[1],
-      a02 = a[2],
-      a03 = a[3];
+    a01 = a[1],
+    a02 = a[2],
+    a03 = a[3];
   var a10 = a[4],
-      a11 = a[5],
-      a12 = a[6],
-      a13 = a[7];
+    a11 = a[5],
+    a12 = a[6],
+    a13 = a[7];
   var a20 = a[8],
-      a21 = a[9],
-      a22 = a[10],
-      a23 = a[11];
+    a21 = a[9],
+    a22 = a[10],
+    a23 = a[11];
   var a30 = a[12],
-      a31 = a[13],
-      a32 = a[14],
-      a33 = a[15];
+    a31 = a[13],
+    a32 = a[14],
+    a33 = a[15];
   var b00 = a00 * a11 - a01 * a10;
   var b01 = a00 * a12 - a02 * a10;
   var b02 = a00 * a13 - a03 * a10;
@@ -641,14 +612,13 @@ function normalFromMat4(out, a) {
   var b08 = a20 * a33 - a23 * a30;
   var b09 = a21 * a32 - a22 * a31;
   var b10 = a21 * a33 - a23 * a31;
-  var b11 = a22 * a33 - a23 * a32; // Calculate the determinant
+  var b11 = a22 * a33 - a23 * a32;
 
+  // Calculate the determinant
   var det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
-
   if (!det) {
     return null;
   }
-
   det = 1.0 / det;
   out[0] = (a11 * b11 - a12 * b10 + a13 * b09) * det;
   out[1] = (a12 * b08 - a10 * b11 - a13 * b07) * det;
@@ -661,6 +631,7 @@ function normalFromMat4(out, a) {
   out[8] = (a30 * b04 - a31 * b02 + a33 * b00) * det;
   return out;
 }
+
 /**
  * Generates a 2D projection matrix with the given bounds
  *
@@ -669,8 +640,6 @@ function normalFromMat4(out, a) {
  * @param {number} height Height of gl context
  * @returns {mat3} out
  */
-
-
 function projection(out, width, height) {
   out[0] = 2 / width;
   out[1] = 0;
@@ -683,28 +652,27 @@ function projection(out, width, height) {
   out[8] = 1;
   return out;
 }
+
 /**
  * Returns a string representation of a mat3
  *
  * @param {ReadonlyMat3} a matrix to represent as a string
  * @returns {String} string representation of the matrix
  */
-
-
 function str(a) {
   return "mat3(" + a[0] + ", " + a[1] + ", " + a[2] + ", " + a[3] + ", " + a[4] + ", " + a[5] + ", " + a[6] + ", " + a[7] + ", " + a[8] + ")";
 }
+
 /**
  * Returns Frobenius norm of a mat3
  *
  * @param {ReadonlyMat3} a the matrix to calculate Frobenius norm of
  * @returns {Number} Frobenius norm
  */
-
-
 function frob(a) {
-  return Math.hypot(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+  return Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2] + a[3] * a[3] + a[4] * a[4] + a[5] * a[5] + a[6] * a[6] + a[7] * a[7] + a[8] * a[8]);
 }
+
 /**
  * Adds two mat3's
  *
@@ -713,8 +681,6 @@ function frob(a) {
  * @param {ReadonlyMat3} b the second operand
  * @returns {mat3} out
  */
-
-
 function add(out, a, b) {
   out[0] = a[0] + b[0];
   out[1] = a[1] + b[1];
@@ -727,6 +693,7 @@ function add(out, a, b) {
   out[8] = a[8] + b[8];
   return out;
 }
+
 /**
  * Subtracts matrix b from matrix a
  *
@@ -735,8 +702,6 @@ function add(out, a, b) {
  * @param {ReadonlyMat3} b the second operand
  * @returns {mat3} out
  */
-
-
 function subtract(out, a, b) {
   out[0] = a[0] - b[0];
   out[1] = a[1] - b[1];
@@ -749,6 +714,7 @@ function subtract(out, a, b) {
   out[8] = a[8] - b[8];
   return out;
 }
+
 /**
  * Multiply each element of the matrix by a scalar.
  *
@@ -757,8 +723,6 @@ function subtract(out, a, b) {
  * @param {Number} b amount to scale the matrix's elements by
  * @returns {mat3} out
  */
-
-
 function multiplyScalar(out, a, b) {
   out[0] = a[0] * b;
   out[1] = a[1] * b;
@@ -771,6 +735,7 @@ function multiplyScalar(out, a, b) {
   out[8] = a[8] * b;
   return out;
 }
+
 /**
  * Adds two mat3's after multiplying each element of the second operand by a scalar value.
  *
@@ -780,8 +745,6 @@ function multiplyScalar(out, a, b) {
  * @param {Number} scale the amount to scale b's elements by before adding
  * @returns {mat3} out
  */
-
-
 function multiplyScalarAndAdd(out, a, b, scale) {
   out[0] = a[0] + b[0] * scale;
   out[1] = a[1] + b[1] * scale;
@@ -794,6 +757,7 @@ function multiplyScalarAndAdd(out, a, b, scale) {
   out[8] = a[8] + b[8] * scale;
   return out;
 }
+
 /**
  * Returns whether or not the matrices have exactly the same elements in the same position (when compared with ===)
  *
@@ -801,11 +765,10 @@ function multiplyScalarAndAdd(out, a, b, scale) {
  * @param {ReadonlyMat3} b The second matrix.
  * @returns {Boolean} True if the matrices are equal, false otherwise.
  */
-
-
 function exactEquals(a, b) {
   return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3] && a[4] === b[4] && a[5] === b[5] && a[6] === b[6] && a[7] === b[7] && a[8] === b[8];
 }
+
 /**
  * Returns whether or not the matrices have approximately the same elements in the same position.
  *
@@ -813,41 +776,36 @@ function exactEquals(a, b) {
  * @param {ReadonlyMat3} b The second matrix.
  * @returns {Boolean} True if the matrices are equal, false otherwise.
  */
-
-
 function equals(a, b) {
   var a0 = a[0],
-      a1 = a[1],
-      a2 = a[2],
-      a3 = a[3],
-      a4 = a[4],
-      a5 = a[5],
-      a6 = a[6],
-      a7 = a[7],
-      a8 = a[8];
+    a1 = a[1],
+    a2 = a[2],
+    a3 = a[3],
+    a4 = a[4],
+    a5 = a[5],
+    a6 = a[6],
+    a7 = a[7],
+    a8 = a[8];
   var b0 = b[0],
-      b1 = b[1],
-      b2 = b[2],
-      b3 = b[3],
-      b4 = b[4],
-      b5 = b[5],
-      b6 = b[6],
-      b7 = b[7],
-      b8 = b[8];
+    b1 = b[1],
+    b2 = b[2],
+    b3 = b[3],
+    b4 = b[4],
+    b5 = b[5],
+    b6 = b[6],
+    b7 = b[7],
+    b8 = b[8];
   return Math.abs(a0 - b0) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a0), Math.abs(b0)) && Math.abs(a1 - b1) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a1), Math.abs(b1)) && Math.abs(a2 - b2) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a2), Math.abs(b2)) && Math.abs(a3 - b3) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a3), Math.abs(b3)) && Math.abs(a4 - b4) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a4), Math.abs(b4)) && Math.abs(a5 - b5) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a5), Math.abs(b5)) && Math.abs(a6 - b6) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a6), Math.abs(b6)) && Math.abs(a7 - b7) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a7), Math.abs(b7)) && Math.abs(a8 - b8) <= glMatrix.EPSILON * Math.max(1.0, Math.abs(a8), Math.abs(b8));
 }
+
 /**
  * Alias for {@link mat3.multiply}
  * @function
  */
+var mul = exports.mul = multiply;
 
-
-var mul = multiply;
 /**
  * Alias for {@link mat3.subtract}
  * @function
  */
-
-exports.mul = mul;
-var sub = subtract;
-exports.sub = sub;
+var sub = exports.sub = subtract;

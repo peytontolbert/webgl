@@ -47,6 +47,13 @@ class DllManager:
         if self._initialized:
             return
             
+        # Keep both the Path (for local filesystem operations) and the original string.
+        # We intentionally preserve the original string because CodeWalker concatenates
+        # Windows-style suffixes like "\\gta5.exe" onto whatever we pass into
+        # GTA5Keys.LoadFromPath(...). On Linux, ensuring a trailing "/" keeps the
+        # resulting compat filename *inside* the game directory ("/.../gtav/\\gta5.exe")
+        # instead of as a sibling entry ("/.../gtav\\gta5.exe").
+        self.game_path_input = str(game_path)
         self.game_path = Path(game_path)
         self.initialized = False
         self.dll = None
@@ -85,6 +92,12 @@ class DllManager:
     def _load_dll(self) -> bool:
         """Load the GTA5 DLL"""
         try:
+            # On Linux, CodeWalker sometimes constructs Windows-style paths (using backslashes)
+            # for a few key files (notably `gta5.exe` used for key/magic data).
+            # Backslashes are valid filename characters on Linux, so those paths won't resolve
+            # unless we provide a compat file at that exact name.
+            self._ensure_linux_codewalker_compat_files()
+
             # Get the path to compiled_cw directory
             cw_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "compiled_cw")
             
@@ -103,6 +116,8 @@ class DllManager:
                 YtdFile, YmapFile, YdrFile,
                 WatermapFile, YnvFile, YndFile
             )
+            # Utility helpers (DDS decoding etc.)
+            from CodeWalker.Utils import DDSIO
             from CodeWalker.World import (
                 Heightmaps, Entity, Space, Water,
                 Watermaps, Camera, Weather, Clouds
@@ -122,6 +137,7 @@ class DllManager:
             self.WatermapFile = WatermapFile
             self.YnvFile = YnvFile
             self.YndFile = YndFile
+            self.DDSIO = DDSIO
             
             # World types
             self.Entity = Entity
@@ -133,8 +149,12 @@ class DllManager:
             self.Clouds = Clouds
             
             # Initialize components in correct order
-            # 1. Initialize GTA5Keys first - this sets up all encryption keys
-            self.GTA5Keys.LoadFromPath(str(self.game_path))
+            # 1. Initialize GTA5Keys first - this sets up all encryption keys.
+            # On Linux we pass a path with a trailing "/" so CodeWalker probes
+            # "/.../gtav/\\gta5.exe" (a file *inside* the dir) rather than
+            # "/.../gtav\\gta5.exe" (a weird sibling name).
+            load_path = self._codewalker_load_path()
+            self.GTA5Keys.LoadFromPath(load_path)
             
             # 2. Initialize GameFileCache with required parameters
             # - size: 2GB cache size (2 * 1024 * 1024 * 1024)
@@ -147,7 +167,7 @@ class DllManager:
             self.game_file_cache = GameFileCache(
                 2 * 1024 * 1024 * 1024,  # 2GB cache size
                 3600,                     # 1 hour cache time
-                str(self.game_path),      # GTA5 folder
+                load_path,                # GTA5 folder
                 False,                    # gen9
                 "",                       # dlc
                 False,                    # mods
@@ -166,15 +186,26 @@ class DllManager:
             error_log_action = Action[str](error_log)
             
             # 4. Create and initialize RpfManager in one step
-            self.rpf_manager = RpfManager()
-            self.rpf_manager.Init(
-                str(self.game_path),  # folder path
-                False,                # gen9 (not needed for our use case)
-                update_status_action, # status callback
-                error_log_action,     # error callback
-                False,                # rootOnly (we want all directories)
-                True                  # buildIndex (we need the index)
-            )
+            #
+            # IMPORTANT:
+            # For drawables/archetypes, CodeWalker expects GameFileCache.Init(...) to be called.
+            # That method builds global + DLC dictionaries (including archetypes) and wires up an RpfManager.
+            #
+            # Older versions of this repo initialized RpfManager directly but did not call GameFileCache.Init,
+            # which results in `GameFileCache.GetArchetype(hash)` returning None for all hashes.
+            #
+            # We therefore initialize GameFileCache here and then reuse its RpfMan as our rpf_manager.
+            try:
+                self.game_file_cache.Init(update_status_action, error_log_action)
+            except Exception as e:
+                logger.error(f"Failed to Init GameFileCache: {e}")
+                return False
+
+            # Reuse GameFileCache's RpfManager so everyone shares the same index.
+            try:
+                self.rpf_manager = getattr(self.game_file_cache, "RpfMan", None) or RpfManager()
+            except Exception:
+                self.rpf_manager = RpfManager()
             
             # 5. Set initialized flag
             self.initialized = True
@@ -188,6 +219,80 @@ class DllManager:
         except Exception as e:
             logger.error(f"Error loading DLL: {e}")
             return False
+
+    def _ensure_linux_codewalker_compat_files(self) -> None:
+        """
+        Best-effort Linux compatibility for CodeWalker file probing.
+
+        CodeWalker (Windows-oriented) sometimes probes for `<gamePath>\\gta5.exe`.
+        On Linux, that is interpreted as a *literal filename containing a backslash*,
+        so it will fail even if `<gamePath>/GTA5.exe` exists.
+
+        We create a symlink at that exact path if needed:
+          `/path/to/gtav\\gta5.exe` -> `/path/to/gtav/GTA5.exe`
+
+        This does not modify the actual GTA install contents; it adds a link next to it.
+        """
+        try:
+            if os.name == "nt":
+                return
+
+            game_dir = Path(self.game_path)
+            if not game_dir.exists():
+                return
+
+            # Locate the real GTA5 executable (case varies by install/source).
+            target = None
+            for candidate in ("GTA5.exe", "gta5.exe"):
+                p = game_dir / candidate
+                if p.exists():
+                    target = p
+                    break
+            if target is None:
+                return
+
+            # CodeWalker uses Windows-style concatenation: folder + "\\gta5.exe".
+            # Depending on whether 'folder' ends with '/', Linux may interpret the
+            # result as either:
+            # - sibling entry (no trailing '/'):   "/.../gtav\\gta5.exe"   (one path component)
+            # - inside dir (with trailing '/'):    "/.../gtav/\\gta5.exe"  (file named "\\gta5.exe")
+            #
+            # We create both if needed, to be robust across call sites.
+            compat_paths = [
+                Path(f"{str(game_dir)}\\gta5.exe"),     # sibling-ish, one component containing '\'
+                (game_dir / "\\gta5.exe"),              # inside game_dir, filename starts with '\'
+            ]
+
+            for compat_path in compat_paths:
+                # If something already exists there (file or symlink), leave it alone.
+                if compat_path.exists() or compat_path.is_symlink():
+                    continue
+
+                compat_parent = compat_path.parent
+                if not compat_parent.exists():
+                    continue
+
+                try:
+                    os.symlink(str(target), str(compat_path))
+                    logger.info(f"Created Linux compat symlink for CodeWalker: {compat_path} -> {target}")
+                except OSError as e:
+                    logger.warning(f"Could not create compat symlink {compat_path} -> {target}: {e}")
+
+        except Exception as e:
+            # Never hard-fail init due to the compat helper.
+            logger.debug(f"Compat helper failed: {e}")
+
+    def _codewalker_load_path(self) -> str:
+        """
+        Return the path string we pass into CodeWalker.
+
+        On Linux, we append a trailing "/" so CodeWalker path concatenations like
+        `path + "\\gta5.exe"` stay inside the directory as `/path/\\gta5.exe`.
+        """
+        p = (self.game_path_input or str(self.game_path)).strip()
+        if os.name != "nt" and p and not p.endswith("/"):
+            return p + "/"
+        return p
             
     def _init_functions(self):
         """Initialize function signatures"""
