@@ -2,26 +2,17 @@ export class TerrainMesh {
     constructor(gl, program) {
         this.gl = gl;
         this.program = program;
+        this.vao = null;
         this.vertexBuffer = null;
         this.indexBuffer = null;
         this.vertexCount = 0;
         this.indexCount = 0;
-        this.vertexStride = 32; // 3(pos) + 3(normal) + 2(texcoord) + 2(texcoord1) + 2(texcoord2) + 2(color0)
+        this.indexType = null; // gl.UNSIGNED_SHORT or gl.UNSIGNED_INT
+        // 3(pos) + 3(normal) + 2(texcoord) + 2(texcoord1) + 2(texcoord2) + 2(color0) = 14 floats = 56 bytes
+        this.vertexStride = 56;
     }
 
     createFromHeightmap(width, height, bounds) {
-        // Calculate step sizes
-        const size = [
-            bounds.max_x - bounds.min_x,
-            bounds.max_y - bounds.min_y,
-            bounds.max_z - bounds.min_z
-        ];
-        const step = [
-            size[0] / (width - 1),
-            size[1] / (height - 1),
-            size[2] / 255.0 // Height values are 0-255
-        ];
-
         // Generate vertices
         const vertices = [];
         const indices = [];
@@ -34,17 +25,18 @@ export class TerrainMesh {
         // Create vertex data
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {
-                // Calculate position
-                const posX = bounds.min_x + x * step[0];
-                const posY = bounds.min_y + y * step[1];
-                const posZ = bounds.min_z; // Height will be set by shader
+                // aPosition.xy is expected to be normalized [0..1] in the vertex shader.
+                // The shader will expand it to world space using terrain bounds/extents.
+                const u = x / (width - 1);
+                const v = y / (height - 1);
+                const posX = u;
+                const posY = v;
+                const posZ = 0.0; // Height will be set by shader
 
                 // Add vertex
                 vertices.push(posX, posY, posZ);
 
                 // Add UV coordinates
-                const u = x / (width - 1);
-                const v = y / (height - 1);
                 texcoords.push(u, v);
                 texcoords1.push(u * 2, v * 2); // Second UV set for detail textures
                 texcoords2.push(u * 4, v * 4); // Third UV set for macro textures
@@ -77,68 +69,97 @@ export class TerrainMesh {
         }
 
         // Create interleaved vertex buffer
-        const vertexData = new Float32Array(vertices.length * 8); // 8 components per vertex
-        for (let i = 0; i < vertices.length / 3; i++) {
-            const base = i * 8;
-            // Position
-            vertexData[base] = vertices[i * 3];
+        const vcount = vertices.length / 3;
+        const vertexData = new Float32Array(vcount * 14);
+        for (let i = 0; i < vcount; i++) {
+            const base = i * 14;
+            // Position (3)
+            vertexData[base + 0] = vertices[i * 3 + 0];
             vertexData[base + 1] = vertices[i * 3 + 1];
             vertexData[base + 2] = vertices[i * 3 + 2];
-            // Normal
-            vertexData[base + 3] = normals[i * 3];
+            // Normal (3)
+            vertexData[base + 3] = normals[i * 3 + 0];
             vertexData[base + 4] = normals[i * 3 + 1];
             vertexData[base + 5] = normals[i * 3 + 2];
-            // Texcoord
-            vertexData[base + 6] = texcoords[i * 2];
+            // Texcoord0 (2)
+            vertexData[base + 6] = texcoords[i * 2 + 0];
             vertexData[base + 7] = texcoords[i * 2 + 1];
+            // Texcoord1 (2)
+            vertexData[base + 8] = texcoords1[i * 2 + 0];
+            vertexData[base + 9] = texcoords1[i * 2 + 1];
+            // Texcoord2 (2)
+            vertexData[base + 10] = texcoords2[i * 2 + 0];
+            vertexData[base + 11] = texcoords2[i * 2 + 1];
+            // Color0 (2)
+            vertexData[base + 12] = colors[i * 2 + 0];
+            vertexData[base + 13] = colors[i * 2 + 1];
         }
 
+        const gl = this.gl;
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+
         // Create vertex buffer
-        this.vertexBuffer = this.gl.createBuffer();
-        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.vertexBuffer);
-        this.gl.bufferData(this.gl.ARRAY_BUFFER, vertexData, this.gl.STATIC_DRAW);
+        this.vertexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, vertexData, gl.STATIC_DRAW);
 
-        // Create index buffer
-        this.indexBuffer = this.gl.createBuffer();
-        this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-        this.gl.bufferData(this.gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), this.gl.STATIC_DRAW);
+        // Create index buffer (use 32-bit indices when needed; requires WebGL2)
+        const indexArray = (vcount > 65535)
+            ? (() => {
+                if (!isWebGL2) throw new Error(`TerrainMesh: ${vcount} vertices require WebGL2 (32-bit indices).`);
+                this.indexType = gl.UNSIGNED_INT;
+                return new Uint32Array(indices);
+            })()
+            : (() => {
+                this.indexType = gl.UNSIGNED_SHORT;
+                return new Uint16Array(indices);
+            })();
 
-        // Set vertex attributes
-        const positionLoc = this.gl.getAttribLocation(this.program.program, 'aPosition');
-        const normalLoc = this.gl.getAttribLocation(this.program.program, 'aNormal');
-        const texcoordLoc = this.gl.getAttribLocation(this.program.program, 'aTexcoord');
-        const texcoord1Loc = this.gl.getAttribLocation(this.program.program, 'aTexcoord1');
-        const texcoord2Loc = this.gl.getAttribLocation(this.program.program, 'aTexcoord2');
-        const color0Loc = this.gl.getAttribLocation(this.program.program, 'aColor0');
+        this.indexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indexArray, gl.STATIC_DRAW);
 
-        this.gl.enableVertexAttribArray(positionLoc);
-        this.gl.enableVertexAttribArray(normalLoc);
-        this.gl.enableVertexAttribArray(texcoordLoc);
-        this.gl.enableVertexAttribArray(texcoord1Loc);
-        this.gl.enableVertexAttribArray(texcoord2Loc);
-        this.gl.enableVertexAttribArray(color0Loc);
+        // Create and configure VAO so other renderers don't clobber attribute state.
+        this.vao = gl.createVertexArray();
+        gl.bindVertexArray(this.vao);
 
-        this.gl.vertexAttribPointer(positionLoc, 3, this.gl.FLOAT, false, this.vertexStride, 0);
-        this.gl.vertexAttribPointer(normalLoc, 3, this.gl.FLOAT, false, this.vertexStride, 12);
-        this.gl.vertexAttribPointer(texcoordLoc, 2, this.gl.FLOAT, false, this.vertexStride, 24);
-        this.gl.vertexAttribPointer(texcoord1Loc, 2, this.gl.FLOAT, false, this.vertexStride, 32);
-        this.gl.vertexAttribPointer(texcoord2Loc, 2, this.gl.FLOAT, false, this.vertexStride, 40);
-        this.gl.vertexAttribPointer(color0Loc, 2, this.gl.FLOAT, false, this.vertexStride, 48);
+        // Bind buffers while VAO is bound (captures bindings + attrib pointers)
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
 
-        this.vertexCount = vertices.length / 3;
+        const bindAttrib = (name, size, offsetBytes) => {
+            const loc = gl.getAttribLocation(this.program.program, name);
+            if (loc === -1) return;
+            gl.enableVertexAttribArray(loc);
+            gl.vertexAttribPointer(loc, size, gl.FLOAT, false, this.vertexStride, offsetBytes);
+        };
+
+        bindAttrib('aPosition', 3, 0);
+        bindAttrib('aNormal', 3, 12);
+        bindAttrib('aTexcoord', 2, 24);
+        bindAttrib('aTexcoord1', 2, 32);
+        bindAttrib('aTexcoord2', 2, 40);
+        bindAttrib('aColor0', 2, 48);
+
+        gl.bindVertexArray(null);
+
+        this.vertexCount = vcount;
         this.indexCount = indices.length;
     }
 
     render() {
-        if (!this.vertexBuffer || !this.indexBuffer) return;
-
-        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.vertexBuffer);
-        this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-
-        this.gl.drawElements(this.gl.TRIANGLES, this.indexCount, this.gl.UNSIGNED_SHORT, 0);
+        if (!this.vao || !this.indexBuffer || !this.indexType) return;
+        const gl = this.gl;
+        gl.bindVertexArray(this.vao);
+        gl.drawElements(gl.TRIANGLES, this.indexCount, this.indexType, 0);
+        gl.bindVertexArray(null);
     }
 
     dispose() {
+        if (this.vao) {
+            this.gl.deleteVertexArray(this.vao);
+            this.vao = null;
+        }
         if (this.vertexBuffer) {
             this.gl.deleteBuffer(this.vertexBuffer);
             this.vertexBuffer = null;

@@ -4,17 +4,10 @@ RPF Reader for GTA5
 Handles reading and extracting data from RPF files.
 """
 
-import os
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any
 import numpy as np
-from PIL import Image
-import io
-
-import clr
-import System
-from System.Numerics import Vector2, Vector3, Vector4
 
 from .dll_manager import DllManager
 from .heightmap import HeightmapFile
@@ -163,6 +156,191 @@ class RpfReader:
             logger.error(f"Failed to get texture {path}: {e}")
             return None
 
+    def get_ytd(self, path: str) -> Optional[Any]:
+        """
+        Load a YTD (texture dictionary) file and return the loaded CodeWalker YtdFile object.
+
+        Note: the returned object is independent from this reader's internal `self.ytd_file`
+        to avoid accidental mutation between calls.
+        """
+        try:
+            entry = self.rpf_manager.GetEntry(path)
+            if not entry:
+                logger.warning(f"Could not find YTD entry: {path}")
+                return None
+
+            data = self.rpf_manager.GetFileData(path)
+            if not data:
+                logger.warning(f"No data found for YTD: {path}")
+                return None
+
+            ytd_file = self.dll_manager.YtdFile()
+            ytd_file.Load(data, entry)
+            return ytd_file
+
+        except Exception as e:
+            logger.error(f"Failed to load YTD {path}: {e}")
+            logger.debug("Stack trace:", exc_info=True)
+            return None
+
+    def get_ytd_textures(self, ytd_file: Any) -> Dict[str, Tuple[np.ndarray, str]]:
+        """
+        Extract all textures from a loaded CodeWalker YtdFile.
+
+        Returns:
+            Dict[name, (image_array, format_name)]
+        """
+        textures: Dict[str, Tuple[np.ndarray, str]] = {}
+        try:
+            if not ytd_file or not hasattr(ytd_file, "TextureDict") or not ytd_file.TextureDict:
+                return textures
+
+            # CodeWalker texture dicts have multiple representations depending on how they were loaded.
+            # In CodeWalker itself, textures are typically accessed via TextureDict.Lookup(...) and/or
+            # TextureDict.Dict (a dictionary keyed by hash). Some builds also expose TextureDict.Textures.
+            #
+            # We try the following in order:
+            # 1) TextureDict.Textures (list-like; common in some pythonnet projections)
+            # 2) TextureDict.Dict.Values (dictionary values; matches CodeWalker rendering path)
+            items = None
+
+            # 1) TextureDict.Textures
+            tex_list = getattr(ytd_file.TextureDict, "Textures", None)
+            if tex_list is not None:
+                items = getattr(tex_list, "data_items", None)
+                if not items:
+                    try:
+                        items = list(tex_list)
+                    except Exception:
+                        items = None
+
+            # 2) TextureDict.Dict.Values / Dict iteration
+            if not items:
+                d = getattr(ytd_file.TextureDict, "Dict", None)
+                if d is not None:
+                    vals = getattr(d, "Values", None)
+                    if vals is not None:
+                        try:
+                            items = list(vals)
+                        except Exception:
+                            items = None
+                    if not items:
+                        # Some dictionary projections iterate KeyValuePairs.
+                        try:
+                            kvs = list(d)
+                            extracted = []
+                            for kv in kvs:
+                                try:
+                                    v = getattr(kv, "Value", None)
+                                    if v is not None:
+                                        extracted.append(v)
+                                except Exception:
+                                    continue
+                            items = extracted or None
+                        except Exception:
+                            items = None
+
+            if not items:
+                return textures
+
+            for tex in items:
+                if not tex:
+                    continue
+                try:
+                    name = str(getattr(tex, "Name", "")).strip()
+                    if not name:
+                        continue
+
+                    width = int(getattr(tex, "Width", 0))
+                    height = int(getattr(tex, "Height", 0))
+                    if width <= 0 or height <= 0:
+                        continue
+
+                    fmt_obj = getattr(tex, "Format", None)
+                    format_name = fmt_obj.ToString() if fmt_obj and hasattr(fmt_obj, "ToString") else str(fmt_obj)
+
+                    # Prefer CodeWalker's DDSIO.GetPixels(tex, mip) path.
+                    # This matches CodeWalker.Forms.YtdForm and tends to work more reliably than tex.GetPixels(...)
+                    # for textures loaded via GameFileCache.
+                    pixels = None
+                    try:
+                        ddsio = getattr(self.dll_manager, "DDSIO", None)
+                        if ddsio is not None and hasattr(ddsio, "GetPixels"):
+                            pixels = ddsio.GetPixels(tex, 0)
+                    except Exception:
+                        pixels = None
+                    # Fallback to texture-native GetPixels.
+                    if not pixels:
+                        try:
+                            if hasattr(tex, "GetPixels"):
+                                pixels = tex.GetPixels(0)
+                        except Exception:
+                            pixels = None
+                    if not pixels:
+                        continue
+
+                    buf = bytes(pixels)
+                    arr = np.frombuffer(buf, dtype=np.uint8)
+                    # CodeWalker DDSIO.GetPixels(tex, mip) is used in YtdForm with a 32bpp ARGB bitmap.
+                    # The returned buffer can be padded per-row (stride). Handle both packed and stride buffers.
+                    img = None
+                    # 4-channel packed
+                    if arr.size == width * height * 4:
+                        img = arr.reshape(height, width, 4)
+                    # 3-channel packed
+                    elif arr.size == width * height * 3:
+                        img = arr.reshape(height, width, 3)
+                    else:
+                        # Try to interpret as stride buffer.
+                        stride = int(getattr(tex, "Stride", 0) or 0)
+                        # Prefer the texture's reported stride (bytes per row) when it matches.
+                        if stride > 0 and (arr.size == stride * height):
+                            if (stride % 4) == 0:
+                                row_px = stride // 4
+                                if row_px >= width:
+                                    img = arr.reshape(height, row_px, 4)[:, :width, :]
+                            elif (stride % 3) == 0:
+                                row_px = stride // 3
+                                if row_px >= width:
+                                    img = arr.reshape(height, row_px, 3)[:, :width, :]
+                        # Fallback: infer stride from buffer length.
+                        if img is None and height > 0 and (arr.size % height) == 0:
+                            row_stride = arr.size // height
+                            if (row_stride % 4) == 0:
+                                row_px = row_stride // 4
+                                if row_px >= width:
+                                    img = arr.reshape(height, row_px, 4)[:, :width, :]
+                            elif (row_stride % 3) == 0:
+                                row_px = row_stride // 3
+                                if row_px >= width:
+                                    img = arr.reshape(height, row_px, 3)[:, :width, :]
+
+                    if img is None:
+                        logger.debug(f"Skipping texture {name}: unexpected pixel count {arr.size} for {width}x{height}")
+                        continue
+
+                    # DDSIO output is typically BGRA (to match PixelFormat.Format32bppArgb).
+                    # Convert to RGBA for the web viewer pipeline.
+                    try:
+                        if img.shape[2] == 4:
+                            img = img[:, :, [2, 1, 0, 3]]
+                        elif img.shape[2] == 3:
+                            img = img[:, :, [2, 1, 0]]
+                    except Exception:
+                        pass
+
+                    textures[name] = (img, format_name)
+                except Exception as e:
+                    logger.debug(f"Error extracting texture from YTD: {e}", exc_info=True)
+                    continue
+
+            return textures
+
+        except Exception as e:
+            logger.error(f"Failed to extract YTD textures: {e}")
+            logger.debug("Stack trace:", exc_info=True)
+            return textures
+
     def get_file_data(self, file_path: str) -> Optional[bytes]:
         """
         Get raw file data from RPF archive
@@ -192,8 +370,11 @@ class RpfReader:
             # Check data size
             if len(data_bytes) != entry.FileSize:
                 logger.warning(f"Data size mismatch. Expected {entry.FileSize}, got {len(data_bytes)}")
-                # Trim data to expected size
-                data_bytes = data_bytes[:entry.FileSize]
+                # IMPORTANT:
+                # For some RPF entries, `FileSize` may refer to compressed/on-disk size while
+                # `RpfManager.GetFileData(...)` returns decompressed bytes. Trimming here can
+                # corrupt the data and break downstream parsers (eg waterheight.dat).
+                # Keep the full buffer and let higher-level code validate/parse it.
             
             return data_bytes
             

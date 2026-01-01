@@ -100,17 +100,20 @@ def main():
         # Log texture info
         logger.info(f"Loaded {terrain_info['num_textures']} texture(s)")
         for name, tex_info in terrain_info.get('texture_info', {}).items():
-            logger.info(f"  - {name}: {tex_info['format']}" + 
-                       (" (with normal map)" if tex_info['has_normal'] else ""))
+            # `texture_info` can contain meta keys like `layers` (list) and `blend_mask` (bool)
+            if not isinstance(tex_info, dict):
+                continue
+            fmt = tex_info.get('format', 'unknown')
+            has_normal = bool(tex_info.get('has_normal', False))
+            logger.info(f"  - {name}: {fmt}" + (" (with normal map)" if has_normal else ""))
         
         # Initialize building system with terrain system
-        building_system = BuildingSystem(str(game_path), dll_manager, terrain_system)
+        building_system = BuildingSystem(str(game_path), dll_manager, terrain_system, output_dir=output_dir)
         
         # Extract building data
         logger.info("Extracting building data...")
         if not building_system.extract_buildings():
-            logger.error("Failed to extract building data")
-            return False
+            logger.warning("Building extraction returned no results (continuing with terrain-only output).")
         
         # Get building info
         building_info = building_system.get_building_info()
@@ -123,7 +126,7 @@ def main():
             logger.info(f"  - {btype}: {count}")
         
         # Log water info
-        if building_info.get('water_info'):
+        if building_info.get('water_info') and building_info['water_info'].get('num_vertices') is not None:
             water_info = building_info['water_info']
             logger.info("Water data:")
             logger.info(f"  - Vertices: {water_info['num_vertices']}")

@@ -7,12 +7,10 @@ Compiles CodeWalker.Core for terrain extraction.
 
 import logging
 import sys
-import os
-import shutil
 from pathlib import Path
 
 from codewalker_modules.config_loader import CodeWalkerConfig
-from codewalker_modules.project_config import get_minimal_config, ProjectConfig
+from codewalker_modules.project_config import ProjectConfig
 from codewalker_modules.compiler import Compiler
 
 # Configure variables
@@ -27,33 +25,8 @@ PROJECT_CONFIG = {
     "output_type": "Library",
     "enable_unsafe": True,
     "define_constants": ["WINDOWS", "RELEASE"],
-    "system_references": [
-        "System",
-        "System.Core",
-        "System.Data",
-        "System.Drawing",
-        "System.Numerics",
-        "System.Runtime",
-        "System.Runtime.Serialization",
-        "System.Windows.Forms",
-        "System.Xml",
-        "System.Xml.Linq",
-        "WindowsBase",
-        "PresentationCore",
-        "PresentationFramework",
-        "System.Memory",
-        "System.Buffers",
-        "System.Runtime.CompilerServices.Unsafe",
-        "System.Numerics.Vectors",
-        "System.Collections",
-        "System.Collections.Concurrent",
-        "System.Threading",
-        "System.Threading.Tasks",
-        "System.IO.Compression",
-        "System.IO.Compression.FileSystem",
-        "System.ComponentModel",
-        "System.ComponentModel.TypeConverter"
-    ],
+    # For net7.0-windows (SDK-style), do not use legacy `<Reference Include="System" />` entries.
+    "system_references": [],
     "nuget_packages": {
         "Microsoft.CSharp": "4.7.0",
         "SharpDX": "4.2.0",

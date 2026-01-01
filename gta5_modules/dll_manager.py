@@ -11,8 +11,8 @@ import ctypes
 from pathlib import Path
 from typing import Optional, Tuple, Any, Dict, List, Union
 
-# Initialize Python.NET
-import clr
+# Initialize Python.NET (robust against the conflicting PyPI `clr` package)
+from .dotnet import clr
 clr.AddReference("System")
 clr.AddReference("System.Core")
 clr.AddReference("System.Numerics")
@@ -79,6 +79,10 @@ class DllManager:
         
         # Initialize Space class
         self._init_space()
+
+        # Optional: full world/collision space (heavy). Initialized on-demand.
+        self.world_space = None
+        self.world_space_inited = False
         
         self._initialized = True
         
@@ -122,6 +126,26 @@ class DllManager:
             self.WatermapFile = WatermapFile
             self.YnvFile = YnvFile
             self.YndFile = YndFile
+
+            # Utility helpers
+            # DDSIO is used to decode CodeWalker texture objects into RGBA pixel buffers.
+            # (RpfReader.get_ytd_textures depends on this.)
+            try:
+                try:
+                    # CodeWalker.Core defines DDSIO under CodeWalker.Utils (see CodeWalker.Core/GameFiles/Utils/DDSIO.cs)
+                    from CodeWalker.Utils import DDSIO as _DDSIO  # type: ignore
+                except Exception:
+                    _DDSIO = None
+                self.DDSIO = _DDSIO
+                # Some builds may expose DDSIO as an instantiable class; others as a static helper.
+                if self.DDSIO is not None and not hasattr(self.DDSIO, "GetPixels"):
+                    try:
+                        self.DDSIO = self.DDSIO()
+                    except Exception:
+                        # Keep whatever we have; RpfReader will handle missing GetPixels gracefully.
+                        pass
+            except Exception:
+                self.DDSIO = None
             
             # World types
             self.Entity = Entity
@@ -153,6 +177,9 @@ class DllManager:
                 False,                    # mods
                 ""                        # excludeFolders
             )
+            # NOTE: GameFileCache.Init(...) is intentionally not called here because it can take time
+            # and isn't required for terrain extraction. Call init_game_file_cache() when you need
+            # archetypes/drawables (YDR/YDD/YFT) resolution.
             
             # 3. Create callback functions for status updates and error logging
             def update_status(msg: str):
@@ -188,6 +215,53 @@ class DllManager:
         except Exception as e:
             logger.error(f"Error loading DLL: {e}")
             return False
+
+    def init_game_file_cache(
+        self,
+        load_vehicles: bool = False,
+        load_peds: bool = False,
+        load_audio: bool = False,
+    ) -> bool:
+        """
+        Initialize CodeWalker's GameFileCache.
+
+        This is required for resolving archetype hashes into Archetype objects and then into drawables (YDR/YDD/YFT).
+        It can take a while because it scans archives and builds indexes.
+        """
+        try:
+            if not self.game_file_cache:
+                logger.error("GameFileCache not created")
+                return False
+
+            # Configure for best archetype coverage
+            try:
+                self.game_file_cache.BuildExtendedJenkIndex = True
+                self.game_file_cache.LoadArchetypes = True
+                self.game_file_cache.LoadPeds = bool(load_peds)
+                self.game_file_cache.LoadVehicles = bool(load_vehicles)
+                self.game_file_cache.LoadAudio = bool(load_audio)
+            except Exception:
+                # Some builds may not expose all properties; ignore.
+                pass
+
+            def update_status(msg: str):
+                logger.info(f"GameFileCache: {msg}")
+
+            def error_log(msg: str):
+                logger.error(f"GameFileCache: {msg}")
+
+            update_status_action = Action[str](update_status)
+            error_log_action = Action[str](error_log)
+
+            self.game_file_cache.Init(update_status_action, error_log_action)
+            return True
+        except Exception as e:
+            logger.error(f"Error initializing GameFileCache: {e}")
+            return False
+
+    def get_game_file_cache(self):
+        """Return the underlying CodeWalker.GameFiles.GameFileCache instance."""
+        return self.game_file_cache
             
     def _init_functions(self):
         """Initialize function signatures"""
@@ -212,6 +286,119 @@ class DllManager:
         except Exception as e:
             logger.error(f"Error initializing Heightmaps: {e}")
             return False
+
+    def init_world_space(self) -> bool:
+        """
+        Initialize CodeWalker's full `CodeWalker.World.Space` (collision + map store).
+
+        This is the closest thing to "game ground" we can query in CodeWalker:
+        - YBN bounds (collision)
+        - HD entity bounds (select)
+
+        NOTE: this is expensive; it scans caches/manifests and builds spatial stores.
+        """
+        try:
+            if self.world_space_inited and self.world_space is not None:
+                return True
+            if not self.game_file_cache:
+                logger.error("GameFileCache not created")
+                return False
+
+            # GameFileCache.Init is required for Space.Init to have the cache dictionaries populated.
+            if not getattr(self.game_file_cache, "IsInited", False):
+                ok = self.init_game_file_cache()
+                if not ok:
+                    return False
+
+            # Create Space and initialize it.
+            from System import Action
+
+            def update_status(msg: str):
+                logger.info(f"WorldSpace: {msg}")
+
+            update_status_action = Action[str](update_status)
+            sp = self.Space()
+            sp.Init(self.game_file_cache, update_status_action)
+            self.world_space = sp
+            self.world_space_inited = True
+            return True
+        except Exception as e:
+            logger.error(f"Failed to init world space: {e}")
+            logger.debug("Stack trace:", exc_info=True)
+            self.world_space = None
+            self.world_space_inited = False
+            return False
+
+    def raycast_down(
+        self,
+        x: float,
+        y: float,
+        z_start: float,
+        max_dist: float = 20000.0,
+        ybn_only: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Raycast downward in GTA/data-space and return the closest hit.
+
+        Args:
+            x,y,z_start: ray origin
+            max_dist: max distance to test
+            ybn_only: if True, ignore hits that are only from HD entity bounds (bridges/props)
+
+        Returns:
+            dict with keys: hit(bool), z(float), position(tuple), normal(tuple), hit_entity(bool)
+        """
+        try:
+            if not self.world_space_inited or self.world_space is None:
+                ok = self.init_world_space()
+                if not ok:
+                    return None
+
+            # Use SharpDX structs (Space.cs is SharpDX-based).
+            import SharpDX  # type: ignore
+
+            origin = SharpDX.Vector3(float(x), float(y), float(z_start))
+            direction = SharpDX.Vector3(0.0, 0.0, -1.0)
+            ray = SharpDX.Ray(origin, direction)
+
+            # Prefer exterior collision layer 0 only; layers array matches Space's BoundsStore layers.
+            # NOTE: MapDataStore (HD ymaps/entities) is not filtered by this, so we post-filter by HitEntity.
+            layers = None
+            try:
+                import System  # type: ignore
+
+                arr = System.Array[System.Boolean]([True, False, False])
+                layers = arr
+            except Exception:
+                layers = None
+
+            res = self.world_space.RayIntersect(ray, float(max_dist), layers)
+            hit = bool(getattr(res, "Hit", False))
+            if not hit:
+                return {"hit": False}
+
+            # Optional: ignore entity-only hits so the heightfield represents "ground collision"
+            hit_entity = getattr(res, "HitEntity", None) is not None
+            hit_ybn = getattr(res, "HitYbn", None) is not None
+            if ybn_only and hit_entity and (not hit_ybn):
+                return {"hit": False}
+
+            pos = getattr(res, "Position", None)
+            nrm = getattr(res, "Normal", None)
+            if pos is None:
+                return {"hit": False}
+
+            return {
+                "hit": True,
+                "z": float(pos.Z),
+                "position": (float(pos.X), float(pos.Y), float(pos.Z)),
+                "normal": (float(nrm.X), float(nrm.Y), float(nrm.Z)) if nrm is not None else None,
+                "hit_entity": bool(hit_entity),
+                "hit_ybn": bool(hit_ybn),
+            }
+        except Exception as e:
+            logger.error(f"Raycast failed at ({x},{y}): {e}")
+            return None
             
     def get_space_instance(self) -> Optional[Any]:
         """Get Heightmaps instance"""
@@ -341,6 +528,32 @@ class DllManager:
                 
         except Exception as e:
             logger.error(f"Failed to create YMAP file object: {e}")
+            return None
+
+    def get_watermap_file(self, data: bytes) -> Optional[Any]:
+        """
+        Create a WatermapFile object from raw waterheight.dat data.
+
+        Args:
+            data: Raw bytes of the watermap file.
+
+        Returns:
+            WatermapFile object if successful, None otherwise.
+        """
+        try:
+            if not self.WatermapFile:
+                logger.error("WatermapFile type not initialized")
+                return None
+            if not data:
+                logger.error("No watermap data provided")
+                return None
+
+            wmf = self.WatermapFile()
+            # Signature: Load(byte[] data, RpfFileEntry entry)
+            wmf.Load(data, None)
+            return wmf
+        except Exception as e:
+            logger.error(f"Failed to create WatermapFile object: {e}")
             return None
             
     def get_ymap_from_path(self, path: str) -> Optional[Any]:

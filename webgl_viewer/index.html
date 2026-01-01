@@ -24,6 +24,12 @@
             border-radius: 5px;
             color: white;
             font-family: Arial, sans-serif;
+            z-index: 10;
+            width: 280px;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+            overflow-x: hidden;
+            -webkit-overflow-scrolling: touch;
         }
         .control-group {
             margin: 10px 0;
@@ -37,14 +43,257 @@
             padding: 5px;
             margin-bottom: 5px;
         }
+        #loadingOverlay {
+            position: fixed;
+            inset: 0;
+            z-index: 9998;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(circle at 30% 20%, rgba(40, 40, 55, 0.92), rgba(0, 0, 0, 0.92));
+            color: #fff;
+            font-family: Arial, sans-serif;
+        }
+        #loadingCard {
+            width: min(760px, calc(100vw - 48px));
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(0,0,0,0.55);
+            border-radius: 12px;
+            padding: 18px 18px 14px 18px;
+            box-shadow: 0 12px 50px rgba(0,0,0,0.55);
+        }
+        #loadingTitle {
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            margin-bottom: 8px;
+        }
+        #loadingDetail {
+            font-size: 12px;
+            opacity: 0.9;
+            line-height: 1.35;
+            white-space: pre-line;
+            margin-bottom: 10px;
+            min-height: 32px;
+        }
+        #loadingBarOuter {
+            width: 100%;
+            height: 10px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: rgba(255,255,255,0.12);
+            border: 1px solid rgba(255,255,255,0.12);
+        }
+        #loadingBarInner {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #8ae, #6f6, #fe8);
+            transition: width 160ms ease;
+        }
+        #loadingFooter {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between;
+            margin-top: 10px;
+            font-size: 12px;
+            opacity: 0.9;
+        }
+        #skipLoading {
+            padding: 6px 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.18);
+            background: rgba(255,255,255,0.06);
+            color: #fff;
+            cursor: pointer;
+        }
+        #skipLoading:hover {
+            background: rgba(255,255,255,0.10);
+        }
+        #perfHud {
+            position: fixed;
+            right: 16px;
+            top: 16px;
+            z-index: 11;
+            pointer-events: none;
+            display: none;
+            background: rgba(0, 0, 0, 0.72);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: rgba(255,255,255,0.95);
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.25;
+            white-space: pre;
+            max-width: min(520px, calc(100vw - 40px));
+        }
     </style>
 </head>
 <body>
     <canvas id="glCanvas"></canvas>
+    <div id="perfHud"></div>
+    <div id="loadingOverlay" style="display: flex;">
+        <div id="loadingCard">
+            <div id="loadingTitle">Loading world…</div>
+            <div id="loadingDetail">Booting…</div>
+            <div id="loadingBarOuter"><div id="loadingBarInner"></div></div>
+            <div id="loadingFooter">
+                <div id="loadingHint">Tip: large `manifest.json` loads can take a bit on first run.</div>
+                <button id="skipLoading" type="button">Skip loading</button>
+            </div>
+        </div>
+    </div>
     <div id="controls">
         <div class="control-group">
             <label for="wireframe">Wireframe Mode</label>
             <input type="checkbox" id="wireframe">
+        </div>
+        <div class="control-group">
+            <label>Ped</label>
+            <button id="spawnCharacter" style="width: 100%; padding: 6px;">Spawn character (GTA camera)</button>
+            <button id="spawnPedCity" style="width: 100%; padding: 6px;">Spawn ped (city)</button>
+            <label style="margin-top: 8px;">Character model (name or hash)</label>
+            <input id="characterModel" value="player_zero">
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enableGameplayCamera" checked>
+                Gameplay camera (smooth follow)
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="followPed" checked>
+                Follow ped
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="controlPed">
+                Control ped (WASD)
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="groundPedToTerrain" checked>
+                Ground ped to terrain (if near ground)
+            </label>
+            <label style="margin-top: 6px;">Ground snap max ΔZ</label>
+            <input id="groundPedMaxDelta" type="number" min="0" max="100000" value="25">
+            <label style="margin-top: 8px;">PedCoords (vector4)</label>
+            <input id="pedCoords" value="vector4(-562.3726, 154.1684, NaN, 0.0)">
+            <label style="margin-top: 6px;">CamCoords (vector4)</label>
+            <input id="camCoords" value="vector4(-562.3726, 254.1684, 176.3396, 0.0)">
+            <button id="applyPedCam" style="width: 100%; padding: 6px; margin-top: 6px;">Apply ped+cam</button>
+            <div id="pedDebug" style="margin-top: 8px; font-size: 12px; opacity: 0.85; line-height: 1.2;"></div>
+            <div id="streamDebug" style="margin-top: 6px; font-size: 12px; opacity: 0.85; line-height: 1.2;"></div>
+            <div style="margin-top: 10px; font-size: 12px; opacity: 0.9;">
+                <div style="font-weight: 700; margin-bottom: 4px;">Live camera coords</div>
+                <div style="opacity: 0.85; margin-bottom: 6px;">
+                    Viewer-space is the WebGL coordinate system. Data-space is GTA coordinate system (used by exports).
+                </div>
+                <textarea id="liveCoords" readonly style="width: 100%; height: 62px; resize: vertical; font-family: Consolas, 'Courier New', monospace; font-size: 12px;"></textarea>
+                <button id="copyLiveCoords" style="width: 100%; padding: 6px; margin-top: 6px;">Copy camera coords</button>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>Scene</label>
+            <div style="margin-top: 6px; font-size: 12px; opacity: 0.75; line-height: 1.25;">
+                Note: collisions (YBN), interiors (MLO), and lights are not implemented in this WebGL viewer.
+            </div>
+            <label style="margin-top: 10px;">Atmosphere</label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enableAtmosphere" checked>
+                Enable sky + fog (atmosphere)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="enableFog" checked>
+                Enable fog
+            </label>
+            <label style="margin-top: 6px;">Time of day (hours)</label>
+            <input id="timeOfDay" type="range" min="0" max="24" step="0.1" value="13.0">
+            <label style="margin-top: 6px;">Fog start (viewer units)</label>
+            <input id="fogStart" type="number" min="0" max="1000000" value="1200">
+            <label style="margin-top: 6px;">Fog end (viewer units)</label>
+            <input id="fogEnd" type="number" min="0" max="2000000" value="9000">
+            <button id="applyHighDetail" style="width: 100%; padding: 6px; margin-top: 8px;">
+                Apply High Detail (GTA-like)
+            </button>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showTerrain" checked>
+                Show terrain (heightmap)
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showBuildings" checked>
+                Show buildings/water mesh (OBJ)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="showWater" checked>
+                Show water
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showEntityDots">
+                Show entity dots (points)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="entityDotsOverlay">
+                Entity dots overlay (always on top)
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showModels" checked>
+                Show GTA models (experimental)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="crossArchetypeInstancing" checked>
+                Cross-archetype instancing (group by mesh + material)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="showPlaceholders">
+                Show placeholder meshes for unexported archetypes
+            </label>
+            <button id="dumpMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Dump missing archetypes (console)</button>
+            <button id="downloadMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Download missing archetypes (json)</button>
+            <label style="margin-top: 10px;">Streaming radius (chunks)</label>
+            <input id="streamRadius" type="number" min="1" max="24" value="6">
+            <label style="margin-top: 6px;">Max loaded chunks</label>
+            <input id="maxLoadedChunks" type="number" min="9" max="4000" value="250">
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="streamFromCamera" checked>
+                Stream around camera (faster first-view)
+            </label>
+            <label style="margin-top: 6px;">Max archetypes (instanced meshes)</label>
+            <input id="maxArchetypes" type="number" min="0" max="20000" value="900">
+            <label style="margin-top: 6px;">Model stream distance (data units)</label>
+            <input id="maxModelDistance" type="number" min="0" max="100000" value="1200">
+            <label style="margin-top: 6px;">Mesh loads in flight</label>
+            <input id="maxMeshLoadsInFlight" type="number" min="1" max="64" value="8">
+            <label style="margin-top: 10px;">Streaming preset</label>
+            <select id="streamPreset">
+                <option value="game">Game-like</option>
+                <option value="city">City (heavier)</option>
+                <option value="extreme">Extreme (may hitch/crash)</option>
+            </select>
+            <button id="applyStreamPreset" style="width: 100%; padding: 6px;">Apply preset</button>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="frustumCulling" checked>
+                Frustum culling
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enableOcclusionCulling">
+                Occlusion culling (experimental)
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enablePerfHud">
+                Perf HUD (diagnostics)
+            </label>
+            <div style="margin-top: 10px; font-size: 12px; opacity: 0.9;">
+                <div style="font-weight: 700; margin-bottom: 4px;">Persistence + cache</div>
+                <label style="margin-top: 6px;">
+                    <input type="checkbox" id="restoreOnRefresh" checked>
+                    Restore view on refresh (camera + settings)
+                </label>
+                <label style="margin-top: 6px;">
+                    <input type="checkbox" id="cacheStreamedChunks">
+                    Cache streamed chunks (faster refresh; uses disk)
+                </label>
+                <div id="cacheStatus" style="margin-top: 6px; opacity: 0.85;">Cache: checking…</div>
+                <button id="clearAssetCache" style="width: 100%; padding: 6px; margin-top: 6px;">Clear cache</button>
+            </div>
+            <button id="streamCity" style="width: 100%; padding: 6px; margin-top: 6px;">Stream more (city)</button>
+            <div id="bootStatus" style="margin-top: 8px; font-size: 12px; opacity: 0.85; line-height: 1.2; white-space: pre-line;"></div>
         </div>
         <div class="control-group">
             <label for="textureQuality">Texture Quality</label>
@@ -63,6 +312,76 @@
             </select>
         </div>
     </div>
+    <!-- gl-matrix is imported via ESM in js/glmatrix.js (Vite dev/build). -->
+    <div id="fatalOverlay" style="
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.85);
+        color: #ffdddd;
+        font-family: Consolas, 'Courier New', monospace;
+        font-size: 12px;
+        padding: 10px 12px;
+        z-index: 9999;
+        white-space: pre-wrap;
+        display: none;
+        max-height: 45vh;
+        overflow: auto;
+        border-top: 1px solid rgba(255,255,255,0.15);
+    "></div>
+    <script>
+      (function () {
+        const bootEl = document.getElementById('bootStatus');
+        const fatalEl = document.getElementById('fatalOverlay');
+        const loadingOverlayEl = document.getElementById('loadingOverlay');
+        const loadingTitleEl = document.getElementById('loadingTitle');
+        const loadingDetailEl = document.getElementById('loadingDetail');
+        const loadingBarInnerEl = document.getElementById('loadingBarInner');
+        const skipBtn = document.getElementById('skipLoading');
+        const setBoot = (msg) => { if (bootEl) bootEl.textContent = String(msg || ''); };
+        const showFatal = (msg) => {
+          const text = String(msg || 'Unknown error');
+          setBoot(text);
+          if (fatalEl) { fatalEl.style.display = 'block'; fatalEl.textContent = text; }
+        };
+        const clamp01 = (v) => Math.max(0, Math.min(1, Number(v)));
+        const setLoading = (state) => {
+          const s = state || {};
+          const visible = (s.visible === undefined) ? true : !!s.visible;
+          if (loadingOverlayEl) loadingOverlayEl.style.display = visible ? 'flex' : 'none';
+          if (loadingTitleEl && s.title !== undefined) loadingTitleEl.textContent = String(s.title || '');
+          if (loadingDetailEl && s.detail !== undefined) loadingDetailEl.textContent = String(s.detail || '');
+          if (loadingBarInnerEl && s.progress !== undefined) {
+            const p = clamp01(s.progress);
+            loadingBarInnerEl.style.width = `${Math.round(p * 100)}%`;
+          }
+        };
+        window.__viewerSetBootStatus = setBoot;
+        window.__viewerShowFatal = showFatal;
+        window.__viewerSetLoading = setLoading;
+        window.__viewerSkipLoading = () => {}; // set by main.js
+        if (skipBtn) {
+          skipBtn.addEventListener('click', () => {
+            try { window.__viewerSkipLoading?.(); } catch { /* ignore */ }
+          });
+        }
+        setBoot('Booting…');
+        setLoading({ visible: true, title: 'Loading world…', detail: 'Booting…', progress: 0.02 });
+        window.addEventListener('error', (e) => {
+          showFatal('JS error:\n' + (e?.error?.stack || e?.message || String(e)));
+        });
+        window.addEventListener('unhandledrejection', (e) => {
+          showFatal('Unhandled promise rejection:\n' + (e?.reason?.stack || e?.reason || String(e)));
+        });
+        // If the module never runs, this stays visible (helps distinguish “JS didn’t load”).
+        setTimeout(() => {
+          if (bootEl && bootEl.textContent === 'Booting…') {
+            setBoot('Still booting after 3s… if the screen is black, open DevTools → Console/Network for errors.');
+          }
+        }, 3000);
+      })();
+    </script>
     <script type="module" src="js/main.js"></script>
 </body>
 </html> 

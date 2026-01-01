@@ -13,7 +13,7 @@ import tempfile
 import subprocess
 import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Optional
 
 from .config_loader import CodeWalkerConfig
 from .project_config import get_minimal_config, generate_project_xml, ProjectConfig
@@ -39,23 +39,8 @@ PROJECT_CONFIG = ProjectConfig(
         "System.Numerics.Vectors": "4.5.0",
         "System.IO.Compression": "4.3.0"
     },
-    system_references=[
-        "System",
-        "System.Core",
-        "System.Data",
-        "System.Drawing",
-        "System.IO.Compression",
-        "System.IO.Compression.FileSystem",
-        "System.Numerics",
-        "System.Runtime",
-        "System.Runtime.Serialization",
-        "System.Windows.Forms",
-        "System.Xml",
-        "System.Xml.Linq",
-        "WindowsBase",
-        "PresentationCore",
-        "PresentationFramework"
-    ],
+    # For net7.0-windows (SDK-style), do not use legacy `<Reference Include="System" />` entries.
+    system_references=[],
     assembly_attributes=[
         'assembly: System.Runtime.CompilerServices.InternalsVisibleTo("CodeWalker.Core")',
         'assembly: System.Runtime.CompilerServices.InternalsVisibleTo("CodeWalker.World")',
@@ -169,8 +154,17 @@ class Compiler:
                     logger.error(f"  - {path}")
                 raise FileNotFoundError(f"Source file not found: {file}")
                 
-            # Determine the correct destination path
-            dst = core_dir / file
+            # Determine the correct destination path by preserving the original
+            # relative path under CodeWalker.Core. This is critical for resources
+            # (eg Properties/Resources.resx) and for keeping the folder structure
+            # consistent with how CodeWalker expects to be built.
+            core_root = self.config.source_dir / "CodeWalker.Core"
+            try:
+                rel = src.relative_to(core_root)
+            except Exception:
+                # Fallback: keep previous behavior if relative computation fails.
+                rel = Path(file)
+            dst = core_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             
             try:
@@ -201,7 +195,7 @@ class Compiler:
         
         if magic_src.exists():
             shutil.copy2(magic_src, magic_dst)
-            logger.debug(f"Copied magic.dat to root Resources directory")
+            logger.debug("Copied magic.dat to root Resources directory")
         else:
             logger.error(f"magic.dat not found at: {magic_src}")
             raise FileNotFoundError(f"magic.dat not found at: {magic_src}")
@@ -253,7 +247,7 @@ class Compiler:
                 
                 # Run dotnet restore
                 logger.info("Starting package restore with dotnet...")
-                restore_result = subprocess.run(
+                subprocess.run(
                     ["dotnet", "restore", str(self.temp_dir / "CodeWalker.Core.csproj")],
                     capture_output=True,
                     text=True,
@@ -287,7 +281,7 @@ class Compiler:
                     logger.error(build_result.stdout)
                     return None
                     
-                logger.info(f"Build completed successfully")
+                logger.info("Build completed successfully")
                 logger.info(f"Compilation completed, output at: {dll_path}")
                 
                 # Verify the DLL exists
@@ -417,11 +411,12 @@ def verify_compiled_dll(dll_path):
         clr.AddReference(str(dll_path))
         
         # Try to import some classes
-        from CodeWalker.GameFiles import HeightmapFile, RpfManager
+        from CodeWalker.GameFiles import HeightmapFile, RpfManager  # type: ignore
         
         # Try to import World.Heightmaps if available
         try:
-            from CodeWalker.World import Heightmaps
+            from CodeWalker.World import Heightmaps  # type: ignore
+            _ = Heightmaps
             logger.info("Successfully imported Heightmaps class from World namespace")
         except ImportError:
             logger.warning("Could not import Heightmaps class from World namespace (this might be okay)")
@@ -437,13 +432,13 @@ def verify_compiled_dll(dll_path):
                 logger.warning("RpfManager.Init method not found")
             
             # Try to create a HeightmapFile instance
-            heightmap_file = HeightmapFile()
+            _heightmap_file = HeightmapFile()
             logger.info("Successfully created HeightmapFile instance")
         except Exception as e:
             logger.warning(f"Error testing DLL functionality: {e}")
             # This is not a critical error, so we continue
         
-        logger.info(f"✓ Successfully loaded compiled DLL. HeightmapFile and RpfManager classes available.")
+        logger.info("✓ Successfully loaded compiled DLL. HeightmapFile and RpfManager classes available.")
         return True
     except Exception as e:
         logger.error(f"Error verifying compiled DLL: {e}")

@@ -153,8 +153,13 @@ def generate_project_xml(config: ProjectConfig) -> str:
         '    <UseWPF>true</UseWPF>',
         '    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>',
         '    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>',
+        '    <EnableDefaultItems>false</EnableDefaultItems>',
         '    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>',
-        '    <RootNamespace>CodeWalker.Core</RootNamespace>',
+        # Leave RootNamespace empty because we compile from a nested `CodeWalker.Core/...` folder.
+        # If RootNamespace is `CodeWalker.Core`, MSBuild can generate doubled manifest names like:
+        #   CodeWalker.Core.CodeWalker.Core.Properties.Resources.resources
+        # which breaks ResourceManager("CodeWalker.Core.Properties.Resources", ...).
+        '    <RootNamespace></RootNamespace>',
         '    <AssemblyName>CodeWalker.Core</AssemblyName>',
         '    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>',
         '    <Platforms>AnyCPU</Platforms>',
@@ -195,8 +200,16 @@ def generate_project_xml(config: ProjectConfig) -> str:
             xml.append('    </PackageReference>')
         xml.append('  </ItemGroup>')
         
-    # Add system references
-    if config.system_references:
+    # Add system/assembly references.
+    #
+    # IMPORTANT:
+    # - For SDK-style projects targeting modern TFMs (net5+/net6+/net7+), adding
+    #   `<Reference Include="System" />` etc is incorrect and can break builds
+    #   (those are .NET Framework/GAC-era references).
+    # - For net4x TFMs, these references can still be required.
+    tfm = (config.target_framework or "").lower()
+    is_net_framework = tfm.startswith("net4") or tfm.startswith("net3") or tfm.startswith("net2") or tfm.startswith("net1")
+    if is_net_framework and config.system_references:
         xml.append('  <ItemGroup>')
         for ref in config.system_references:
             xml.append(f'    <Reference Include="{ref}" />')
@@ -211,6 +224,9 @@ def generate_project_xml(config: ProjectConfig) -> str:
     xml.append('  <ItemGroup>')
     xml.append('    <EmbeddedResource Include="CodeWalker.Core/Resources/**/*.resx" />')
     xml.append('    <EmbeddedResource Include="CodeWalker.Core/Resources/**/*.resources" />')
+    # CodeWalker.Core uses the standard Visual Studio resource file under Properties/
+    # (eg Properties/Resources.resx references magic.dat). Include these.
+    xml.append('    <EmbeddedResource Include="CodeWalker.Core/Properties/**/*.resx" />')
     xml.append('    <None Include="CodeWalker.Core/*.xml" />')
     xml.append('  </ItemGroup>')
     

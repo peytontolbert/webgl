@@ -1,8 +1,8 @@
-// Import gl-matrix
-import * as glMatrix from 'gl-matrix';
+import { glMatrix } from './glmatrix.js';
 import { ShaderProgram } from './shader_program.js';
 import { TextureManager } from './texture_manager.js';
 import { TerrainMesh } from './terrain_mesh.js';
+import { fetchBlob, fetchJSON } from './asset_fetcher.js';
 
 // Vertex shader
 const vsSource = `#version 300 es
@@ -17,7 +17,8 @@ const vsSource = `#version 300 es
     uniform mat4 uModelMatrix;
     uniform mat3 uNormalMatrix;
     uniform vec3 uTerrainBounds;  // (min_x, min_y, min_z)
-    uniform vec3 uTerrainSize;    // (width, height, max_height)
+    uniform vec3 uTerrainSize;    // (size_x, size_y, size_z) in world units
+    uniform vec2 uTerrainGrid;    // (width, height) in samples
     uniform sampler2D uHeightmap;
     uniform bool uHasHeightmap;
     uniform bool uEnableTint;
@@ -29,6 +30,7 @@ const vsSource = `#version 300 es
     out vec2 vTexcoord1;
     out vec2 vTexcoord2;
     out vec4 vColor0;
+    out float vHeight01;
     
     void main() {
         // Convert position to world coordinates
@@ -38,19 +40,19 @@ const vsSource = `#version 300 es
             vec2 gridPos = aPosition.xy;
             
             // Calculate world position using GTA5's coordinate system
-            worldPos.x = uTerrainBounds.x + (gridPos.x / (uTerrainSize.x - 1.0)) * (uTerrainBounds.x + uTerrainSize.x);
-            worldPos.y = uTerrainBounds.y + (gridPos.y / (uTerrainSize.y - 1.0)) * (uTerrainBounds.y + uTerrainSize.y);
+            worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
+            worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
             
             // Sample height from heightmap
             vec2 heightmapCoord = vec2(gridPos.x, 1.0 - gridPos.y);
             float height = texture(uHeightmap, heightmapCoord).r;
+            vHeight01 = height;
             
-            // Scale height to match the terrain bounds
-            float heightScale = uTerrainSize.z / 255.0;
-            worldPos.z = uTerrainBounds.z + height * heightScale;
+            // Scale height to match the terrain bounds (height is already 0..1 from R8 texture)
+            worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
             
             // Calculate normal from heightmap
-            vec2 texelSize = 1.0 / uTerrainSize.xy;
+            vec2 texelSize = 1.0 / max(uTerrainGrid, vec2(2.0, 2.0));
             float left = texture(uHeightmap, heightmapCoord - vec2(texelSize.x, 0.0)).r;
             float right = texture(uHeightmap, heightmapCoord + vec2(texelSize.x, 0.0)).r;
             float top = texture(uHeightmap, heightmapCoord - vec2(0.0, texelSize.y)).r;
@@ -58,8 +60,8 @@ const vsSource = `#version 300 es
             
             // Calculate normal using central differences
             vec3 normal = normalize(vec3(
-                (left - right) * heightScale,
-                (top - bottom) * heightScale,
+                (left - right) * uTerrainSize.z,
+                (top - bottom) * uTerrainSize.z,
                 1.0
             ));
             
@@ -68,6 +70,7 @@ const vsSource = `#version 300 es
         } else {
             worldPos = aPosition;
             vNormal = normalize(uNormalMatrix * aNormal);
+            vHeight01 = 0.0;
         }
         
         // Transform position
@@ -93,133 +96,93 @@ const fsSource = `#version 300 es
     in vec2 vTexcoord1;
     in vec2 vTexcoord2;
     in vec4 vColor0;
+    in float vHeight01;
     
-    // Main textures (t0-t4)
-    uniform sampler2D uDiffuseMap;      // t0
-    uniform sampler2D uNormalMap;       // t1
-    uniform sampler2D uBlendMask;       // t2
-    uniform sampler2D uLayer1Map;       // t3
-    uniform sampler2D uLayer2Map;       // t4
-    
-    // Terrain type textures (t5-t9)
-    uniform sampler2D uGrassDiffuseMap; // t5
-    uniform sampler2D uRockDiffuseMap;  // t6
-    uniform sampler2D uDirtDiffuseMap;  // t7
-    uniform sampler2D uSandDiffuseMap;  // t8
-    uniform sampler2D uSnowDiffuseMap;  // t9
-    
-    // Normal maps for terrain types (t10-t14)
-    uniform sampler2D uGrassNormalMap;  // t10
-    uniform sampler2D uRockNormalMap;   // t11
-    uniform sampler2D uDirtNormalMap;   // t12
-    uniform sampler2D uSandNormalMap;   // t13
-    uniform sampler2D uSnowNormalMap;   // t14
-    
-    uniform bool uHasNormalMap;
-    uniform bool uHasGrassNormalMap;
-    uniform bool uHasRockNormalMap;
-    uniform bool uHasDirtNormalMap;
-    uniform bool uHasSandNormalMap;
-    uniform bool uHasSnowNormalMap;
+    // True 4-layer splat blending:
+    // - uBlendMask is a world-space (same UVs as heightmap) RGBA weight map.
+    // - uLayer{1..4}Map are tiled material textures.
+    uniform sampler2D uBlendMask;
+    uniform sampler2D uLayer1Map;
+    uniform sampler2D uLayer2Map;
+    uniform sampler2D uLayer3Map;
+    uniform sampler2D uLayer4Map;
     uniform bool uEnableTint;
     uniform float uTintYVal;
     uniform vec3 uLightDir;
     uniform vec3 uLightColor;
     uniform float uAmbientIntensity;
     uniform float uBumpiness;
+
+    uniform vec3 uCameraPos;
+    uniform bool uFogEnabled;
+    uniform vec3 uFogColor;
+    uniform float uFogStart;
+    uniform float uFogEnd;
     
     out vec4 fragColor;
+
+    // Color pipeline:
+    // - If terrain layer textures are uploaded as sRGB, sampling returns linear.
+    // - If not, set uDecodeSrgb so we decode manually.
+    uniform bool uDecodeSrgb;
+
+    vec3 decodeSrgb(vec3 c) {
+        return pow(max(c, vec3(0.0)), vec3(2.2));
+    }
+    vec3 encodeSrgb(vec3 c) {
+        return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+    }
     
     void main() {
-        // Sample textures with proper wrapping
-        vec4 diffuse = texture(uDiffuseMap, vTexcoord0);
-        vec4 layer1 = texture(uLayer1Map, vTexcoord0);
-        vec4 layer2 = texture(uLayer2Map, vTexcoord0);
-        vec4 blendMask = texture(uBlendMask, vTexcoord1);
-        
-        // Sample terrain type textures
-        vec4 grassTex = texture(uGrassDiffuseMap, vTexcoord0);
-        vec4 rockTex = texture(uRockDiffuseMap, vTexcoord0);
-        vec4 dirtTex = texture(uDirtDiffuseMap, vTexcoord0);
-        vec4 sandTex = texture(uSandDiffuseMap, vTexcoord0);
-        vec4 snowTex = texture(uSnowDiffuseMap, vTexcoord0);
-        
-        // Initialize final diffuse color
-        vec4 finalDiffuse = diffuse;
-        
-        // Blend layers using mask (if available)
-        if (blendMask.r > 0.0) finalDiffuse = mix(finalDiffuse, layer1, blendMask.r);
-        if (blendMask.g > 0.0) finalDiffuse = mix(finalDiffuse, layer2, blendMask.g);
-        
-        // Blend terrain types based on height and slope
-        float height = vPosition.y;
-        float slope = 1.0 - abs(dot(vNormal, vec3(1.0, 0.0, 0.0)));
-        
-        // Height-based blending
-        if (height > 0.8) {
-            finalDiffuse = mix(finalDiffuse, snowTex, smoothstep(0.8, 1.0, height));
-        } else if (height > 0.6) {
-            finalDiffuse = mix(finalDiffuse, rockTex, smoothstep(0.6, 0.8, height));
-        } else if (height > 0.4) {
-            finalDiffuse = mix(finalDiffuse, dirtTex, smoothstep(0.4, 0.6, height));
-        } else if (height > 0.2) {
-            finalDiffuse = mix(finalDiffuse, grassTex, smoothstep(0.2, 0.4, height));
+        // vTexcoord0 is in "image space" (v increases downward). Heightmap sampling uses (u, 1-v),
+        // so match that convention for the blend mask too.
+        vec2 maskUv = vec2(vTexcoord0.x, 1.0 - vTexcoord0.y);
+        vec4 w = texture(uBlendMask, maskUv);
+        float sumW = w.r + w.g + w.b + w.a;
+        if (sumW <= 1e-5) {
+            w = vec4(1.0, 0.0, 0.0, 0.0);
         } else {
-            finalDiffuse = mix(finalDiffuse, sandTex, smoothstep(0.0, 0.2, height));
+            w /= sumW;
         }
-        
-        // Slope-based blending
-        if (slope < 0.3) {
-            finalDiffuse = mix(finalDiffuse, rockTex, smoothstep(0.3, 0.0, slope));
+
+        // Tiled UVs for material layers.
+        vec2 tileUv = vTexcoord1;
+        vec4 c1 = texture(uLayer1Map, tileUv);
+        vec4 c2 = texture(uLayer2Map, tileUv);
+        vec4 c3 = texture(uLayer3Map, tileUv);
+        vec4 c4 = texture(uLayer4Map, tileUv);
+        if (uDecodeSrgb) {
+            c1.rgb = decodeSrgb(c1.rgb);
+            c2.rgb = decodeSrgb(c2.rgb);
+            c3.rgb = decodeSrgb(c3.rgb);
+            c4.rgb = decodeSrgb(c4.rgb);
         }
+
+        vec4 finalDiffuse = (c1 * w.r) + (c2 * w.g) + (c3 * w.b) + (c4 * w.a);
         
         // Apply vertex colors if enabled
         if (uEnableTint) {
             finalDiffuse *= vColor0;
         }
         
-        // Normal mapping
         vec3 normal = normalize(vNormal);
-        if (uHasNormalMap) {
-            vec3 normalMap = texture(uNormalMap, vTexcoord0).rgb * 2.0 - 1.0;
-            normalMap *= uBumpiness;
-            normal = normalize(normal + normalMap);
-        }
-        
-        // Terrain type normal maps
-        if (uHasGrassNormalMap && height > 0.2 && height < 0.4) {
-            vec3 normalMap = texture(uGrassNormalMap, vTexcoord0).rgb * 2.0 - 1.0;
-            normalMap *= uBumpiness;
-            normal = normalize(normal + normalMap * smoothstep(0.2, 0.4, height));
-        }
-        if (uHasRockNormalMap && (height > 0.6 || slope < 0.3)) {
-            vec3 normalMap = texture(uRockNormalMap, vTexcoord0).rgb * 2.0 - 1.0;
-            normalMap *= uBumpiness;
-            normal = normalize(normal + normalMap * (1.0 - smoothstep(0.6, 0.8, height) + smoothstep(0.3, 0.0, slope)));
-        }
-        if (uHasDirtNormalMap && height > 0.4 && height < 0.6) {
-            vec3 normalMap = texture(uDirtNormalMap, vTexcoord0).rgb * 2.0 - 1.0;
-            normalMap *= uBumpiness;
-            normal = normalize(normal + normalMap * smoothstep(0.4, 0.6, height));
-        }
-        if (uHasSandNormalMap && height < 0.2) {
-            vec3 normalMap = texture(uSandNormalMap, vTexcoord0).rgb * 2.0 - 1.0;
-            normalMap *= uBumpiness;
-            normal = normalize(normal + normalMap * (1.0 - smoothstep(0.0, 0.2, height)));
-        }
-        if (uHasSnowNormalMap && height > 0.8) {
-            vec3 normalMap = texture(uSnowNormalMap, vTexcoord0).rgb * 2.0 - 1.0;
-            normalMap *= uBumpiness;
-            normal = normalize(normal + normalMap * smoothstep(0.8, 1.0, height));
-        }
         
         // Calculate lighting
         float diff = max(dot(normal, uLightDir), 0.0);
         vec3 lighting = uAmbientIntensity * uLightColor + diff * uLightColor;
         
-        // Final color with gamma correction
+        // Final color (linear lighting)
         vec3 finalColor = finalDiffuse.rgb * lighting;
-        finalColor = pow(finalColor, vec3(1.0 / 2.2)); // Gamma correction
+
+        // Atmospheric fog (linear)
+        if (uFogEnabled) {
+            float dist = length(vPosition - uCameraPos);
+            float fogF = smoothstep(uFogStart, uFogEnd, dist);
+            finalColor = mix(finalColor, uFogColor, fogF);
+        }
+
+        // Gamma encode for display
+        finalColor = encodeSrgb(finalColor);
         
         // Ensure alpha is preserved
         fragColor = vec4(finalColor, finalDiffuse.a);
@@ -233,8 +196,17 @@ export class TerrainRenderer {
         this.textureManager = new TextureManager(gl);
         this.mesh = null;
         this.heightmap = null;
+        // CPU copy of heightmap pixels for sampling (optional)
+        this.heightmapPixels = null; // { width, height, data: Uint8ClampedArray }
         this.terrainBounds = [0, 0, 0];
         this.terrainSize = [0, 0, 0];
+        // Used by shaders for heightmap sampling/normal reconstruction; must match heightmap texture resolution.
+        this.terrainGrid = [1, 1];
+        // Geometry tessellation grid (can be higher than the heightmap resolution for smoother silhouettes).
+        this.meshGrid = [1, 1];
+        // Soft cap to avoid blowing up the vertex count on large maps.
+        this.maxTerrainVertices = 220000;
+        this.sceneBoundsView = { min: [0, 0, 0], max: [0, 0, 0] };
         this.modelMatrix = glMatrix.mat4.create();
         this.normalMatrix = glMatrix.mat3.create();
         this.uniforms = null;
@@ -282,12 +254,101 @@ export class TerrainRenderer {
                 normal: null
             }
         };
+
+        // Ensure we always have sane fallbacks so zoomed-out view doesn't go "red"
+        // (which happens when samplers default to texture unit 0 = heightmap).
+        this._ensureTerrainTextureFallbacks();
         
-        // Initialize model matrix to match GTA5's coordinate system
+        // Data-space (GTA) is Z-up. Viewer-space uses Y-up (camera.up = [0,1,0]).
+        // Convert Z-up -> Y-up via -90° around X. The extra 180° Y-rotation keeps the map facing the expected direction.
         glMatrix.mat4.rotateY(this.modelMatrix, this.modelMatrix, Math.PI);
-        glMatrix.mat4.rotateX(this.modelMatrix, this.modelMatrix, Math.PI / 2);
+        glMatrix.mat4.rotateX(this.modelMatrix, this.modelMatrix, -Math.PI / 2);
         
         this.initShaders();
+    }
+
+    _ensureTerrainTextureFallbacks() {
+        // Main terrain textures
+        if (!this.textures.diffuse) this.textures.diffuse = this._createSolidTextureRGBA(this._defaultColorForTextureType('diffuse'));
+        if (!this.textures.normal) this.textures.normal = this._createSolidTextureRGBA(this._defaultColorForTextureType('normal'));
+        // Default mask chooses layer1.
+        if (!this.textures.blendMask) this.textures.blendMask = this._createSolidTextureRGBA([255, 0, 0, 0]);
+        if (!this.textures.layer1) this.textures.layer1 = this._createSolidTextureRGBA(this._defaultColorForTextureType('layer1'));
+        if (!this.textures.layer2) this.textures.layer2 = this._createSolidTextureRGBA(this._defaultColorForTextureType('layer2'));
+        if (!this.textures.layer3) this.textures.layer3 = this._createSolidTextureRGBA(this._defaultColorForTextureType('layer3'));
+        if (!this.textures.layer4) this.textures.layer4 = this._createSolidTextureRGBA(this._defaultColorForTextureType('layer4'));
+
+        // Terrain type textures + normals
+        const types = ['grass', 'rock', 'dirt', 'sand', 'snow'];
+        for (const t of types) {
+            if (!this.textures[t]?.diffuse) this.textures[t].diffuse = this._createSolidTextureRGBA(this._defaultColorForTextureType(t));
+            if (!this.textures[t]?.normal) this.textures[t].normal = this._createSolidTextureRGBA(this._defaultColorForTextureType('normal'));
+        }
+    }
+
+    _defaultColorForTextureType(type) {
+        // RGBA 0-255
+        const t = (type || '').toLowerCase();
+        if (t.includes('normal')) return [128, 128, 255, 255]; // flat normal
+        if (t.includes('blend') || t.includes('mask') || t.includes('lookup')) return [128, 128, 128, 255];
+        if (t.includes('grass')) return [60, 140, 60, 255];
+        if (t.includes('rock')) return [110, 110, 110, 255];
+        if (t.includes('dirt')) return [120, 90, 60, 255];
+        if (t.includes('sand')) return [190, 180, 120, 255];
+        if (t.includes('snow')) return [230, 230, 230, 255];
+        return [200, 200, 200, 255];
+    }
+
+    _createSolidTextureRGBA(colorRGBA255) {
+        const gl = this.gl;
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+
+        const data = new Uint8Array(colorRGBA255);
+        gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            1,
+            1,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            data
+        );
+        return texture;
+    }
+
+    _chooseMeshGrid(heightmapW, heightmapH) {
+        const hw = Math.max(2, heightmapW | 0);
+        const hh = Math.max(2, heightmapH | 0);
+        const cap = Math.max(10000, this.maxTerrainVertices | 0);
+
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (this.gl instanceof WebGL2RenderingContext);
+        const maxVerts = isWebGL2 ? cap : Math.min(cap, 65000);
+
+        const baseVerts = hw * hh;
+        if (baseVerts <= 0) return [hw, hh];
+
+        // Preserve aspect ratio while scaling vertex count towards maxVerts.
+        const s = Math.sqrt(maxVerts / baseVerts);
+        const scale = Math.max(1.0, s);
+        let mw = Math.max(2, Math.round(hw * scale));
+        let mh = Math.max(2, Math.round(hh * scale));
+
+        // Final clamp for WebGL1 16-bit index safety.
+        if (!isWebGL2) {
+            while (mw * mh > 65000) {
+                mw = Math.max(2, Math.floor(mw * 0.98));
+                mh = Math.max(2, Math.floor(mh * 0.98));
+            }
+        }
+
+        return [mw, mh];
     }
     
     async initShaders() {
@@ -302,6 +363,7 @@ export class TerrainRenderer {
                 uNormalMatrix: this.gl.getUniformLocation(this.program.program, 'uNormalMatrix'),
                 uTerrainBounds: this.gl.getUniformLocation(this.program.program, 'uTerrainBounds'),
                 uTerrainSize: this.gl.getUniformLocation(this.program.program, 'uTerrainSize'),
+                uTerrainGrid: this.gl.getUniformLocation(this.program.program, 'uTerrainGrid'),
                 uHeightmap: this.gl.getUniformLocation(this.program.program, 'uHeightmap'),
                 uHasHeightmap: this.gl.getUniformLocation(this.program.program, 'uHasHeightmap'),
                 
@@ -341,6 +403,15 @@ export class TerrainRenderer {
                 uLightDir: this.gl.getUniformLocation(this.program.program, 'uLightDir'),
                 uLightColor: this.gl.getUniformLocation(this.program.program, 'uLightColor'),
                 uAmbientIntensity: this.gl.getUniformLocation(this.program.program, 'uAmbientIntensity'),
+
+                // Fog/atmosphere
+                uCameraPos: this.gl.getUniformLocation(this.program.program, 'uCameraPos'),
+                uFogEnabled: this.gl.getUniformLocation(this.program.program, 'uFogEnabled'),
+                uFogColor: this.gl.getUniformLocation(this.program.program, 'uFogColor'),
+                uFogStart: this.gl.getUniformLocation(this.program.program, 'uFogStart'),
+                uFogEnd: this.gl.getUniformLocation(this.program.program, 'uFogEnd'),
+
+                uDecodeSrgb: this.gl.getUniformLocation(this.program.program, 'uDecodeSrgb'),
                 
                 // Texture uniforms
                 uColourmap0: this.gl.getUniformLocation(this.program.program, 'uColourmap0'),
@@ -353,7 +424,32 @@ export class TerrainRenderer {
                 uNormalmap1: this.gl.getUniformLocation(this.program.program, 'uNormalmap1'),
                 uNormalmap2: this.gl.getUniformLocation(this.program.program, 'uNormalmap2'),
                 uNormalmap3: this.gl.getUniformLocation(this.program.program, 'uNormalmap3'),
-                uNormalmap4: this.gl.getUniformLocation(this.program.program, 'uNormalmap4')
+                uNormalmap4: this.gl.getUniformLocation(this.program.program, 'uNormalmap4'),
+
+                // Actual terrain samplers used by the current fsSource
+                uDiffuseMap: this.gl.getUniformLocation(this.program.program, 'uDiffuseMap'),
+                uNormalMap: this.gl.getUniformLocation(this.program.program, 'uNormalMap'),
+                uBlendMask: this.gl.getUniformLocation(this.program.program, 'uBlendMask'),
+                uLayer1Map: this.gl.getUniformLocation(this.program.program, 'uLayer1Map'),
+                uLayer2Map: this.gl.getUniformLocation(this.program.program, 'uLayer2Map'),
+                uLayer3Map: this.gl.getUniformLocation(this.program.program, 'uLayer3Map'),
+                uLayer4Map: this.gl.getUniformLocation(this.program.program, 'uLayer4Map'),
+                uGrassDiffuseMap: this.gl.getUniformLocation(this.program.program, 'uGrassDiffuseMap'),
+                uRockDiffuseMap: this.gl.getUniformLocation(this.program.program, 'uRockDiffuseMap'),
+                uDirtDiffuseMap: this.gl.getUniformLocation(this.program.program, 'uDirtDiffuseMap'),
+                uSandDiffuseMap: this.gl.getUniformLocation(this.program.program, 'uSandDiffuseMap'),
+                uSnowDiffuseMap: this.gl.getUniformLocation(this.program.program, 'uSnowDiffuseMap'),
+                uGrassNormalMap: this.gl.getUniformLocation(this.program.program, 'uGrassNormalMap'),
+                uRockNormalMap: this.gl.getUniformLocation(this.program.program, 'uRockNormalMap'),
+                uDirtNormalMap: this.gl.getUniformLocation(this.program.program, 'uDirtNormalMap'),
+                uSandNormalMap: this.gl.getUniformLocation(this.program.program, 'uSandNormalMap'),
+                uSnowNormalMap: this.gl.getUniformLocation(this.program.program, 'uSnowNormalMap'),
+                uHasNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasNormalMap'),
+                uHasGrassNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasGrassNormalMap'),
+                uHasRockNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasRockNormalMap'),
+                uHasDirtNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasDirtNormalMap'),
+                uHasSandNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasSandNormalMap'),
+                uHasSnowNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasSnowNormalMap')
             };
         } catch (error) {
             console.error('Failed to initialize shader program:', error);
@@ -363,14 +459,31 @@ export class TerrainRenderer {
     async loadTerrainMesh() {
         try {
             // Load heightmap data
-            const heightmapResponse = await fetch('assets/heightmap.png');
-            if (!heightmapResponse.ok) {
+            let heightmapBlob;
+            try {
+                // HIGH priority: required for the first playable frame.
+                heightmapBlob = await fetchBlob('assets/heightmap.png', { priority: 'high' });
+            } catch {
                 console.warn('Heightmap texture not found, terrain will be rendered without heightmap');
                 return false;
             }
-            
-            const heightmapBlob = await heightmapResponse.blob();
             const heightmapImage = await createImageBitmap(heightmapBlob);
+
+            // Keep a CPU-side copy for height sampling (spawn ped on ground, etc.)
+            try {
+                const canvas = document.createElement('canvas');
+                canvas.width = heightmapImage.width;
+                canvas.height = heightmapImage.height;
+                const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                if (ctx) {
+                    ctx.drawImage(heightmapImage, 0, 0);
+                    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    this.heightmapPixels = { width: canvas.width, height: canvas.height, data: img.data };
+                }
+            } catch {
+                // Ignore if browser disallows canvas readback or any error occurs.
+                this.heightmapPixels = null;
+            }
             
             // Create heightmap texture
             this.heightmap = this.gl.createTexture();
@@ -383,23 +496,19 @@ export class TerrainRenderer {
             this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
             
             // Upload heightmap data
+            // For ImageBitmap sources, use the 6-arg overload.
             this.gl.texImage2D(
                 this.gl.TEXTURE_2D,
                 0,                // mip level
                 this.gl.R8,       // internal format (single channel for height)
-                heightmapImage.width,      // width
-                heightmapImage.height,     // height
-                0,                // border
                 this.gl.RED,      // format
                 this.gl.UNSIGNED_BYTE, // type
-                heightmapImage    // data
+                heightmapImage    // source
             );
             
             // Load terrain info
-            const infoResponse = await fetch('assets/terrain_info.json');
-            if (!infoResponse.ok) throw new Error('Failed to load terrain info');
-            
-            const info = await infoResponse.json();
+            // HIGH priority: required for the first playable frame.
+            const info = await fetchJSON('assets/terrain_info.json', { priority: 'high' });
             
             // Validate terrain info structure
             if (!info.dimensions || !info.bounds || Object.keys(info.dimensions).length === 0) {
@@ -415,58 +524,52 @@ export class TerrainRenderer {
                 throw new Error('Missing bounds or dimensions data');
             }
             
-            // Set terrain bounds and size
+            // Set terrain bounds and size (world-space extents)
             this.terrainBounds = [bounds.min_x, bounds.min_y, bounds.min_z];
             this.terrainSize = [
-                firstHeightmap.width,
-                firstHeightmap.height,
-                bounds.max_z - bounds.min_z
+                (bounds.max_x - bounds.min_x),
+                (bounds.max_y - bounds.min_y),
+                (bounds.max_z - bounds.min_z),
             ];
+            // IMPORTANT: this must match the actual heightmap *texture* size used in the shader.
+            // terrain_info.json dimensions may refer to the original extraction grid, which can differ from the
+            // viewer's downsampled heightmap.png.
+            this.terrainGrid = [heightmapImage.width, heightmapImage.height];
+            this.meshGrid = this._chooseMeshGrid(heightmapImage.width, heightmapImage.height);
+
+            // Precompute scene AABB in *viewer space* for the camera (transform 8 corners).
+            const corners = [
+                [bounds.min_x, bounds.min_y, bounds.min_z],
+                [bounds.max_x, bounds.min_y, bounds.min_z],
+                [bounds.min_x, bounds.max_y, bounds.min_z],
+                [bounds.max_x, bounds.max_y, bounds.min_z],
+                [bounds.min_x, bounds.min_y, bounds.max_z],
+                [bounds.max_x, bounds.min_y, bounds.max_z],
+                [bounds.min_x, bounds.max_y, bounds.max_z],
+                [bounds.max_x, bounds.max_y, bounds.max_z],
+            ];
+            const vmin = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
+            const vmax = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY];
+            for (const c of corners) {
+                const c4 = glMatrix.vec4.fromValues(c[0], c[1], c[2], 1.0);
+                const out = glMatrix.vec4.create();
+                glMatrix.vec4.transformMat4(out, c4, this.modelMatrix);
+                vmin[0] = Math.min(vmin[0], out[0]);
+                vmin[1] = Math.min(vmin[1], out[1]);
+                vmin[2] = Math.min(vmin[2], out[2]);
+                vmax[0] = Math.max(vmax[0], out[0]);
+                vmax[1] = Math.max(vmax[1], out[1]);
+                vmax[2] = Math.max(vmax[2], out[2]);
+            }
+            this.sceneBoundsView = { min: vmin, max: vmax };
             
             // Create mesh from heightmap data
             this.mesh = new TerrainMesh(this.gl, this.program);
             this.mesh.createFromHeightmap(
-                heightmapImage.width,
-                heightmapImage.height,
+                this.meshGrid[0],
+                this.meshGrid[1],
                 bounds
             );
-            
-            // Load terrain textures using CodeWalker's texture organization
-            // Main terrain textures (t0-t4)
-            await this.loadTexture('diffuse', 'assets/textures/cs_rsn_sl_agrdirttrack3_diffuse.png');
-            await this.loadTexture('normal', 'assets/textures/cs_rsn_sl_agrdirttrack3_normal.png');
-            
-            // Layer textures (t1-t4)
-            await this.loadTexture('layer1', 'assets/textures/cs_rsn_sl_agrgrass_02_dark_diffuse.png');
-            await this.loadTexture('normal1', 'assets/textures/og_coastgrass_01_normal.png');
-            
-            await this.loadTexture('layer2', 'assets/textures/cs_rsn_sl_cstcliff_0003_diffuse.png');
-            await this.loadTexture('normal2', 'assets/textures/cs_rsn_sl_cstcliff_0003_normal.png');
-            
-            await this.loadTexture('layer3', 'assets/textures/cs_islx_canyonrock_rough_01_diffuse.png');
-            await this.loadTexture('normal3', 'assets/textures/cs_islx_canyonrock_rough_01_height_diffuse.png');
-            
-            await this.loadTexture('layer4', 'assets/textures/cs_rsn_sl_rockslime_01_diffuse.png');
-            await this.loadTexture('normal4', 'assets/textures/cs_rsn_sl_agrdirttrack1_normal.png');
-            
-            // Load blend mask (using a height texture as mask)
-            await this.loadTexture('blendMask', 'assets/textures/cs_rsn_sl_cstcliff_0003_height_diffuse.png');
-            
-            // Load terrain type textures (t5-t9)
-            await this.loadTexture('grass_diffuse', 'assets/textures/cs_rsn_sl_agrgrass_02_dark_diffuse.png');
-            await this.loadTexture('grass_normal', 'assets/textures/og_coastgrass_01_normal.png');
-            
-            await this.loadTexture('rock_diffuse', 'assets/textures/cs_rsn_sl_cstcliff_0003_diffuse.png');
-            await this.loadTexture('rock_normal', 'assets/textures/cs_rsn_sl_cstcliff_0003_normal.png');
-            
-            await this.loadTexture('dirt_diffuse', 'assets/textures/cs_rsn_sl_agrdirttrack3_diffuse.png');
-            await this.loadTexture('dirt_normal', 'assets/textures/cs_rsn_sl_agrdirttrack3_normal.png');
-            
-            await this.loadTexture('sand_diffuse', 'assets/textures/cs_islx_wetlandmud03b_diffuse.png');
-            await this.loadTexture('sand_normal', 'assets/textures/cs_rsn_sl_uwshell_0001_normal.png');
-            
-            await this.loadTexture('snow_diffuse', 'assets/textures/cs_rsn_sl_rockslime_01_diffuse.png');
-            await this.loadTexture('snow_normal', 'assets/textures/cs_rsn_sl_agrdirttrack1_normal.png');
             
             console.log('Terrain mesh loaded successfully');
             return true;
@@ -476,16 +579,43 @@ export class TerrainRenderer {
             return false;
         }
     }
+
+    /**
+     * Sample terrain height in GTA/data space at (x, y).
+     * Returns null if sampling isn't available yet.
+     */
+    getHeightAtXY(x, y) {
+        if (!this.heightmapPixels || !this.heightmapPixels.data) return null;
+        const [minX, minY, minZ] = this.terrainBounds || [0, 0, 0];
+        const [sizeX, sizeY, sizeZ] = this.terrainSize || [0, 0, 0];
+        if (!sizeX || !sizeY || !sizeZ) return null;
+
+        // Map to UV in [0..1]
+        let u = (x - minX) / sizeX;
+        let v = (y - minY) / sizeY;
+        u = Math.max(0, Math.min(1, u));
+        v = Math.max(0, Math.min(1, v));
+
+        // Shader samples at vec2(u, 1 - v)
+        const w = this.heightmapPixels.width;
+        const h = this.heightmapPixels.height;
+        const px = Math.round(u * (w - 1));
+        const py = Math.round((1.0 - v) * (h - 1));
+        const idx = (py * w + px) * 4;
+        const r = this.heightmapPixels.data[idx] ?? 0;
+        const height01 = r / 255.0;
+        return minZ + height01 * sizeZ;
+    }
     
     async loadHeightmapTexture() {
         try {
-            const response = await fetch('assets/heightmap.png');
-            if (!response.ok) {
+            let blob;
+            try {
+                blob = await fetchBlob('assets/heightmap.png', { priority: 'high' });
+            } catch {
                 console.warn('Heightmap texture not found, terrain will be rendered without heightmap');
                 return false;
             }
-            
-            const blob = await response.blob();
             const image = await createImageBitmap(blob);
             
             // Create texture
@@ -499,16 +629,14 @@ export class TerrainRenderer {
             this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
             
             // Upload heightmap data
+            // For ImageBitmap sources, use the 6-arg overload.
             this.gl.texImage2D(
                 this.gl.TEXTURE_2D,
                 0,                // mip level
                 this.gl.R8,       // internal format (single channel for height)
-                image.width,      // width
-                image.height,     // height
-                0,                // border
                 this.gl.RED,      // format
                 this.gl.UNSIGNED_BYTE, // type
-                image            // data
+                image             // source
             );
             
             this.heightmap = texture;
@@ -571,58 +699,18 @@ export class TerrainRenderer {
     
     async loadTexture(type, path) {
         try {
-            console.log(`Loading ${type} texture from ${path}...`);
-            const response = await fetch(path);
-            if (!response.ok) {
-                console.warn(`Failed to load ${type} texture from ${path}: ${response.status} ${response.statusText}`);
+            let blob;
+            try {
+                // LOW priority: terrain textures are a quality upgrade, not a boot blocker.
+                blob = await fetchBlob(path, { priority: 'low' });
+            } catch {
+                // Use a placeholder texture so rendering continues without spam.
+                this._setTextureByKeyPath(type, this._createSolidTextureRGBA(this._defaultColorForTextureType(type)));
                 return false;
             }
-            
-            const blob = await response.blob();
-            
-            // Create a promise for image loading
-            const imageLoadPromise = new Promise((resolve, reject) => {
-                const image = new Image();
-                
-                // Set timeout for image loading
-                const timeout = setTimeout(() => {
-                    reject(new Error(`Timeout loading ${type} texture from ${path}`));
-                }, 10000); // 10 second timeout
-                
-                image.onload = () => {
-                    clearTimeout(timeout);
-                    console.log(`${type} texture loaded:`, image.width, 'x', image.height);
-                    resolve(image);
-                };
-                
-                image.onerror = (error) => {
-                    clearTimeout(timeout);
-                    console.warn(`Failed to load ${type} texture from ${path}:`, error);
-                    reject(error);
-                };
-                
-                // Create object URL and set source
-                const objectUrl = URL.createObjectURL(blob);
-                image.src = objectUrl;
-                
-                // Clean up object URL after loading or error
-                image.onload = () => {
-                    clearTimeout(timeout);
-                    URL.revokeObjectURL(objectUrl);
-                    console.log(`${type} texture loaded:`, image.width, 'x', image.height);
-                    resolve(image);
-                };
-                
-                image.onerror = (error) => {
-                    clearTimeout(timeout);
-                    URL.revokeObjectURL(objectUrl);
-                    console.warn(`Failed to load ${type} texture from ${path}:`, error);
-                    reject(error);
-                };
-            });
-            
-            // Wait for image to load
-            const image = await imageLoadPromise;
+
+            // Decode without <img> to avoid noisy onerror Events.
+            const imageBitmap = await createImageBitmap(blob);
             
             // Create texture
             const texture = this.gl.createTexture();
@@ -634,47 +722,94 @@ export class TerrainRenderer {
             this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.REPEAT);
             this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.REPEAT);
             
-            // Create a canvas to get the image data
-            const canvas = document.createElement('canvas');
-            canvas.width = image.width;
-            canvas.height = image.height;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(image, 0, 0);
-            
-            // Get the image data
-            const imageData = ctx.getImageData(0, 0, image.width, image.height);
-            
-            // Upload image data
-            this.gl.texImage2D(
-                this.gl.TEXTURE_2D,
-                0,                // mip level
-                this.gl.RGBA,     // internal format
-                image.width,      // width
-                image.height,     // height
-                0,                // border
-                this.gl.RGBA,     // format
-                this.gl.UNSIGNED_BYTE, // type
-                imageData.data    // data
+            // Upload image data with a defined color pipeline:
+            // - Color layers: sRGB when supported
+            // - Data textures (normals/blend/etc): linear
+            const t = String(type || '').toLowerCase();
+            const isColor = !(t.includes('normal') || t.includes('blend') || t.includes('mask') || t.includes('lookup') || t.includes('height'));
+
+            const gl = this.gl;
+            const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+            const extSrgb = (!isWebGL2) ? (gl.getExtension('EXT_sRGB') || gl.getExtension('WEBGL_sRGB')) : null;
+            const canSrgb = isColor && (isWebGL2 || !!extSrgb);
+
+            const prevCsc = (() => {
+                try { return gl.getParameter(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL); } catch { return null; }
+            })();
+            try {
+                if (prevCsc !== null && typeof gl.UNPACK_COLORSPACE_CONVERSION_WEBGL !== 'undefined') {
+                    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+                }
+            } catch { /* ignore */ }
+
+            const internalFormat = (canSrgb && isWebGL2 && typeof gl.SRGB8_ALPHA8 === 'number')
+                ? gl.SRGB8_ALPHA8
+                : (canSrgb && extSrgb && typeof extSrgb.SRGB_ALPHA_EXT === 'number')
+                    ? extSrgb.SRGB_ALPHA_EXT
+                    : gl.RGBA;
+            const format = (canSrgb && extSrgb && !isWebGL2) ? extSrgb.SRGB_ALPHA_EXT : gl.RGBA;
+
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0, // mip level
+                internalFormat,
+                format,
+                gl.UNSIGNED_BYTE,
+                imageBitmap
             );
+
+            try {
+                if (prevCsc !== null && typeof gl.UNPACK_COLORSPACE_CONVERSION_WEBGL !== 'undefined') {
+                    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, prevCsc);
+                }
+            } catch { /* ignore */ }
             
             // Generate mipmaps
             this.gl.generateMipmap(this.gl.TEXTURE_2D);
             
             // Store texture
-            this.textures[type] = texture;
+            this._setTextureByKeyPath(type, texture);
             
             return true;
             
         } catch (error) {
-            console.warn(`Error loading ${type} texture from ${path}:`, error);
+            // Placeholder fallback on any unexpected error.
+            this._setTextureByKeyPath(type, this._createSolidTextureRGBA(this._defaultColorForTextureType(type)));
             return false;
         }
     }
+
+    _setTextureByKeyPath(type, texture) {
+        // Supports nested keys like "grass.diffuse" to populate this.textures.grass.diffuse.
+        const key = String(type || '');
+        if (!key) return;
+
+        const parts = key.split('.').map(s => s.trim()).filter(Boolean);
+        if (parts.length === 0) return;
+
+        // If it's a simple key, keep old behavior.
+        if (parts.length === 1) {
+            this.textures[parts[0]] = texture;
+            return;
+        }
+
+        // Walk/create containers.
+        let obj = this.textures;
+        for (let i = 0; i < parts.length - 1; i++) {
+            const p = parts[i];
+            if (!obj[p] || typeof obj[p] !== 'object') obj[p] = {};
+            obj = obj[p];
+        }
+        obj[parts[parts.length - 1]] = texture;
+    }
     
-    render(viewProjectionMatrix) {
+    render(viewProjectionMatrix, cameraPos = [0, 0, 0], fog = { enabled: false, color: [0.6, 0.7, 0.8], start: 1500, end: 9000 }) {
         if (!this.mesh || !this.uniforms) return;
         
         this.program.use();
+
+        // Ensure we always have sane fallbacks so samplers never default to unit 0 (heightmap).
+        this._ensureTerrainTextureFallbacks();
         
         // Update matrices
         glMatrix.mat3.normalFromMat4(this.normalMatrix, this.modelMatrix);
@@ -685,6 +820,9 @@ export class TerrainRenderer {
         this.gl.uniformMatrix3fv(this.uniforms.uNormalMatrix, false, this.normalMatrix);
         this.gl.uniform3fv(this.uniforms.uTerrainBounds, this.terrainBounds);
         this.gl.uniform3fv(this.uniforms.uTerrainSize, this.terrainSize);
+        if (this.uniforms.uTerrainGrid) {
+            this.gl.uniform2fv(this.uniforms.uTerrainGrid, this.terrainGrid || [1, 1]);
+        }
         
         // Set entity uniforms
         this.gl.uniform4f(this.uniforms.uCamRel, 0, 0, 0, 1);
@@ -722,75 +860,55 @@ export class TerrainRenderer {
         this.gl.uniform3fv(this.uniforms.uLightDir, [0.5, 0.8, 0.3]);
         this.gl.uniform3fv(this.uniforms.uLightColor, [1.0, 1.0, 1.0]);
         this.gl.uniform1f(this.uniforms.uAmbientIntensity, 0.7);
+
+        // Fog uniforms
+        this.gl.uniform3fv(this.uniforms.uCameraPos, cameraPos);
+        this.gl.uniform1i(this.uniforms.uFogEnabled, fog?.enabled ? 1 : 0);
+        this.gl.uniform3fv(this.uniforms.uFogColor, fog?.color || [0.6, 0.7, 0.8]);
+        this.gl.uniform1f(this.uniforms.uFogStart, Number(fog?.start ?? 1500));
+        this.gl.uniform1f(this.uniforms.uFogEnd, Number(fog?.end ?? 9000));
+
+        // If we can't upload sRGB textures, decode in shader.
+        try {
+            const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (this.gl instanceof WebGL2RenderingContext);
+            const hasSrgb = isWebGL2 || !!(this.gl.getExtension('EXT_sRGB') || this.gl.getExtension('WEBGL_sRGB'));
+            this.gl.uniform1i(this.uniforms.uDecodeSrgb, hasSrgb ? 0 : 1);
+        } catch {
+            this.gl.uniform1i(this.uniforms.uDecodeSrgb, 1);
+        }
         
-        // Bind textures
+        // Bind heightmap (unit 0)
         if (this.heightmap) {
             this.gl.activeTexture(this.gl.TEXTURE0);
             this.gl.bindTexture(this.gl.TEXTURE_2D, this.heightmap);
             this.gl.uniform1i(this.uniforms.uHeightmap, 0);
             this.gl.uniform1i(this.uniforms.uHasHeightmap, 1);
         }
-        
-        // Bind main terrain textures
-        if (this.textures.diffuse) {
-            this.gl.activeTexture(this.gl.TEXTURE1);
-            this.gl.bindTexture(this.gl.TEXTURE_2D, this.textures.diffuse);
-            this.gl.uniform1i(this.uniforms.uColourmap0, 1);
-        }
-        
-        if (this.textures.normal) {
-            this.gl.activeTexture(this.gl.TEXTURE2);
-            this.gl.bindTexture(this.gl.TEXTURE_2D, this.textures.normal);
-            this.gl.uniform1i(this.uniforms.uNormalmap0, 2);
-        }
-        
-        // Bind layer textures
-        for (let i = 1; i <= 4; i++) {
-            const layerTex = this.textures[`layer${i}`];
-            const normalTex = this.textures[`normal${i}`];
-            
-            if (layerTex) {
-                this.gl.activeTexture(this.gl.TEXTURE1 + i);
-                this.gl.bindTexture(this.gl.TEXTURE_2D, layerTex);
-                this.gl.uniform1i(this.uniforms[`uColourmap${i}`], 1 + i);
-            }
-            
-            if (normalTex) {
-                this.gl.activeTexture(this.gl.TEXTURE5 + i);
-                this.gl.bindTexture(this.gl.TEXTURE_2D, normalTex);
-                this.gl.uniform1i(this.uniforms[`uNormalmap${i}`], 5 + i);
-            }
-        }
-        
-        // Bind blend mask
-        if (this.textures.blendMask) {
-            this.gl.activeTexture(this.gl.TEXTURE9);
-            this.gl.bindTexture(this.gl.TEXTURE_2D, this.textures.blendMask);
-            this.gl.uniform1i(this.uniforms.uColourmask, 9);
-        }
-        
-        // Bind terrain type textures
-        const terrainTypes = ['grass', 'rock', 'dirt', 'sand', 'snow'];
-        for (let i = 0; i < terrainTypes.length; i++) {
-            const type = terrainTypes[i];
-            const diffuseTex = this.textures[type].diffuse;
-            const normalTex = this.textures[type].normal;
-            
-            if (diffuseTex) {
-                this.gl.activeTexture(this.gl.TEXTURE10 + i);
-                this.gl.bindTexture(this.gl.TEXTURE_2D, diffuseTex);
-                this.gl.uniform1i(this.uniforms[`u${type}DiffuseMap`], 10 + i);
-            }
-            
-            if (normalTex) {
-                this.gl.activeTexture(this.gl.TEXTURE15 + i);
-                this.gl.bindTexture(this.gl.TEXTURE_2D, normalTex);
-                this.gl.uniform1i(this.uniforms[`u${type}NormalMap`], 15 + i);
-            }
-        }
+
+        // Bind terrain samplers so they don't implicitly sample the heightmap.
+        // Keep units within 0..15 (WebGL2 guarantees at least 16 texture units).
+        const gl = this.gl;
+        const bind2D = (unit, tex, uniformLoc) => {
+            gl.activeTexture(gl.TEXTURE0 + unit);
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            if (uniformLoc) gl.uniform1i(uniformLoc, unit);
+        };
+
+        // Keep texture units well under WebGL2's guaranteed minimum (16).
+        // Unit 0 is reserved for heightmap.
+        bind2D(1, this.textures.blendMask, this.uniforms.uBlendMask);
+        bind2D(2, this.textures.layer1, this.uniforms.uLayer1Map);
+        bind2D(3, this.textures.layer2, this.uniforms.uLayer2Map);
+        bind2D(4, this.textures.layer3, this.uniforms.uLayer3Map);
+        bind2D(5, this.textures.layer4, this.uniforms.uLayer4Map);
         
         // Render mesh
+        // Depth-bias the terrain slightly so it doesn't z-fight with roads/buildings that sit near the ground.
+        // This helps when using a coarse heightmap under detailed city meshes.
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(1.0, 1.0);
         this.mesh.render();
+        gl.disable(gl.POLYGON_OFFSET_FILL);
     }
     
     dispose() {

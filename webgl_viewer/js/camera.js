@@ -1,18 +1,19 @@
-// Import gl-matrix
-import * as glMatrix from 'gl-matrix';
+import { glMatrix } from './glmatrix.js';
 
 export class Camera {
     constructor() {
         // Camera parameters
         this.fieldOfView = 45.0; // Reduced for better perspective
         this.aspectRatio = 1.0;
-        this.nearPlane = 100.0; // Increased for better depth precision
+        // NOTE: For "character-level" close-up inspection we need a small near plane.
+        // Depth precision isn't perfect at world scale, but this makes close viewing possible.
+        this.nearPlane = 1.0;
         this.farPlane = 100000.0; // Increased to see the whole map
         this.orthographicSize = 1000.0;
         
-        // Zoom limits adjusted for GTA5 map scale
-        this.minZoom = 5000.0; // 5km minimum zoom
-        this.maxZoom = 20000.0; // 20km maximum zoom
+        // Zoom limits (allow close-up inspection + wide map viewing)
+        this.minZoom = 10.0;
+        this.maxZoom = 80000.0;
         
         // Camera state
         this.position = glMatrix.vec3.create();
@@ -44,6 +45,47 @@ export class Camera {
         // Update matrices
         this.updateViewMatrix();
         this.updateProjectionMatrix();
+    }
+
+    setFovDegrees(deg) {
+        const v = Number(deg);
+        if (!Number.isFinite(v)) return;
+        // Keep within a sane range.
+        this.fieldOfView = Math.max(10.0, Math.min(120.0, v));
+        this.updateProjectionMatrix();
+    }
+
+    lookAtPoint(targetVec3) {
+        this.target[0] = targetVec3[0];
+        this.target[1] = targetVec3[1];
+        this.target[2] = targetVec3[2];
+        this.updateViewMatrix();
+    }
+
+    frameAABB(minVec3, maxVec3) {
+        // Place camera so the AABB is likely in view (simple heuristic).
+        const cx = (minVec3[0] + maxVec3[0]) * 0.5;
+        const cy = (minVec3[1] + maxVec3[1]) * 0.5;
+        const cz = (minVec3[2] + maxVec3[2]) * 0.5;
+        const dx = (maxVec3[0] - minVec3[0]);
+        const dy = (maxVec3[1] - minVec3[1]);
+        const dz = (maxVec3[2] - minVec3[2]);
+        const radius = Math.max(1.0, Math.sqrt(dx*dx + dy*dy + dz*dz) * 0.5);
+
+        this.target[0] = cx;
+        this.target[1] = cy;
+        this.target[2] = cz;
+
+        // Put camera on a diagonal above the scene.
+        this.position[0] = cx + radius * 0.8;
+        this.position[1] = cy + radius * 1.2;
+        this.position[2] = cz + radius * 0.8;
+
+        // Expand clip planes to cover the scene.
+        this.nearPlane = Math.max(1.0, radius * 0.01);
+        this.farPlane = Math.max(1000.0, radius * 10.0);
+        this.updateProjectionMatrix();
+        this.updateViewMatrix();
     }
 
     updateViewMatrix() {
@@ -153,6 +195,23 @@ export class Camera {
         
         // Update matrices
         this.updateViewMatrix();
+    }
+
+    setZoomLimits(minZoom, maxZoom) {
+        const mn = Number(minZoom);
+        const mx = Number(maxZoom);
+        if (!Number.isFinite(mn) || !Number.isFinite(mx)) return;
+        this.minZoom = Math.max(0.1, Math.min(mn, mx));
+        this.maxZoom = Math.max(this.minZoom, mx);
+    }
+
+    setClipPlanes(nearPlane, farPlane) {
+        const n = Number(nearPlane);
+        const f = Number(farPlane);
+        if (!Number.isFinite(n) || !Number.isFinite(f)) return;
+        this.nearPlane = Math.max(0.01, Math.min(n, f * 0.5));
+        this.farPlane = Math.max(this.nearPlane * 2.0, f);
+        this.updateProjectionMatrix();
     }
 
     getDistance() {

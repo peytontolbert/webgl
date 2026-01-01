@@ -4,27 +4,19 @@ Building System for GTA5
 Handles building and structure data extraction and visualization.
 """
 
-import os
 import logging
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, field
+from typing import Dict, Optional, Any
+from dataclasses import dataclass
 import json
-import time
-import struct
 import math
 from concurrent.futures import ThreadPoolExecutor
-
-import clr
-import System
-from System.Numerics import Vector2, Vector3, Vector4
+import shutil
 
 from .dll_manager import DllManager
 from .rpf_reader import RpfReader
-from .ymap_handler import YmapHandler, CMapData
-from .meta import Meta, MetaType, MetaName
-from .hash import jenkins_hash
+from .ymap_handler import YmapHandler
 from .terrain_system import TerrainSystem
 
 # Configure logging
@@ -74,8 +66,15 @@ class BuildingSystem:
     DEFAULT_WATERMAP_PATHS = [
         "common.rpf\\data\\levels\\gta5\\waterheight.dat"
     ]
+
+    # "Client-like" streaming: write entities into spatial chunks for incremental loading.
+    ENTITY_CHUNK_SIZE = 512.0  # world units (meters)
+    MAX_OPEN_CHUNK_FILES = 64
+    # If enabled, we only snap entities/buildings to the heightmap when their Z is already close to ground.
+    # This prevents the coarse heightmap from "messing up" placement for bridges, roofs, interiors, etc.
+    SNAP_TO_TERRAIN_MAX_DELTA_Z = 25.0
     
-    def __init__(self, game_path: str, dll_manager: DllManager, terrain_system: TerrainSystem):
+    def __init__(self, game_path: str, dll_manager: DllManager, terrain_system: TerrainSystem, output_dir: Optional[Path] = None):
         """
         Initialize building system
         
@@ -103,7 +102,12 @@ class BuildingSystem:
         
         # Initialize building components
         self.buildings: Dict[str, BuildingData] = {}
+        # Keep only "building-like" entities here so `buildings.obj` doesn't explode in size.
+        # Full entity point cloud is exported separately to `entities.obj`.
         self.water: Optional[WaterData] = None
+        self.output_dir: Optional[Path] = output_dir
+        self.num_entities: int = 0
+        self.entity_types: Dict[str, int] = {}
         
         # Building info
         self.building_info = {
@@ -118,6 +122,129 @@ class BuildingSystem:
         
         # Initialize thread pool
         self.executor = ThreadPoolExecutor(max_workers=4)
+
+    class _EntityChunkWriter:
+        def __init__(self, chunks_dir: Path, chunk_size: float, max_open: int):
+            self.chunks_dir = chunks_dir
+            self.chunk_size = float(chunk_size)
+            self.max_open = int(max_open)
+            self.handles: Dict[str, Any] = {}
+            self.lru: list[str] = []
+
+            self.bounds = {
+                "min_x": float("inf"),
+                "min_y": float("inf"),
+                "min_z": float("inf"),
+                "max_x": float("-inf"),
+                "max_y": float("-inf"),
+                "max_z": float("-inf"),
+            }
+            self.chunk_counts: Dict[str, int] = {}
+
+        def _touch(self, key: str) -> None:
+            try:
+                self.lru.remove(key)
+            except ValueError:
+                pass
+            self.lru.append(key)
+
+        def _evict_if_needed(self) -> None:
+            while len(self.handles) > self.max_open and self.lru:
+                old = self.lru.pop(0)
+                h = self.handles.pop(old, None)
+                try:
+                    if h:
+                        h.close()
+                except Exception:
+                    pass
+
+        def _get_handle(self, key: str):
+            h = self.handles.get(key)
+            if h:
+                self._touch(key)
+                return h
+            self.chunks_dir.mkdir(parents=True, exist_ok=True)
+            path = self.chunks_dir / f"{key}.jsonl"
+            # NOTE: we always open in append mode; callers should clear the chunks dir before a fresh extraction.
+            h = open(path, "a", encoding="utf-8")
+            self.handles[key] = h
+            self._touch(key)
+            self._evict_if_needed()
+            return h
+
+        def write(self, ent: Dict[str, Any]) -> None:
+            pos = ent.get("position")
+            if not pos or len(pos) < 3:
+                return
+            x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+
+            # update bounds
+            b = self.bounds
+            b["min_x"] = min(b["min_x"], x)
+            b["min_y"] = min(b["min_y"], y)
+            b["min_z"] = min(b["min_z"], z)
+            b["max_x"] = max(b["max_x"], x)
+            b["max_y"] = max(b["max_y"], y)
+            b["max_z"] = max(b["max_z"], z)
+
+            cx = int(math.floor(x / self.chunk_size))
+            cy = int(math.floor(y / self.chunk_size))
+            key = f"{cx}_{cy}"
+            self.chunk_counts[key] = self.chunk_counts.get(key, 0) + 1
+
+            h = self._get_handle(key)
+            h.write(json.dumps(ent) + "\n")
+
+        def close(self) -> None:
+            for h in list(self.handles.values()):
+                try:
+                    h.close()
+                except Exception:
+                    pass
+            self.handles.clear()
+            self.lru.clear()
+
+    def _is_building_archetype(self, archetype: str) -> bool:
+        """
+        Best-effort heuristic to decide if an archetype should be treated as a "building".
+        This keeps `buildings.obj` useful without trying to export millions of props.
+        """
+        if not archetype:
+            return False
+        a = archetype.lower()
+
+        # Common excludes (small props / foliage / infrastructure clutter)
+        excludes = [
+            "tree", "bush", "grass", "plant",
+            "rock", "stone",
+            "fence", "rail", "barrier",
+            "lamp", "light", "traffic", "sign", "pole",
+            "bin", "trash", "barrel", "crate", "pallet",
+            "cone", "bollard", "hydrant",
+            "road", "curb", "kerb", "sidewalk", "sidewalk",
+            "decal", "patch", "grime",
+        ]
+        if any(x in a for x in excludes):
+            return False
+
+        # Common includes (structures)
+        includes = [
+            "building", "bldg", "skyscraper", "tower",
+            "apartment", "apt", "house", "home", "mansion",
+            "hotel", "motel",
+            "shop", "store", "market",
+            "office", "warehouse", "factory", "hangar",
+            "garage", "barn", "shed", "shack",
+        ]
+        if any(x in a for x in includes):
+            return True
+
+        # Prefix patterns that often indicate architecture in GTA naming
+        if a.startswith(("v_", "hei_", "dt1_", "dt1_", "cs_", "ss1_", "ss2_", "po1_", "po2_")) and ("_int" not in a):
+            # still might be props, but this catches a lot of real buildings; keep it conservative
+            return ("bld" in a) or ("build" in a) or ("house" in a) or ("apt" in a) or ("tower" in a) or ("hotel" in a)
+
+        return False
         
     def _quaternion_from_float_array(self, arr: np.ndarray) -> np.ndarray:
         """Convert float array to quaternion"""
@@ -258,15 +385,42 @@ class BuildingSystem:
             bool: True if successful
         """
         try:
+            entities_obj = None
+            obj_vidx = 1
+            chunk_writer = None
+
+            if self.output_dir:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                entities_obj = open(self.output_dir / "entities.obj", "w", encoding="utf-8")
+                entities_obj.write("# Entities (point cloud)\n")
+                # Chunked entity output for streaming in the WebGL viewer.
+                # IMPORTANT: clear previous chunk outputs to avoid appending duplicates across runs.
+                try:
+                    chunks_dir = (self.output_dir / "entities_chunks")
+                    if chunks_dir.exists():
+                        shutil.rmtree(chunks_dir)
+                except Exception:
+                    pass
+                chunk_writer = self._EntityChunkWriter(
+                    chunks_dir=(self.output_dir / "entities_chunks"),
+                    chunk_size=self.ENTITY_CHUNK_SIZE,
+                    max_open=self.MAX_OPEN_CHUNK_FILES,
+                )
+
             # Load YMAP files using CodeWalker's RPF manager
             ymap_files = []
+            ymap_seen = set()
             for rpf in self.rpf_manager.AllRpfs:
-                if not hasattr(rpf, 'AllEntries') or not rpf.AllEntries:
+                if (not hasattr(rpf, 'AllEntries')) or (rpf.AllEntries is None):
                     continue
                     
                 for entry in rpf.AllEntries:
                     if entry.Name.lower().endswith('.ymap'):
-                        ymap_files.append(entry.Path)
+                        p = entry.Path
+                        if p in ymap_seen:
+                            continue
+                        ymap_seen.add(p)
+                        ymap_files.append(p)
                         
             logger.info(f"Found {len(ymap_files)} YMAP files")
             
@@ -280,29 +434,145 @@ class BuildingSystem:
                         continue
                         
                     # Process entities
-                    if not hasattr(ymap, 'AllEntities') or not ymap.AllEntities:
+                    if (not hasattr(ymap, 'AllEntities')) or (ymap.AllEntities is None):
                         continue
                         
                     for entity in ymap.AllEntities:
-                        if not entity:
+                        if entity is None:
                             continue
-                            
-                        # Get archetype safely
-                        archetype = getattr(entity, 'Archetype', None)
-                        if not archetype:
+                        
+                        try:
+                            # CodeWalker does not always resolve a concrete Archetype object here.
+                            # The reliable identity is the archetypeName hash stored on the underlying CEntityDef.
+                            ced = getattr(entity, "_CEntityDef", None)
+                            archetype_name = getattr(ced, "archetypeName", None) if ced is not None else None
+
+                            def _as_u32(v) -> Optional[int]:
+                                try:
+                                    if v is None:
+                                        return None
+                                    # Common CodeWalker hash wrappers
+                                    for attr in ("Hash", "hash", "Value", "value"):
+                                        if hasattr(v, attr):
+                                            v = getattr(v, attr)
+                                    if isinstance(v, str):
+                                        s = v.strip()
+                                        if not s or not s.lstrip("-").isdigit():
+                                            return None
+                                        return int(s, 10) & 0xFFFFFFFF
+                                    return int(v) & 0xFFFFFFFF
+                                except Exception:
+                                    return None
+
+                            archetype_hash = _as_u32(archetype_name)
+                            archetype_raw = str(archetype_name) if archetype_name is not None else "UNKNOWN"
+
+                            # Position (world)
+                            posv = getattr(entity, "Position", None)
+                            if posv is None and ced is not None:
+                                posv = getattr(ced, "position", None)
+                            position = np.array([
+                                float(getattr(posv, "X", 0.0)),
+                                float(getattr(posv, "Y", 0.0)),
+                                float(getattr(posv, "Z", 0.0)),
+                            ], dtype=np.float32)
+
+                            # Rotation: YmapEntityDef doesn't always expose Rotation directly; use CEntityDef.rotation (quaternion)
+                            rotq = getattr(ced, "rotation", None) if ced is not None else None
+                            rotation_quat = None
+                            if rotq is not None:
+                                rotation_quat = [
+                                    float(getattr(rotq, "X", 0.0)),
+                                    float(getattr(rotq, "Y", 0.0)),
+                                    float(getattr(rotq, "Z", 0.0)),
+                                    float(getattr(rotq, "W", 1.0)),
+                                ]
+
+                            # Scale
+                            scv = getattr(entity, "Scale", None)
+                            if scv is None and ced is not None:
+                                # Some defs store scale as separate XY/Z fields
+                                sxy = float(getattr(ced, "scaleXY", 1.0))
+                                sz = float(getattr(ced, "scaleZ", 1.0))
+                                scale = np.array([sxy, sxy, sz], dtype=np.float32)
+                            else:
+                                scale = np.array([
+                                    float(getattr(scv, "X", 1.0)),
+                                    float(getattr(scv, "Y", 1.0)),
+                                    float(getattr(scv, "Z", 1.0)),
+                                ], dtype=np.float32)
+
+                            flags = int(getattr(entity, "Flags", getattr(ced, "flags", 0) if ced is not None else 0))
+                            lod_dist = float(getattr(entity, "LodDist", getattr(ced, "lodDist", 0.0) if ced is not None else 0.0))
+                            lod_level = getattr(ced, "lodLevel", None) if ced is not None else None
+
+                            # Sample terrain at entity XY so the renderer can snap props/buildings to ground.
+                            terrain_z, terrain_normal = self.terrain_system.sample_terrain_data(position)
+                            dz = float(abs(float(position[2]) - float(terrain_z)))
+                            used_ground = dz <= float(self.SNAP_TO_TERRAIN_MAX_DELTA_Z)
+
+                            ent_data = {
+                                "ymap": ymap_path,
+                                "name": getattr(entity, "Name", ""),
+                                # Keep a stable numeric hash for downstream tooling/viewer exporters.
+                                # (Older exports used "archetype" directly; prefer numeric when available.)
+                                "archetype": str(archetype_hash) if archetype_hash is not None else archetype_raw,
+                                "archetype_hash": str(archetype_hash) if archetype_hash is not None else None,
+                                "archetype_raw": archetype_raw,
+                                "position": [float(position[0]), float(position[1]), float(position[2])],
+                                "rotation_quat": rotation_quat,
+                                "scale": [float(scale[0]), float(scale[1]), float(scale[2])],
+                                "flags": flags,
+                                "lod_dist": lod_dist,
+                                "lod_level": str(lod_level) if lod_level is not None else None,
+                                "terrain_z": float(terrain_z),
+                                "terrain_normal": terrain_normal.tolist() if terrain_normal is not None else None,
+                                "terrain_snap_used": bool(used_ground),
+                                "terrain_snap_delta_z": float(dz),
+                            }
+
+                            self.num_entities += 1
+                            ktype = str(archetype_hash) if archetype_hash is not None else archetype_raw
+                            self.entity_types[ktype] = self.entity_types.get(ktype, 0) + 1
+
+                            # Build a lightweight "building" list for buildings.obj / building_info.json
+                            if self._is_building_archetype(archetype_raw):
+                                bname = (getattr(entity, "Name", "") or "").strip()
+                                if not bname:
+                                    bname = f"{archetype_raw}_{self.num_entities}"
+
+                                # Avoid runaway memory: keep only first N if something goes wrong with heuristics
+                                if len(self.buildings) < 250_000:
+                                    building = BuildingData(
+                                        name=bname,
+                                        model_name=archetype_raw,
+                                        position=position.copy(),
+                                        rotation=np.zeros(3, dtype=np.float32),
+                                        scale=scale.copy(),
+                                        flags=flags,
+                                        lod_dist=lod_dist,
+                                        archetype=archetype_raw,
+                                    )
+                                    # Snap Z only when close enough; otherwise keep original Z (bridges/interiors/etc).
+                                    if used_ground:
+                                        building.position[2] = float(terrain_z)
+                                    building.terrain_normal = terrain_normal
+                                    self.buildings[bname] = building
+                                    self.building_info["building_types"][archetype_raw] = (
+                                        self.building_info["building_types"].get(archetype_raw, 0) + 1
+                                    )
+
+                            if chunk_writer:
+                                chunk_writer.write(ent_data)
+
+                            if entities_obj:
+                                # Point cloud vertex at original position (not snapped). Consumers can snap using terrain_z.
+                                entities_obj.write(f"v {position[0]:.6f} {position[1]:.6f} {position[2]:.6f}\n")
+                                entities_obj.write(f"p {obj_vidx}\n")
+                                obj_vidx += 1
+                        except Exception as e:
+                            logger.debug(f"Skipping entity export due to error: {e}")
                             continue
-                            
-                        # Check if this is a building/structure
-                        archetype_str = str(archetype).lower()
-                        if any(x in archetype_str for x in ['building', 'house', 'apartment', 'skyscraper', 'bridge']):
-                            building = self._process_building(entity)
-                            if building:
-                                self.buildings[building.name] = building
-                                
-                                # Update building type stats
-                                building_type = building.archetype or 'unknown'
-                                self.building_info['building_types'][building_type] = \
-                                    self.building_info['building_types'].get(building_type, 0) + 1
                                     
                 except Exception as e:
                     logger.warning(f"Failed to process YMAP {ymap_path}: {e}")
@@ -310,22 +580,48 @@ class BuildingSystem:
             
             # Load water data
             self._load_water_data()
+
+            # Write streaming index for chunked entities
+            if self.output_dir and chunk_writer:
+                index = {
+                    "version": 1,
+                    "chunk_size": float(self.ENTITY_CHUNK_SIZE),
+                    "chunks_dir": "entities_chunks",
+                    "total_entities": int(self.num_entities),
+                    "bounds": chunk_writer.bounds,
+                    "chunks": {
+                        k: {"count": int(v), "file": f"{k}.jsonl"}
+                        for k, v in chunk_writer.chunk_counts.items()
+                    },
+                }
+                with open(self.output_dir / "entities_index.json", "w", encoding="utf-8") as f:
+                    json.dump(index, f, indent=2)
             
             # Update building info
             self.building_info['num_buildings'] = len(self.buildings)
             self.building_info['num_structures'] = sum(1 for b in self.buildings.values() 
                                                     if 'structure' in (b.archetype or '').lower())
+            self.building_info['num_entities'] = int(self.num_entities)
+            self.building_info['entity_types'] = self.entity_types
             
             # Log summary
             logger.info(f"Extracted {len(self.buildings)} buildings")
             logger.info(f"Building types: {self.building_info['building_types']}")
             
-            return len(self.buildings) > 0
+            return self.num_entities > 0
             
         except Exception as e:
             logger.error(f"Failed to extract buildings: {e}")
             logger.debug("Stack trace:", exc_info=True)
             return False
+        finally:
+            try:
+                if entities_obj:
+                    entities_obj.close()
+                if chunk_writer:
+                    chunk_writer.close()
+            except Exception:
+                pass
             
     def _process_building(self, entity: Any) -> Optional[BuildingData]:
         """
@@ -390,7 +686,9 @@ class BuildingSystem:
             if self.terrain_system:
                 # Sample terrain height and normal
                 height, normal = self.terrain_system.sample_terrain_data(position)
-                building.position[2] = height
+                dz = float(abs(float(position[2]) - float(height)))
+                if dz <= float(self.SNAP_TO_TERRAIN_MAX_DELTA_Z):
+                    building.position[2] = float(height)
                 building.terrain_normal = normal
                 
                 # Check for water intersection
@@ -417,59 +715,151 @@ class BuildingSystem:
                     
                 # Create watermap file object with DLL manager
                 watermap_file = self.dll_manager.get_watermap_file(data)
-                
-                # Extract vertices and indices
-                vertices = []
-                indices = []
-                
-                # Process watermap data
-                for water_data in watermap_file.water_data:
-                    # Add vertices
-                    for vertex in water_data.vertices:
-                        vertices.append([
-                            vertex.x,
-                            vertex.y,
-                            vertex.z
-                        ])
-                    
-                    # Add indices
-                    for index in water_data.indices:
-                        indices.append(index)
-                
-                # Convert to numpy arrays
-                vertices = np.array(vertices, dtype=np.float32)
-                indices = np.array(indices, dtype=np.uint32)
-                
-                # Calculate bounds
-                bounds = {
-                    'min_x': float(np.min(vertices[:, 0])),
-                    'min_y': float(np.min(vertices[:, 1])),
-                    'min_z': float(np.min(vertices[:, 2])),
-                    'max_x': float(np.max(vertices[:, 0])),
-                    'max_y': float(np.max(vertices[:, 1])),
-                    'max_z': float(np.max(vertices[:, 2]))
-                }
-                
-                # Create water data
-                self.water = WaterData(
-                    vertices=vertices,
-                    indices=indices,
-                    bounds=bounds
-                )
-                
-                # Update water info
-                self.building_info['water_info'] = {
-                    'num_vertices': len(vertices),
-                    'num_triangles': len(indices) // 3,
-                    'bounds': bounds
-                }
-                
-                logger.info(f"Loaded water data with {len(vertices)} vertices and {len(indices)//3} triangles")
+                if not watermap_file:
+                    logger.warning("Could not parse waterheight.dat (skipping water data).")
+                    continue
+
+                # Build a triangulated water surface mesh from the decompressed grid.
+                water = self._watermap_to_waterdata(watermap_file)
+                if water:
+                    self.water = water
+                    self.building_info['water_info'] = {
+                        'loaded': True,
+                        'source': path,
+                        'num_vertices': int(water.vertices.shape[0]),
+                        'num_triangles': int(water.indices.shape[0] // 3),
+                        'bounds': water.bounds,
+                    }
+                    logger.info(
+                        f"Extracted water mesh: {water.vertices.shape[0]} verts, {water.indices.shape[0]//3} tris"
+                    )
+                else:
+                    self.building_info['water_info'] = {'loaded': True, 'source': path}
+                    logger.info("Loaded waterheight.dat successfully (no mesh generated).")
                 break  # Only process first watermap for now
                 
         except Exception as e:
             logger.error(f"Failed to load water data: {e}")
             logger.debug("Stack trace:", exc_info=True)
+
+    def _watermap_to_waterdata(self, wmf: Any) -> Optional[WaterData]:
+        """
+        Convert a CodeWalker `WatermapFile` into a simple triangulated surface mesh.
+
+        Strategy:
+        - Build a vertex for every grid cell.
+        - Only emit faces for quads where all 4 corners have at least one water ref,
+          to avoid spanning over non-water areas.
+        """
+        try:
+            if not wmf:
+                return None
+
+            w = int(getattr(wmf, "Width", 0))
+            h = int(getattr(wmf, "Height", 0))
+            if w <= 1 or h <= 1:
+                return None
+
+            corner_x = float(getattr(wmf, "CornerX", 0.0))
+            corner_y = float(getattr(wmf, "CornerY", 0.0))
+            tile_x = float(getattr(wmf, "TileX", 0.0))
+            tile_y = float(getattr(wmf, "TileY", 0.0))
+
+            grid_refs = getattr(wmf, "GridWatermapRefs", None)
+            if grid_refs is None:
+                return None
+
+            # Height + water-mask grids
+            z = np.zeros((h, w), dtype=np.float32)
+            has = np.zeros((h, w), dtype=np.bool_)
+
+            def _ref_type_str(ref) -> str:
+                t = getattr(ref, "Type", None)
+                if t is None:
+                    return ""
+                return t.ToString() if hasattr(t, "ToString") else str(t)
+
+            def _get_height_at(o: int) -> float:
+                harr = grid_refs[o]
+                if harr is None:
+                    return 0.0
+                # `harr` is an array; in pythonnet, len(...) should work
+                if len(harr) == 0:
+                    return 0.0
+                h0 = harr[0]
+                t = _ref_type_str(h0).lower()
+                # River: use vector Z
+                if "river" in t:
+                    vec = getattr(h0, "Vector", None)
+                    return float(getattr(vec, "Z", 0.0)) if vec is not None else 0.0
+                # Lake/Pool: prefer item.Position.Z
+                if ("lake" in t) or ("pool" in t):
+                    item = getattr(h0, "Item", None)
+                    if item is not None:
+                        pos = getattr(item, "Position", None)
+                        if pos is not None:
+                            return float(getattr(pos, "Z", 0.0))
+                vec = getattr(h0, "Vector", None)
+                return float(getattr(vec, "Z", 0.0)) if vec is not None else 0.0
+
+            # Fill grids
+            for yi in range(h):
+                row_off = yi * w
+                for xi in range(w):
+                    o = row_off + xi
+                    harr = grid_refs[o]
+                    if harr is not None and len(harr) > 0:
+                        has[yi, xi] = True
+                        z[yi, xi] = _get_height_at(o)
+
+            # Build vertices (world XY from Corner + Tile; Y step is negative in CW).
+            verts = np.zeros((w * h, 3), dtype=np.float32)
+            for yi in range(h):
+                wy = corner_y - tile_y * yi
+                row_off = yi * w
+                for xi in range(w):
+                    wx = corner_x + tile_x * xi
+                    verts[row_off + xi, 0] = wx
+                    verts[row_off + xi, 1] = wy
+                    verts[row_off + xi, 2] = z[yi, xi]
+
+            # Faces
+            inds = []
+            for yi in range(h - 1):
+                for xi in range(w - 1):
+                    # quad corners (top-left style grid)
+                    if not (has[yi, xi] and has[yi, xi + 1] and has[yi + 1, xi] and has[yi + 1, xi + 1]):
+                        continue
+                    v00 = yi * w + xi
+                    v10 = yi * w + (xi + 1)
+                    v01 = (yi + 1) * w + xi
+                    v11 = (yi + 1) * w + (xi + 1)
+                    inds.extend([v00, v10, v01])
+                    inds.extend([v10, v11, v01])
+
+            if not inds:
+                return None
+
+            ind_arr = np.array(inds, dtype=np.uint32)
+
+            # Bounds over used vertices only
+            used = np.unique(ind_arr)
+            used_verts = verts[used]
+            bounds = {
+                "min_x": float(np.min(used_verts[:, 0])),
+                "min_y": float(np.min(used_verts[:, 1])),
+                "min_z": float(np.min(used_verts[:, 2])),
+                "max_x": float(np.max(used_verts[:, 0])),
+                "max_y": float(np.max(used_verts[:, 1])),
+                "max_z": float(np.max(used_verts[:, 2])),
+            }
+
+            return WaterData(vertices=verts, indices=ind_arr, bounds=bounds)
+
+        except Exception as e:
+            logger.error(f"Failed to convert watermap to mesh: {e}")
+            logger.debug("Stack trace:", exc_info=True)
+            return None
             
     def get_building_data(self, name: str) -> Optional[BuildingData]:
         """
@@ -523,9 +913,14 @@ class BuildingSystem:
         try:
             # Get the output directory
             output_dir = Path(output_path).parent
+            entities_obj_path = output_dir / "entities.obj"
             
             # Write OBJ file
             with open(output_path, 'w') as f:
+                if entities_obj_path.exists():
+                    f.write("# Entities were exported to entities.obj (point cloud)\n")
+                    f.write("# Copy/paste contents from entities.obj if your tool only accepts one OBJ.\n\n")
+
                 # Write water mesh if available
                 if self.water:
                     f.write("# Water mesh\n")

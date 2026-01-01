@@ -4,8 +4,10 @@
   "description": "WebGL viewer for GTA5 terrain",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build && npm run sync:assets",
+    "build:code": "vite build --emptyOutDir=false",
+    "sync:assets": "python sync_assets_to_dist.py",
     "preview": "vite preview"
   },
   "dependencies": {

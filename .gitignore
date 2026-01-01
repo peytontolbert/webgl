@@ -4,3 +4,7 @@ output/
 CodeWalker-master/
 compiled_cw/
 webgl_viewer/assets/
+webgl_viewer/dist/
+wrappers/
+webgl_viewer/node_modules/
+CodeWalker/
