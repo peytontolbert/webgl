@@ -19,279 +19,122 @@ layout(std140) uniform ShadowmapVars {
 // Shadow map texture
 uniform sampler2D uShadowMap;
 
-// Calculate scene depth for shadow mapping
+// --- Shadow sampling helpers ---
+// Notes:
+// - This is a simplified, single-directional shadow map path (no cascades yet).
+// - The uniform block still contains cascade fields for future parity, but we do not use them here.
+
+float _shadowCompare(vec2 uv, float depth01, float bias) {
+    // Depth texture stores depth in [0..1].
+    float shadowDepth = texture(uShadowMap, uv).r;
+    return (depth01 - bias > shadowDepth) ? 0.0 : 1.0;
+}
+
+// Calculate shadow amount for a world/view-space position, returning [0..1].
+// Also outputs the raw light clip position (for debugging/visualization if desired).
 float ShadowmapSceneDepth(vec3 worldPos, out vec4 lightSpacePos) {
     if (uEnableShadows == 0u) {
         lightSpacePos = vec4(0.0);
         return 1.0;
     }
-    
-    // Transform position to light space
+
+    // Transform position to light clip space.
     lightSpacePos = uLightProjMatrix * uLightViewMatrix * vec4(worldPos, 1.0);
-    
-    // Calculate cascade index
-    float depth = lightSpacePos.z / lightSpacePos.w;
-    int cascadeIndex = 0;
-    for (int i = 0; i < 3; i++) {
-        if (depth < uCascadeSplits[i]) {
-            cascadeIndex = i;
-            break;
-        }
+
+    // Project to NDC.
+    vec3 ndc = lightSpacePos.xyz / max(lightSpacePos.w, 1e-6);
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    float depth01 = ndc.z * 0.5 + 0.5;
+
+    // Early out if outside the shadow map.
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0;
     }
-    
-    // Transform to cascade UV coordinates
-    vec2 shadowUV = lightSpacePos.xy * uCascadeScales[cascadeIndex] + uCascadeOffsets[cascadeIndex].xy;
-    shadowUV = shadowUV * 0.5 + 0.5;
-    
-    // Sample shadow map
-    float shadowDepth = texture(uShadowMap, shadowUV).r;
-    
-    // Apply bias and softness
-    float bias = uShadowBias * (1.0 - abs(dot(normalize(worldPos), uLightDir)));
-    float shadow = 1.0;
-    
-    if (depth - bias > shadowDepth) {
-        shadow = 0.0;
+
+    // Constant-ish bias. (Slope-scale would need a normal.)
+    float bias = max(0.0, uShadowBias);
+
+    // PCF softness: interpret as a radius in texels (0 = hard).
+    float r = max(0.0, uShadowSoftness);
+    if (r <= 0.0) {
+        return _shadowCompare(uv, depth01, bias);
     }
-    
-    // Apply soft shadows
-    if (uShadowSoftness > 0.0) {
-        float sum = 0.0;
-        float samples = 9.0;
-        float offset = uShadowSoftness / 1024.0;
-        
-        for (int x = -1; x <= 1; x++) {
-            for (int y = -1; y <= 1; y++) {
-                vec2 off = vec2(x, y) * offset;
-                float depth = texture(uShadowMap, shadowUV + off).r;
-                sum += (depth - bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        
-        shadow = sum / samples;
-    }
-    
-    return shadow;
+
+    // 3x3 PCF kernel. We assume a square shadow map; caller should set softness accordingly.
+    vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
+    vec2 duv = texel * r;
+    float sum = 0.0;
+    sum += _shadowCompare(uv + vec2(-duv.x, -duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( 0.0,   -duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( duv.x, -duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2(-duv.x,  0.0),   depth01, bias);
+    sum += _shadowCompare(uv + vec2( 0.0,    0.0),   depth01, bias);
+    sum += _shadowCompare(uv + vec2( duv.x,  0.0),   depth01, bias);
+    sum += _shadowCompare(uv + vec2(-duv.x,  duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( 0.0,    duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( duv.x,  duv.y), depth01, bias);
+    return sum / 9.0;
 }
 
 // Calculate shadow amount with cascades
-float ShadowAmount(vec4 shadowCoord, float shadowDepth) {
-    if (uEnableShadows == 0u) {
-        return 1.0;
-    }
-    
-    // Calculate cascade index
-    float depth = shadowCoord.z / shadowCoord.w;
-    int cascadeIndex = 0;
-    for (int i = 0; i < 3; i++) {
-        if (depth < uCascadeSplits[i]) {
-            cascadeIndex = i;
-            break;
-        }
-    }
-    
-    // Transform to cascade UV coordinates
-    vec2 shadowUV = shadowCoord.xy * uCascadeScales[cascadeIndex] + uCascadeOffsets[cascadeIndex].xy;
-    shadowUV = shadowUV * 0.5 + 0.5;
-    
-    // Sample shadow map
-    float shadowDepth = texture(uShadowMap, shadowUV).r;
-    
-    // Apply bias and softness
-    float bias = uShadowBias * (1.0 - abs(dot(normalize(shadowCoord.xyz), uLightDir)));
-    float shadow = 1.0;
-    
-    if (depth - bias > shadowDepth) {
-        shadow = 0.0;
-    }
-    
-    // Apply soft shadows
-    if (uShadowSoftness > 0.0) {
-        float sum = 0.0;
-        float samples = 9.0;
-        float offset = uShadowSoftness / 1024.0;
-        
-        for (int x = -1; x <= 1; x++) {
-            for (int y = -1; y <= 1; y++) {
-                vec2 off = vec2(x, y) * offset;
-                float depth = texture(uShadowMap, shadowUV + off).r;
-                sum += (depth - bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        
-        shadow = sum / samples;
-    }
-    
-    return shadow;
+float ShadowAmount(vec4 shadowCoord, float unusedShadowDepth) {
+    // Kept for compatibility with older shader code; treat as the same as ShadowmapSceneDepth.
+    vec3 ndc = shadowCoord.xyz / max(shadowCoord.w, 1e-6);
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    float depth01 = ndc.z * 0.5 + 0.5;
+    if (uEnableShadows == 0u) return 1.0;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    float bias = max(0.0, uShadowBias);
+    return _shadowCompare(uv, depth01, bias);
 }
 
 // Calculate shadow amount with PCF
 float ShadowAmountPCF(vec4 shadowCoord, float shadowDepth) {
-    if (uEnableShadows == 0u) {
-        return 1.0;
-    }
-    
-    // Calculate cascade index
-    float depth = shadowCoord.z / shadowCoord.w;
-    int cascadeIndex = 0;
-    for (int i = 0; i < 3; i++) {
-        if (depth < uCascadeSplits[i]) {
-            cascadeIndex = i;
-            break;
-        }
-    }
-    
-    // Transform to cascade UV coordinates
-    vec2 shadowUV = shadowCoord.xy * uCascadeScales[cascadeIndex] + uCascadeOffsets[cascadeIndex].xy;
-    shadowUV = shadowUV * 0.5 + 0.5;
-    
-    // Apply PCF
+    if (uEnableShadows == 0u) return 1.0;
+    vec3 ndc = shadowCoord.xyz / max(shadowCoord.w, 1e-6);
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    float depth01 = ndc.z * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    float bias = max(0.0, uShadowBias);
+
+    float r = max(0.0, uShadowSoftness);
+    if (r <= 0.0) return _shadowCompare(uv, depth01, bias);
+
+    vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
+    vec2 duv = texel * r;
     float sum = 0.0;
-    float samples = 9.0;
-    float offset = 1.0 / 1024.0;
-    
-    for (int x = -1; x <= 1; x++) {
-        for (int y = -1; y <= 1; y++) {
-            vec2 off = vec2(x, y) * offset;
-            float depth = texture(uShadowMap, shadowUV + off).r;
-            sum += (depth - uShadowBias > depth) ? 0.0 : 1.0;
-        }
-    }
-    
-    return sum / samples;
+    sum += _shadowCompare(uv + vec2(-duv.x, -duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( 0.0,   -duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( duv.x, -duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2(-duv.x,  0.0),   depth01, bias);
+    sum += _shadowCompare(uv + vec2( 0.0,    0.0),   depth01, bias);
+    sum += _shadowCompare(uv + vec2( duv.x,  0.0),   depth01, bias);
+    sum += _shadowCompare(uv + vec2(-duv.x,  duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( 0.0,    duv.y), depth01, bias);
+    sum += _shadowCompare(uv + vec2( duv.x,  duv.y), depth01, bias);
+    return sum / 9.0;
 }
 
 // Calculate shadow amount with PCSS
 float ShadowAmountPCSS(vec4 shadowCoord, float shadowDepth) {
-    if (uEnableShadows == 0u) {
-        return 1.0;
-    }
-    
-    // Calculate cascade index
-    float depth = shadowCoord.z / shadowCoord.w;
-    int cascadeIndex = 0;
-    for (int i = 0; i < 3; i++) {
-        if (depth < uCascadeSplits[i]) {
-            cascadeIndex = i;
-            break;
-        }
-    }
-    
-    // Transform to cascade UV coordinates
-    vec2 shadowUV = shadowCoord.xy * uCascadeScales[cascadeIndex] + uCascadeOffsets[cascadeIndex].xy;
-    shadowUV = shadowUV * 0.5 + 0.5;
-    
-    // Calculate penumbra size
-    float penumbra = uShadowSoftness * (1.0 - abs(dot(normalize(shadowCoord.xyz), uLightDir)));
-    
-    // Apply PCSS
-    float sum = 0.0;
-    float samples = 16.0;
-    float offset = penumbra / 1024.0;
-    
-    for (int x = -2; x <= 2; x++) {
-        for (int y = -2; y <= 2; y++) {
-            vec2 off = vec2(x, y) * offset;
-            float depth = texture(uShadowMap, shadowUV + off).r;
-            sum += (depth - uShadowBias > depth) ? 0.0 : 1.0;
-        }
-    }
-    
-    return sum / samples;
+    // Not implemented in simplified path.
+    return ShadowAmount(shadowCoord, shadowDepth);
 }
 
 // Calculate shadow amount with VSM
 float ShadowAmountVSM(vec4 shadowCoord, float shadowDepth) {
-    if (uEnableShadows == 0u) {
-        return 1.0;
-    }
-    
-    // Calculate cascade index
-    float depth = shadowCoord.z / shadowCoord.w;
-    int cascadeIndex = 0;
-    for (int i = 0; i < 3; i++) {
-        if (depth < uCascadeSplits[i]) {
-            cascadeIndex = i;
-            break;
-        }
-    }
-    
-    // Transform to cascade UV coordinates
-    vec2 shadowUV = shadowCoord.xy * uCascadeScales[cascadeIndex] + uCascadeOffsets[cascadeIndex].xy;
-    shadowUV = shadowUV * 0.5 + 0.5;
-    
-    // Sample VSM
-    vec2 moments = texture(uShadowMap, shadowUV).xy;
-    float mean = moments.x;
-    float variance = moments.y - mean * mean;
-    float delta = depth - mean;
-    float p = variance / (variance + delta * delta);
-    
-    return p;
+    // Not supported with a single depth map.
+    return ShadowAmount(shadowCoord, shadowDepth);
 }
 
 // Calculate shadow amount with ESM
 float ShadowAmountESM(vec4 shadowCoord, float shadowDepth) {
-    if (uEnableShadows == 0u) {
-        return 1.0;
-    }
-    
-    // Calculate cascade index
-    float depth = shadowCoord.z / shadowCoord.w;
-    int cascadeIndex = 0;
-    for (int i = 0; i < 3; i++) {
-        if (depth < uCascadeSplits[i]) {
-            cascadeIndex = i;
-            break;
-        }
-    }
-    
-    // Transform to cascade UV coordinates
-    vec2 shadowUV = shadowCoord.xy * uCascadeScales[cascadeIndex] + uCascadeOffsets[cascadeIndex].xy;
-    shadowUV = shadowUV * 0.5 + 0.5;
-    
-    // Sample ESM
-    float moment = texture(uShadowMap, shadowUV).r;
-    float p = exp(-uShadowSoftness * (depth - moment));
-    
-    return p;
+    // Not supported with a single depth map.
+    return ShadowAmount(shadowCoord, shadowDepth);
 }
 
 // Calculate shadow amount with MSM
 float ShadowAmountMSM(vec4 shadowCoord, float shadowDepth) {
-    if (uEnableShadows == 0u) {
-        return 1.0;
-    }
-    
-    // Calculate cascade index
-    float depth = shadowCoord.z / shadowCoord.w;
-    int cascadeIndex = 0;
-    for (int i = 0; i < 3; i++) {
-        if (depth < uCascadeSplits[i]) {
-            cascadeIndex = i;
-            break;
-        }
-    }
-    
-    // Transform to cascade UV coordinates
-    vec2 shadowUV = shadowCoord.xy * uCascadeScales[cascadeIndex] + uCascadeOffsets[cascadeIndex].xy;
-    shadowUV = shadowUV * 0.5 + 0.5;
-    
-    // Sample MSM
-    vec4 moments = texture(uShadowMap, shadowUV);
-    float mean = moments.x;
-    float variance = moments.y - mean * mean;
-    float skewness = moments.z - 3.0 * mean * variance - mean * mean * mean;
-    float kurtosis = moments.w - 4.0 * mean * skewness - 6.0 * mean * mean * variance - mean * mean * mean * mean;
-    
-    float delta = depth - mean;
-    float delta2 = delta * delta;
-    float delta3 = delta2 * delta;
-    float delta4 = delta3 * delta;
-    
-    float p = variance / (variance + delta2);
-    p += skewness * delta3 / (6.0 * variance * variance * variance);
-    p += kurtosis * delta4 / (24.0 * variance * variance * variance * variance);
-    
-    return p;
+    // Not supported with a single depth map.
+    return ShadowAmount(shadowCoord, shadowDepth);
 } 

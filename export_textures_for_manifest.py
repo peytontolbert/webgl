@@ -141,7 +141,17 @@ def main():
     ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
     ap.add_argument("--max", type=int, default=0, help="Limit number of textures exported (0 = all)")
-    ap.add_argument("--only-missing", action="store_true", help="Only export when material.diffuse is missing")
+    ap.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="Only export when selected material maps are missing (see --only-missing-maps).",
+    )
+    ap.add_argument(
+        "--only-missing-maps",
+        default="diffuse",
+        help="Comma-separated material keys to treat as required when --only-missing is set (default: diffuse). "
+             "Example: diffuse,normal,spec",
+    )
     ap.add_argument("--ytd-spins", type=int, default=2000, help="Max ContentThreadProc spins while waiting for a YTD to load")
     ap.add_argument("--drawable-spins", type=int, default=600, help="Max ContentThreadProc spins while waiting for a Drawable to load")
     ap.add_argument("--export-ktx2", action="store_true", help="Also write .ktx2 copies for exported textures (requires toktx; writes *Ktx2 fields in materials)")
@@ -223,7 +233,7 @@ def main():
     skipped = 0
     skip_reasons = {
         "bad_hash": 0,
-        "only_missing_already_has_diffuse": 0,
+        "only_missing_already_has_required_maps": 0,
         "no_archetype": 0,
         "no_drawable": 0,
         "no_texture_dict": 0,
@@ -344,10 +354,28 @@ def main():
             skipped += 1
             continue
         entry = meshes.get(hs) or {}
-        have = _entry_has_any_diffuse(entry) if isinstance(entry, dict) else False
-        if args.only_missing and have:
-            skip_reasons["only_missing_already_has_diffuse"] += 1
-            _sample("only_missing_already_has_diffuse")
+        # Optional fast path: skip entries that already have the requested material maps.
+        # This used to mean "diffuse only", but missing normal/spec is a common failure mode.
+        want_keys = []
+        try:
+            want_keys = [k.strip() for k in str(args.only_missing_maps or "").split(",") if k.strip()]
+        except Exception:
+            want_keys = []
+        if not want_keys:
+            want_keys = ["diffuse"]
+
+        have_all = True
+        if isinstance(entry, dict):
+            for k in want_keys:
+                if not _entry_has_any_map(entry, k):
+                    have_all = False
+                    break
+        else:
+            have_all = False
+
+        if args.only_missing and have_all:
+            skip_reasons["only_missing_already_has_required_maps"] += 1
+            _sample("only_missing_already_has_required_maps", want=",".join(want_keys))
             skipped += 1
             continue
 
@@ -540,6 +568,7 @@ def main():
                 textures=textures,
                 td_hash=int(td_hash) & 0xFFFFFFFF,
                 tex_dir=tex_dir,
+                dll_manager=dm,
                 export_ktx2=bool(args.export_ktx2),
                 ktx2_dir=ktx2_dir,
                 toktx_exe=str(args.toktx or "toktx"),
@@ -583,6 +612,7 @@ def main():
                             textures=textures,
                             td_hash=int(td_hash) & 0xFFFFFFFF,
                             tex_dir=tex_dir,
+                            dll_manager=dm,
                             export_ktx2=bool(args.export_ktx2),
                             ktx2_dir=ktx2_dir,
                             toktx_exe=str(args.toktx or "toktx"),

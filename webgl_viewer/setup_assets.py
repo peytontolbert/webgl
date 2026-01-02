@@ -110,6 +110,15 @@ def setup_assets():
             shutil.copy2(chunk_file, chunks_dst / chunk_file.name)
         print("Copied entities_chunks/*.jsonl")
 
+        # Optional interiors (MLO archetype defs): output/interiors/*.json -> assets/interiors/*.json
+        interiors_src = output_dir / 'interiors'
+        if interiors_src.exists():
+            interiors_dst = assets_dir / 'interiors'
+            interiors_dst.mkdir(exist_ok=True)
+            for f in interiors_src.glob('*.json'):
+                shutil.copy2(f, interiors_dst / f.name)
+            print("Copied interiors/*.json")
+
         # Optional: build fast binary position chunks for dot rendering
         # (keeps JSONL for model streaming / archetype data).
         if _SHOULD_BUILD_ENTITY_BINS:
@@ -139,6 +148,47 @@ def setup_assets():
     else:
         print("Warning: textures directory not found")
 
+    # Copy model textures from common export output layouts into assets/models_textures/.
+    #
+    # Notes:
+    # - Some exporters write directly into webgl/webgl_viewer/assets/models_textures/ already.
+    # - Other pipelines export into webgl/output/... first (historical layouts vary).
+    # - The runtime expects model textures under assets/models_textures/ (not assets/textures/).
+    def _copy_newer(src: Path, dst: Path) -> bool:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                try:
+                    if dst.stat().st_mtime >= src.stat().st_mtime:
+                        return False
+                except Exception:
+                    pass
+            shutil.copy2(src, dst)
+            return True
+        except Exception:
+            return False
+
+    model_tex_candidates = [
+        output_dir / 'models_textures',
+        output_dir / 'models' / 'models_textures',
+        output_dir / 'models_textures_png',
+    ]
+    assets_models_textures_dir = assets_dir / 'models_textures'
+    copied_model_textures = 0
+    for src_dir in model_tex_candidates:
+        if not src_dir.exists():
+            continue
+        try:
+            assets_models_textures_dir.mkdir(parents=True, exist_ok=True)
+            for p in src_dir.glob('*.png'):
+                if _copy_newer(p, assets_models_textures_dir / p.name):
+                    copied_model_textures += 1
+        except Exception:
+            # Keep asset setup best-effort.
+            continue
+    if copied_model_textures > 0:
+        print(f"Copied model textures into assets/models_textures: {copied_model_textures} files")
+
     # If terrain_info.json indicates no textures, try to auto-link terrain textures from the copied PNGs.
     _patch_terrain_info_with_detected_textures(assets_dir / 'terrain_info.json', assets_dir / 'textures')
 
@@ -165,6 +215,14 @@ def setup_assets():
     # Generate a sharded manifest (manifest_index.json + manifest_shards/*.json) for faster web startup.
     _ensure_models_manifest_shards(assets_dir / 'models')
 
+    # Optional but very useful: export CodeWalker ShaderParamNames (hash -> name) for
+    # viewer-side shaderParams introspection + best-effort material normalization.
+    # This is fast (~1-2s) and produces a small JSON file under assets/.
+    try:
+        _ensure_shader_param_name_map(assets_dir)
+    except Exception as e:
+        print(f"Warning: failed to generate shader_param_names.json: {e}")
+
     # Optional: build a small chunk->model-manifest-shards index to enable faster runtime prefetching.
     # This is separate from entities_index.json (which only maps chunk keys to filenames/counts).
     if _SHOULD_BUILD_CHUNK_SHARD_INDEX:
@@ -175,6 +233,75 @@ def setup_assets():
     
     print("\nAsset setup complete!")
     print(f"Assets directory: {assets_dir.absolute()}")
+
+
+def _ensure_shader_param_name_map(assets_dir: Path) -> None:
+    """
+    Generate `assets/shader_param_names.json` by parsing CodeWalker's ShaderParamNames enum:
+      CodeWalker.Core/GameFiles/Resources/ShaderParams.cs
+
+    Output schema:
+      {
+        "schema": "codewalker-shader-param-names-v1",
+        "source": "<path>",
+        "source_mtime_ns": <int>,
+        "byHash": { "<u32>": "<Name>", ... }
+      }
+
+    The viewer uses this to resolve shaderParams.{texturesByHash,vectorsByHash} into friendly names,
+    and to auto-populate common material fields (bumpiness/specular/etc).
+    """
+    if not assets_dir.exists() or not assets_dir.is_dir():
+        return
+
+    # Locate CodeWalker source relative to this repo layout.
+    # repo_root/webgl/webgl_viewer/setup_assets.py -> repo_root/webgl/CodeWalker/...
+    viewer_dir = Path(__file__).resolve().parent
+    codewalker_shaderparams = (viewer_dir.parent / "CodeWalker" / "CodeWalker.Core" / "GameFiles" / "Resources" / "ShaderParams.cs")
+    if not codewalker_shaderparams.exists():
+        # Allow running viewer without CodeWalker sources checked out.
+        return
+
+    out_path = assets_dir / "shader_param_names.json"
+    try:
+        src_mtime_ns = int(codewalker_shaderparams.stat().st_mtime_ns)
+    except Exception:
+        src_mtime_ns = 0
+
+    # Skip if already up to date.
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text(encoding="utf-8", errors="ignore"))
+            if (
+                isinstance(existing, dict)
+                and existing.get("schema") == "codewalker-shader-param-names-v1"
+                and int(existing.get("source_mtime_ns") or 0) == int(src_mtime_ns)
+            ):
+                return
+        except Exception:
+            pass
+
+    text = codewalker_shaderparams.read_text(encoding="utf-8", errors="ignore")
+    # Match lines like: "DiffuseSampler = 4059966321,"
+    pat = re.compile(r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<val>\d+)\s*,\s*$", re.MULTILINE)
+    by_hash = {}
+    for m in pat.finditer(text):
+        name = m.group("name")
+        val = m.group("val")
+        # Keep as decimal string; manifests also use decimal strings.
+        by_hash[str(val)] = str(name)
+
+    if not by_hash:
+        return
+
+    payload = {
+        "schema": "codewalker-shader-param-names-v1",
+        "source": str(codewalker_shaderparams),
+        "source_mtime_ns": int(src_mtime_ns),
+        "byHash": by_hash,
+    }
+    out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    print(f"Generated shader_param_names.json ({len(by_hash)} entries): {out_path}")
 
 def _build_entity_position_bins(assets_dir: Path, max_chunks: int = 0):
     """
@@ -282,7 +409,14 @@ def _build_entity_instance_bins(assets_dir: Path, max_chunks: int = 0):
       - 4 bytes: b'ENT1'
       - u32 little-endian: recordCount
       - recordCount records of:
-          <I3f4f3f> = archetypeHash(u32), pos(xyz), quat(xyzw), scale(xyz)
+          v1: <I3f4f3f> = archetypeHash(u32), pos(xyz), quat(xyzw), scale(xyz)
+          v2: <I3f4f3fI> adds u32 tintIndex
+          v3: <I3f4f3f5I> adds u32 tintIndex, u32 guid, u32 mloParentGuid, u32 mloEntitySetHash, u32 flags
+
+     flags bits (v3):
+       - 1: isMloInstance
+       - 2: isInteriorChild (mloParentGuid != 0)
+       - 4: isEntitySetChild (mloEntitySetHash != 0)
     """
     idx_path = assets_dir / "entities_index.json"
     chunks_dir = assets_dir / "entities_chunks"
@@ -374,7 +508,48 @@ def _build_entity_instance_bins(assets_dir: Path, max_chunks: int = 0):
                     except Exception:
                         sx, sy, sz = 1.0, 1.0, 1.0
 
-                    buf += struct.pack("<I3f4f3f", int(h), x, y, z, qx, qy, qz, qw, sx, sy, sz)
+                    # Optional metadata (v3)
+                    tint = obj.get("tintIndex", obj.get("tint", 0))
+                    try:
+                        tint_u32 = int(tint) & 0xFFFFFFFF
+                    except Exception:
+                        tint_u32 = 0
+                    guid = obj.get("guid", 0)
+                    try:
+                        guid_u32 = int(guid) & 0xFFFFFFFF
+                    except Exception:
+                        guid_u32 = 0
+                    mlo_parent = obj.get("mlo_parent_guid", 0)
+                    try:
+                        mlo_parent_u32 = int(mlo_parent) & 0xFFFFFFFF
+                    except Exception:
+                        mlo_parent_u32 = 0
+                    mlo_set = obj.get("mlo_entity_set_hash", 0)
+                    try:
+                        mlo_set_u32 = int(mlo_set) & 0xFFFFFFFF
+                    except Exception:
+                        mlo_set_u32 = 0
+                    is_mlo_instance = bool(obj.get("is_mlo_instance", False))
+                    flags = 0
+                    if is_mlo_instance:
+                        flags |= 1
+                    if mlo_parent_u32 != 0:
+                        flags |= 2
+                    if mlo_set_u32 != 0:
+                        flags |= 4
+
+                    buf += struct.pack(
+                        "<I3f4f3f5I",
+                        int(h),
+                        x, y, z,
+                        qx, qy, qz, qw,
+                        sx, sy, sz,
+                        int(tint_u32),
+                        int(guid_u32),
+                        int(mlo_parent_u32),
+                        int(mlo_set_u32),
+                        int(flags),
+                    )
                     count += 1
                     if len(buf) >= 4 * 1024 * 1024:
                         fo.write(buf)
@@ -509,7 +684,20 @@ def _build_entities_chunk_shard_index(assets_dir: Path, max_chunks: int = 0):
                         head = f.read(8)
                         if len(head) == 8 and head[:4] == b"ENT1":
                             count = struct.unpack("<I", head[4:8])[0]
+                            # Detect stride based on file size (v1=44, v2=48, v3=64)
+                            try:
+                                size = bin_path.stat().st_size
+                            except Exception:
+                                size = 0
+                            payload_bytes = max(0, int(size) - 8)
                             stride = 44
+                            if count > 0:
+                                if payload_bytes == int(count) * 64:
+                                    stride = 64
+                                elif payload_bytes == int(count) * 48:
+                                    stride = 48
+                                else:
+                                    stride = 44
                             # Stream records to avoid loading huge files into memory.
                             # Read in blocks aligned to stride.
                             remaining = int(count) * stride

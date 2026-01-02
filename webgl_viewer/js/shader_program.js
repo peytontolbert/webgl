@@ -5,6 +5,68 @@ export class ShaderProgram {
         this.attributes = {};
         this.uniforms = {};
     }
+
+    /**
+     * Very small GLSL preprocessor for `#include "file.glsl"`.
+     * - Only supports quoted includes.
+     * - Keeps `#version` where it is; include files must not declare `#version`.
+     * @param {string} source
+     * @param {(name: string) => (string|Promise<string>)} includeLoader
+     * @param {number} maxDepth
+     * @returns {Promise<string>}
+     */
+    static async preprocessIncludes(source, includeLoader, maxDepth = 20) {
+        /** @param {string} src @param {string[]} stack */
+        const expand = async (src, stack) => {
+            // IMPORTANT:
+            // Do NOT share a single global RegExp across recursive expand() calls.
+            // RegExp with /g uses a mutable `lastIndex`; if recursion reuses the same RegExp,
+            // nested calls will clobber lastIndex and the parent loop can re-match the same
+            // include line repeatedly, growing `parts` until we hit RangeError: Invalid array length.
+            const includeRe = /^[ \t]*#include[ \t]+"([^"]+)"[ \t]*$/gm;
+
+            if (stack.length > maxDepth) {
+                throw new Error(`GLSL include depth exceeded (${maxDepth}): ${stack.join(' -> ')}`);
+            }
+
+            /** @type {string[]} */
+            const parts = [];
+            let lastIdx = 0;
+            includeRe.lastIndex = 0;
+            for (;;) {
+                const m = includeRe.exec(src);
+                if (!m) break;
+                const [full, name] = m;
+                const start = m.index;
+                const end = start + full.length;
+                parts.push(src.slice(lastIdx, start));
+
+                const trimmed = String(name || '').trim();
+                if (!trimmed) {
+                    parts.push(`\n/* #include "" ignored */\n`);
+                    lastIdx = end;
+                    continue;
+                }
+                if (stack.includes(trimmed)) {
+                    throw new Error(`GLSL include cycle: ${[...stack, trimmed].join(' -> ')}`);
+                }
+
+                const inc = await includeLoader(trimmed);
+                if (typeof inc !== 'string') {
+                    throw new Error(`GLSL include not found: "${trimmed}"`);
+                }
+                parts.push(`\n/* begin include: ${trimmed} */\n`);
+                parts.push(await expand(inc, [...stack, trimmed]));
+                parts.push(`\n/* end include: ${trimmed} */\n`);
+
+                lastIdx = end;
+            }
+            parts.push(src.slice(lastIdx));
+            return parts.join('');
+        };
+
+        return await expand(String(source ?? ''), []);
+    }
     
     async createProgram(vsSource, fsSource) {
         try {

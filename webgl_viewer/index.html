@@ -241,6 +241,10 @@
                 Cross-archetype instancing (group by mesh + material)
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="entityLodTraversal">
+                Entity LOD traversal (CodeWalker-style; slower; needs updated entity chunks)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
                 <input type="checkbox" id="showPlaceholders">
                 Show placeholder meshes for unexported archetypes
             </label>
@@ -310,6 +314,18 @@
                 <option value="1">Medium</option>
                 <option value="2">Low</option>
             </select>
+        </div>
+        <div class="control-group">
+            <label>RPF (experimental)</label>
+            <div style="margin-top: 6px; font-size: 12px; opacity: 0.78; line-height: 1.25;">
+                Mount a local <code>.rpf</code> and extract a file by path. This is an RPF explorer, not a full in-game asset loader (yet).
+            </div>
+            <input id="rpfFileInput" type="file" accept=".rpf" style="display:none" />
+            <button id="mountRpfBtn" style="width: 100%; padding: 6px; margin-top: 6px;">Mount .rpf file…</button>
+            <div id="rpfStatus" style="margin-top: 6px; font-size: 12px; opacity: 0.88; line-height: 1.2; white-space: pre-line;"></div>
+            <label style="margin-top: 8px;">Extract file (path inside RPF)</label>
+            <input id="rpfExtractPath" placeholder="common/data/levels/gta5/..." />
+            <button id="rpfExtractBtn" style="width: 100%; padding: 6px; margin-top: 6px;">Extract to download</button>
         </div>
     </div>
     <!-- gl-matrix is imported via ESM in js/glmatrix.js (Vite dev/build). -->

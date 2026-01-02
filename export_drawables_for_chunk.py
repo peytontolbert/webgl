@@ -19,6 +19,7 @@ This is intentionally an MVP:
 import argparse
 import json
 import os
+import re
 import struct
 from pathlib import Path
 import time
@@ -145,6 +146,39 @@ def _as_uint32(x) -> int:
         x = int(x)
     x = int(x)
     return x & 0xFFFFFFFF
+
+
+def joaat(input_str: str) -> int:
+    """
+    GTA "joaat" (Jenkins one-at-a-time) hash.
+    Must match the viewer's implementation (see webgl_viewer/js/joaat.js).
+    """
+    s = str(input_str or "").lower()
+    h = 0
+    for ch in s:
+        h = (h + ord(ch)) & 0xFFFFFFFF
+        h = (h + ((h << 10) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        h ^= (h >> 6)
+    h = (h + ((h << 3) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    h ^= (h >> 11)
+    h = (h + ((h << 15) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    return h & 0xFFFFFFFF
+
+
+def _slugify_texture_name(name: str) -> str:
+    """
+    Match viewer-side slugification (see ModelManager._slugifyTextureName):
+      - lowercase
+      - replace non [a-z0-9] with '_'
+      - trim leading/trailing underscores
+    """
+    s = str(name or "").strip().lower()
+    if not s:
+        return ""
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"^_+", "", s)
+    s = re.sub(r"_+$", "", s)
+    return s
 
 
 def _extract_first_drawable_geometry(drawable) -> tuple[np.ndarray, np.ndarray] | None:
@@ -843,6 +877,45 @@ def _pick_diffuse_texture_name_from_shader(textures: dict, shader) -> str | None
     return _pick_diffuse_texture_name(textures)
 
 
+def _pick_diffuse_texture_name_from_shader_with_hash(textures: dict, shader) -> tuple[str | None, int | None]:
+    """
+    Like _pick_diffuse_texture_name_from_shader, but also returns the shader param hash (u32) that selected it.
+    Returns (name, hash_u32) where hash_u32 can be None when we fell back to heuristic selection.
+    """
+    if not isinstance(textures, dict) or not textures:
+        return None, None
+
+    tex_by_lower = {str(k).lower(): str(k) for k in textures.keys()}
+    pref_rank = {h: i for i, h in enumerate(_SP_DIFFUSE_PREFERRED)}
+    candidates = []
+    for hv, p in _shader_param_iter(shader) or []:
+        try:
+            if int(getattr(p, "DataType", 255)) != 0:
+                continue
+            tex = getattr(p, "Data", None)
+            nm = str(getattr(tex, "Name", "")).strip()
+            if not nm:
+                continue
+            low = nm.lower()
+            if any(k in low for k in ("_n", "normal", "nrm", "nm_", "spec", "srm", "mask", "lookup")):
+                continue
+            key = tex_by_lower.get(low)
+            if not key:
+                continue
+            hv_u32 = int(hv) & 0xFFFFFFFF
+            rank = pref_rank.get(hv_u32, 999)
+            candidates.append((rank, hv_u32, key))
+        except Exception:
+            continue
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][2], candidates[0][1]
+
+    # Heuristic fallback (no reliable param hash).
+    return _pick_diffuse_texture_name(textures), None
+
+
 def _pick_texture_name_from_shader(textures: dict, shader, preferred_hashes: list[int], require_keywords: tuple[str, ...] | None = None) -> str | None:
     """
     Pick a texture name by following shader texture params, preferring certain param hashes.
@@ -851,7 +924,6 @@ def _pick_texture_name_from_shader(textures: dict, shader, preferred_hashes: lis
     if not isinstance(textures, dict) or not textures:
         return None
 
-    tex_by_lower = {str(k).lower(): str(k) for k in textures.keys()}
     pref_rank = {int(h) & 0xFFFFFFFF: i for i, h in enumerate(preferred_hashes or [])}
 
     candidates = []
@@ -866,11 +938,8 @@ def _pick_texture_name_from_shader(textures: dict, shader, preferred_hashes: lis
             low = nm.lower()
             if require_keywords and not any(k in low for k in require_keywords):
                 continue
-            key = tex_by_lower.get(low)
-            if not key:
-                continue
             rank = pref_rank.get(int(hv) & 0xFFFFFFFF, 999)
-            candidates.append((rank, key))
+            candidates.append((rank, nm))
         except Exception:
             continue
 
@@ -879,6 +948,80 @@ def _pick_texture_name_from_shader(textures: dict, shader, preferred_hashes: lis
         return candidates[0][1]
     return None
 
+
+def _pick_texture_name_from_shader_with_hash(
+    textures: dict,
+    shader,
+    preferred_hashes: list[int],
+    require_keywords: tuple[str, ...] | None = None,
+) -> tuple[str | None, int | None]:
+    """
+    Like _pick_texture_name_from_shader, but also returns the shader param hash (u32) that selected it.
+    Returns (name, hash_u32) where hash_u32 can be None if no selection was possible.
+    """
+    if not isinstance(textures, dict) or not textures:
+        return None, None
+
+    pref_rank = {int(h) & 0xFFFFFFFF: i for i, h in enumerate(preferred_hashes or [])}
+
+    candidates = []
+    for hv, p in _shader_param_iter(shader) or []:
+        try:
+            if int(getattr(p, "DataType", 255)) != 0:
+                continue
+            tex = getattr(p, "Data", None)
+            nm = str(getattr(tex, "Name", "")).strip()
+            if not nm:
+                continue
+            low = nm.lower()
+            if require_keywords and not any(k in low for k in require_keywords):
+                continue
+            hv_u32 = int(hv) & 0xFFFFFFFF
+            rank = pref_rank.get(hv_u32, 999)
+            candidates.append((rank, hv_u32, nm))
+        except Exception:
+            continue
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][2], candidates[0][1]
+    return None, None
+
+
+def _format_name_for_texture(textures: dict, tex_name: str) -> str | None:
+    """
+    Return the CodeWalker texture format name string for a given texture (e.g. 'D3DFMT_ATI2', 'D3DFMT_DXT5').
+    This comes from gta5_modules.rpf_reader.get_ytd_textures() -> (img, format_name).
+    """
+    try:
+        if not tex_name or not isinstance(textures, dict) or tex_name not in textures:
+            return None
+        _img, fmt = textures.get(tex_name, (None, None))
+        s = str(fmt or "").strip()
+        return s or None
+    except Exception:
+        return None
+
+
+def _normal_decode_flags_from_codewalker_format(tex_name: str, fmt_name: str | None) -> dict:
+    """
+    Emit viewer normal decode flags based on CodeWalker format.
+    - BC5 (ATI2): XY in RG, Z reconstructed => swizzle='rg', reconstructZ=1
+    - DXT5 normal maps often use DXT5nm packing: X in A, Y in G => swizzle='ag', reconstructZ=1
+      (Heuristic gated by texture name keywords.)
+    - Otherwise: assume standard RGB normal => swizzle='rg', reconstructZ=0
+    """
+    low = str(tex_name or "").lower()
+    fmt = str(fmt_name or "").upper()
+
+    if "ATI2" in fmt or "BC5" in fmt:
+        return {"normalSwizzle": "rg", "normalReconstructZ": 1}
+
+    # DXT5nm heuristic: name suggests normal and format is DXT5/BC3.
+    if ("DXT5" in fmt or "BC3" in fmt) and any(k in low for k in ("_n", "normal", "nrm", "nm_", "bump")):
+        return {"normalSwizzle": "ag", "normalReconstructZ": 1}
+
+    return {"normalSwizzle": "rg", "normalReconstructZ": 0}
 
 def _pick_texture_by_keywords(textures: dict, include_keywords: tuple[str, ...], exclude_keywords: tuple[str, ...] | None = None) -> str | None:
     """
@@ -982,28 +1125,154 @@ def _extract_shader_params(shader, max_textures: int = 32, max_vectors: int = 64
     }
 
 
-def _export_texture_png(textures: dict, tex_name: str, tex_dir: Path, td_hash: int) -> tuple[str | None, bool]:
+def _decode_texture_object_to_img_rgba(dll_manager: DllManager | None, tex_obj) -> tuple[np.ndarray | None, str | None]:
+    """
+    Decode a CodeWalker texture object into an RGBA uint8 image (H,W,4) + format_name.
+    This is used as a fallback when a shader references a texture that isn't present in the
+    currently loaded YTD dict returned by get_ytd_textures(...).
+    """
+    if tex_obj is None:
+        return None, None
+
+    # Best-effort format string
+    fmt_obj = getattr(tex_obj, "Format", None)
+    format_name = fmt_obj.ToString() if fmt_obj and hasattr(fmt_obj, "ToString") else (str(fmt_obj) if fmt_obj is not None else None)
+
+    width = int(getattr(tex_obj, "Width", 0) or 0)
+    height = int(getattr(tex_obj, "Height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return None, format_name
+
+    pixels = None
+    # Prefer DDSIO if available (matches CodeWalker UI path).
+    try:
+        ddsio = getattr(dll_manager, "DDSIO", None) if dll_manager is not None else None
+        if ddsio is not None and hasattr(ddsio, "GetPixels"):
+            pixels = ddsio.GetPixels(tex_obj, 0)
+    except Exception:
+        pixels = None
+    if not pixels:
+        try:
+            if hasattr(tex_obj, "GetPixels"):
+                pixels = tex_obj.GetPixels(0)
+        except Exception:
+            pixels = None
+    if not pixels:
+        return None, format_name
+
+    arr = np.frombuffer(bytes(pixels), dtype=np.uint8)
+
+    img = None
+    # packed RGBA
+    if arr.size == width * height * 4:
+        img = arr.reshape(height, width, 4)
+    # packed RGB
+    elif arr.size == width * height * 3:
+        img = arr.reshape(height, width, 3)
+    else:
+        # Try stride interpretation
+        stride = int(getattr(tex_obj, "Stride", 0) or 0)
+        if stride > 0 and (arr.size == stride * height):
+            if (stride % 4) == 0:
+                row_px = stride // 4
+                if row_px >= width:
+                    img = arr.reshape(height, row_px, 4)[:, :width, :]
+            elif (stride % 3) == 0:
+                row_px = stride // 3
+                if row_px >= width:
+                    img = arr.reshape(height, row_px, 3)[:, :width, :]
+        if img is None and height > 0 and (arr.size % height) == 0:
+            row_stride = arr.size // height
+            if (row_stride % 4) == 0:
+                row_px = row_stride // 4
+                if row_px >= width:
+                    img = arr.reshape(height, row_px, 4)[:, :width, :]
+            elif (row_stride % 3) == 0:
+                row_px = row_stride // 3
+                if row_px >= width:
+                    img = arr.reshape(height, row_px, 3)[:, :width, :]
+
+    if img is None:
+        return None, format_name
+
+    # DDSIO output is typically BGRA; convert to RGBA.
+    try:
+        if img.shape[2] == 4:
+            img = img[:, :, [2, 1, 0, 3]]
+        elif img.shape[2] == 3:
+            img = img[:, :, [2, 1, 0]]
+    except Exception:
+        pass
+
+    # Ensure RGBA
+    if img.shape[2] == 3:
+        img = np.concatenate([img, 255 * np.ones((img.shape[0], img.shape[1], 1), dtype=np.uint8)], axis=2)
+
+    return img.astype(np.uint8), format_name
+
+
+def _export_texture_png(
+    textures: dict,
+    tex_name: str,
+    tex_dir: Path,
+    *,
+    td_hash: int | None = None,
+    shader_tex_obj=None,
+    dll_manager: DllManager | None = None,
+) -> tuple[str | None, bool]:
     """
     Write a texture to assets/models_textures and return (relativePath, wroteNewFile).
     """
-    if not tex_name or not isinstance(textures, dict) or tex_name not in textures:
+    if not tex_name or not isinstance(textures, dict):
         return None, False
-    img, _fmt = textures.get(tex_name, (None, None))
+
+    # Prefer already-decoded textures (from YTD dict).
+    img, fmt = textures.get(tex_name, (None, None)) if tex_name in textures else (None, None)
+
+    # Fallback: decode directly from the shader's texture object (covers cross-dict references).
+    if img is None and shader_tex_obj is not None:
+        img2, fmt2 = _decode_texture_object_to_img_rgba(dll_manager, shader_tex_obj)
+        if img2 is not None:
+            img = img2
+            fmt = fmt2
+            textures[tex_name] = (img, fmt)  # cache for later format queries
+
     if img is None:
         return None, False
     try:
-        if img.shape[2] == 3:
-            rgba = np.concatenate([img, 255 * np.ones((img.shape[0], img.shape[1], 1), dtype=np.uint8)], axis=2)
-        else:
-            rgba = img
         tex_dir.mkdir(parents=True, exist_ok=True)
-        safe = _safe_tex_name(tex_name)
-        out_tex = tex_dir / f"{int(td_hash) & 0xFFFFFFFF}_{safe}.png"
+        h = joaat(tex_name)
+        slug = _slugify_texture_name(tex_name)
+        if not slug:
+            slug = _safe_tex_name(tex_name).lower()  # last-ditch, stable token
+
+        # Historically some pipelines used hash+slug filenames. The viewer hot path prefers hash-only.
+        # We therefore:
+        # - write the slugged file (for debugging / human readability)
+        # - ensure the hash-only alias exists
+        # - return the hash-only relative path so manifests don't depend on slug presence
+        h_u32 = int(h) & 0xFFFFFFFF
+        out_slug = tex_dir / f"{h_u32}_{slug}.png"
+        out_hash = tex_dir / f"{h_u32}.png"
+
         wrote = False
-        if not out_tex.exists():
-            Image.fromarray(rgba, mode="RGBA").save(out_tex)
+        if not out_slug.exists():
+            Image.fromarray(img, mode="RGBA").save(out_slug)
             wrote = True
-        return f"models_textures/{int(td_hash) & 0xFFFFFFFF}_{safe}.png", wrote
+
+        # Ensure the hash-only alias exists (prefer hardlink to avoid duplicated disk usage).
+        if not out_hash.exists():
+            try:
+                import os
+                os.link(out_slug, out_hash)
+            except Exception:
+                try:
+                    shutil.copy2(out_slug, out_hash)
+                except Exception:
+                    # If we can't create the alias, still return the slug path as a fallback.
+                    return f"models_textures/{h_u32}_{slug}.png", wrote
+
+        return f"models_textures/{h_u32}.png", wrote
     except Exception:
         return None, False
 
@@ -1107,6 +1376,7 @@ def _update_existing_manifest_materials_for_drawable(
     td_hash: int | None,
     tex_dir: Path,
     *,
+    dll_manager: DllManager | None = None,
     export_ktx2: bool = False,
     ktx2_dir: Path | None = None,
     toktx_exe: str = "toktx",
@@ -1142,6 +1412,23 @@ def _update_existing_manifest_materials_for_drawable(
             mat = _ensure_submesh_material(entry, lod_key, si)
             if mat is None:
                 break
+
+            # Collect shader-referenced texture objects by (lowercased) name.
+            # This allows exporting textures that aren't present in the current YTD dict.
+            shader_tex_objs = {}
+            try:
+                for _hv, p in _shader_param_iter(shader) or []:
+                    try:
+                        if int(getattr(p, "DataType", 255)) != 0:
+                            continue
+                        tex_obj = getattr(p, "Data", None)
+                        nm = str(getattr(tex_obj, "Name", "")).strip() if tex_obj is not None else ""
+                        if nm:
+                            shader_tex_objs[nm.lower()] = tex_obj
+                    except Exception:
+                        continue
+            except Exception:
+                shader_tex_objs = {}
 
             # Coarse flags from shader name (alpha mode, double sided).
             try:
@@ -1201,67 +1488,110 @@ def _update_existing_manifest_materials_for_drawable(
                 mat["specMaskWeights"] = [float(v4[0]), float(v4[1]), float(v4[2])]
 
             # Diffuse
-            pick_d = _pick_diffuse_texture_name_from_shader(textures, shader)
+            pick_d, pick_d_hv = _pick_diffuse_texture_name_from_shader_with_hash(textures, shader)
             if pick_d:
-                rel_d, wrote_d = _export_texture_png(textures, pick_d, tex_dir, td_hash)
+                rel_d, wrote_d = _export_texture_png(
+                    textures,
+                    pick_d,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_d).lower()),
+                    dll_manager=dll_manager,
+                )
                 if wrote_d:
                     wrote += 1
                 if rel_d:
                     mat["diffuse"] = rel_d
                     mat["diffuseName"] = str(pick_d)
+                    if pick_d_hv is not None:
+                        mat["diffuseParamHash"] = int(pick_d_hv) & 0xFFFFFFFF
                     if export_ktx2 and ktx2_dir:
                         rel_k2 = _try_export_texture_ktx2_from_png(rel_d, tex_dir, ktx2_dir, toktx_exe=toktx_exe, srgb=True)
                         if rel_k2:
                             mat["diffuseKtx2"] = rel_k2
 
             # Diffuse2 (layer blend) - BasicPS uses Colourmap2 sampled on Texcoord1 and blended by its alpha.
-            pick_d2 = _pick_texture_name_from_shader(textures, shader, [_SP_DIFFUSE2], require_keywords=None)
+            pick_d2, pick_d2_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_DIFFUSE2], require_keywords=None)
             if not pick_d2:
                 pick_d2 = _pick_texture_by_keywords(textures, include_keywords=("diffuse2", "diffusetex2", "diffusetexture2", "_d2", "_2"))
             if pick_d2:
-                rel_d2, wrote_d2 = _export_texture_png(textures, pick_d2, tex_dir, td_hash)
+                rel_d2, wrote_d2 = _export_texture_png(
+                    textures,
+                    pick_d2,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_d2).lower()),
+                    dll_manager=dll_manager,
+                )
                 if wrote_d2:
                     wrote += 1
                 if rel_d2:
                     mat["diffuse2"] = rel_d2
                     mat["diffuse2Name"] = str(pick_d2)
                     mat["diffuse2Uv"] = "uv1"
+                    if pick_d2_hv is not None:
+                        mat["diffuse2ParamHash"] = int(pick_d2_hv) & 0xFFFFFFFF
                     if export_ktx2 and ktx2_dir:
                         rel_k2 = _try_export_texture_ktx2_from_png(rel_d2, tex_dir, ktx2_dir, toktx_exe=toktx_exe, srgb=True)
                         if rel_k2:
                             mat["diffuse2Ktx2"] = rel_k2
 
             # Normal
-            pick_n = _pick_texture_name_from_shader(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=("normal", "bump", "_n", "nrm", "nm_"))
+            pick_n, pick_n_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=("normal", "bump", "_n", "nrm", "nm_"))
             if not pick_n:
-                pick_n = _pick_texture_name_from_shader(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=None)
+                pick_n, pick_n_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=None)
             if not pick_n:
                 pick_n = _pick_texture_by_keywords(textures, include_keywords=("_n", "normal", "nrm", "nm_", "bump"))
+                pick_n_hv = None
             if pick_n:
-                rel_n, wrote_n = _export_texture_png(textures, pick_n, tex_dir, td_hash)
+                rel_n, wrote_n = _export_texture_png(
+                    textures,
+                    pick_n,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_n).lower()),
+                    dll_manager=dll_manager,
+                )
                 if wrote_n:
                     wrote += 1
                 if rel_n:
                     mat["normal"] = rel_n
                     mat["normalName"] = str(pick_n)
+                    if pick_n_hv is not None:
+                        mat["normalParamHash"] = int(pick_n_hv) & 0xFFFFFFFF
+                    # Emit normal decode flags from CodeWalker texture format (ground truth).
+                    fmt = _format_name_for_texture(textures, pick_n)
+                    if fmt:
+                        mat["normalFormat"] = str(fmt)
+                    mat.update(_normal_decode_flags_from_codewalker_format(pick_n, fmt))
                     if export_ktx2 and ktx2_dir:
                         rel_k2 = _try_export_texture_ktx2_from_png(rel_n, tex_dir, ktx2_dir, toktx_exe=toktx_exe, srgb=False)
                         if rel_k2:
                             mat["normalKtx2"] = rel_k2
 
             # Detail map (commonly a detail normal) + detailSettings
-            pick_det = _pick_texture_name_from_shader(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=("detail",))
+            pick_det, pick_det_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=("detail",))
             if not pick_det:
-                pick_det = _pick_texture_name_from_shader(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=None)
+                pick_det, pick_det_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=None)
             if not pick_det:
                 pick_det = _pick_texture_by_keywords(textures, include_keywords=("detail",))
+                pick_det_hv = None
             if pick_det:
-                rel_det, wrote_det = _export_texture_png(textures, pick_det, tex_dir, td_hash)
+                rel_det, wrote_det = _export_texture_png(
+                    textures,
+                    pick_det,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_det).lower()),
+                    dll_manager=dll_manager,
+                )
                 if wrote_det:
                     wrote += 1
                 if rel_det:
                     mat["detail"] = rel_det
                     mat["detailName"] = str(pick_det)
+                    if pick_det_hv is not None:
+                        mat["detailParamHash"] = int(pick_det_hv) & 0xFFFFFFFF
                     if export_ktx2 and ktx2_dir:
                         rel_k2 = _try_export_texture_ktx2_from_png(rel_det, tex_dir, ktx2_dir, toktx_exe=toktx_exe, srgb=False)
                         if rel_k2:
@@ -1272,18 +1602,28 @@ def _update_existing_manifest_materials_for_drawable(
                         mat["detailSettings"] = [float(ds[0]), float(ds[1]), float(ds[2]), float(ds[3])]
 
             # AO / occlusion (common across many GTA shaders)
-            pick_ao = _pick_texture_name_from_shader(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=("ao", "occl"))
+            pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=("ao", "occl"))
             if not pick_ao:
-                pick_ao = _pick_texture_name_from_shader(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=None)
+                pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=None)
             if not pick_ao:
                 pick_ao = _pick_texture_by_keywords(textures, include_keywords=("ao", "occl", "occ"))
+                pick_ao_hv = None
             if pick_ao:
-                rel_ao, wrote_ao = _export_texture_png(textures, pick_ao, tex_dir, td_hash)
+                rel_ao, wrote_ao = _export_texture_png(
+                    textures,
+                    pick_ao,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_ao).lower()),
+                    dll_manager=dll_manager,
+                )
                 if wrote_ao:
                     wrote += 1
                 if rel_ao:
                     mat["ao"] = rel_ao
                     mat["aoName"] = str(pick_ao)
+                    if pick_ao_hv is not None:
+                        mat["aoParamHash"] = int(pick_ao_hv) & 0xFFFFFFFF
                     if export_ktx2 and ktx2_dir:
                         rel_k2 = _try_export_texture_ktx2_from_png(rel_ao, tex_dir, ktx2_dir, toktx_exe=toktx_exe, srgb=False)
                         if rel_k2:
@@ -1292,18 +1632,28 @@ def _update_existing_manifest_materials_for_drawable(
                         mat["aoStrength"] = 1.0
 
             # Spec
-            pick_s = _pick_texture_name_from_shader(textures, shader, _SP_SPEC_PREFERRED, require_keywords=("spec", "srm"))
+            pick_s, pick_s_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_SPEC_PREFERRED, require_keywords=("spec", "srm"))
             if not pick_s:
-                pick_s = _pick_texture_name_from_shader(textures, shader, _SP_SPEC_PREFERRED, require_keywords=None)
+                pick_s, pick_s_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_SPEC_PREFERRED, require_keywords=None)
             if not pick_s:
                 pick_s = _pick_texture_by_keywords(textures, include_keywords=("spec", "srm"))
+                pick_s_hv = None
             if pick_s:
-                rel_s, wrote_s = _export_texture_png(textures, pick_s, tex_dir, td_hash)
+                rel_s, wrote_s = _export_texture_png(
+                    textures,
+                    pick_s,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_s).lower()),
+                    dll_manager=dll_manager,
+                )
                 if wrote_s:
                     wrote += 1
                 if rel_s:
                     mat["spec"] = rel_s
                     mat["specName"] = str(pick_s)
+                    if pick_s_hv is not None:
+                        mat["specParamHash"] = int(pick_s_hv) & 0xFFFFFFFF
                     if export_ktx2 and ktx2_dir:
                         rel_k2 = _try_export_texture_ktx2_from_png(rel_s, tex_dir, ktx2_dir, toktx_exe=toktx_exe, srgb=False)
                         if rel_k2:
@@ -1319,7 +1669,14 @@ def _update_existing_manifest_materials_for_drawable(
             if not pick_e:
                 pick_e = _pick_texture_by_keywords(textures, include_keywords=("emiss", "glow", "illum", "_em", "light"))
             if pick_e:
-                rel_e, wrote_e = _export_texture_png(textures, pick_e, tex_dir, td_hash)
+                rel_e, wrote_e = _export_texture_png(
+                    textures,
+                    pick_e,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_e).lower()),
+                    dll_manager=dll_manager,
+                )
                 if wrote_e:
                     wrote += 1
                 if rel_e:
@@ -1342,7 +1699,14 @@ def _update_existing_manifest_materials_for_drawable(
                         exclude_keywords=("normal", "spec", "srm", "ao", "occl"),
                     )
                     if pick_am:
-                        rel_am, wrote_am = _export_texture_png(textures, pick_am, tex_dir, td_hash)
+                        rel_am, wrote_am = _export_texture_png(
+                            textures,
+                            pick_am,
+                            tex_dir,
+                            td_hash=td_hash,
+                            shader_tex_obj=shader_tex_objs.get(str(pick_am).lower()),
+                            dll_manager=dll_manager,
+                        )
                         if wrote_am:
                             wrote += 1
                         if rel_am:
@@ -1517,7 +1881,15 @@ def main():
     ap.add_argument("--max-archetypes", type=int, default=0, help="Limit archetypes exported (0 = no limit)")
     ap.add_argument("--skip-existing", action="store_true", help="Skip archetypes already present in assets/models/manifest.json")
     ap.add_argument("--force", action="store_true", help="Force re-export mesh bins even if present in manifest (useful after exporter changes)")
-    ap.add_argument("--export-textures", action="store_true", help="Export one diffuse texture per archetype (slow)")
+    ap.add_argument(
+        "--export-textures",
+        action="store_true",
+        help=(
+            "Export model textures referenced by shaders into assets/models_textures/. "
+            "Writes both <hash>_<slug>.png (debug) and <hash>.png (runtime hot path), "
+            "and stores manifest paths as models_textures/<hash>.png."
+        ),
+    )
     ap.add_argument("--export-ktx2", action="store_true", help="Also write .ktx2 copies for exported textures (requires toktx; writes *Ktx2 fields in materials)")
     ap.add_argument("--toktx", default="toktx", help="Path to toktx executable (KTX-Software). Used when --export-ktx2 is set.")
     ap.add_argument("--write-report", action="store_true", help="Write a JSON report of export outcomes into assets/models")
@@ -1774,83 +2146,164 @@ def main():
 
                         # Textures per submesh.
                         if textures and isinstance(textures, dict) and td_hash:
+                            # Collect shader-referenced texture objects by (lowercased) name.
+                            # This allows exporting textures that aren't present in the current YTD dict
+                            # returned by get_ytd_textures(...).
+                            shader_tex_objs = {}
+                            try:
+                                for _hv, p in _shader_param_iter(shader) or []:
+                                    try:
+                                        if int(getattr(p, "DataType", 255)) != 0:
+                                            continue
+                                        tex_obj = getattr(p, "Data", None)
+                                        nm = str(getattr(tex_obj, "Name", "")).strip() if tex_obj is not None else ""
+                                        if nm:
+                                            shader_tex_objs[nm.lower()] = tex_obj
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                shader_tex_objs = {}
+
                             # Diffuse
-                            pick_d = _pick_diffuse_texture_name_from_shader(textures, shader)
-                            rel_d, wrote_d = _export_texture_png(textures, pick_d, tex_dir, td_hash) if pick_d else (None, False)
+                            pick_d, pick_d_hv = _pick_diffuse_texture_name_from_shader_with_hash(textures, shader)
+                            rel_d, wrote_d = _export_texture_png(
+                                textures,
+                                pick_d,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_d).lower()) if pick_d else None,
+                                dll_manager=dm,
+                            ) if pick_d else (None, False)
                             if wrote_d:
                                 textures_exported_now += 1
                             if rel_d:
                                 mat["diffuse"] = rel_d
                                 mat["diffuseName"] = str(pick_d)
+                                if pick_d_hv is not None:
+                                    mat["diffuseParamHash"] = int(pick_d_hv) & 0xFFFFFFFF
 
                             # Diffuse2
-                            pick_d2 = _pick_texture_name_from_shader(textures, shader, [_SP_DIFFUSE2], require_keywords=None)
+                            pick_d2, pick_d2_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_DIFFUSE2], require_keywords=None)
                             if not pick_d2:
                                 pick_d2 = _pick_texture_by_keywords(textures, include_keywords=("diffuse2", "diffusetex2", "diffusetexture2", "_d2", "_2"))
-                            rel_d2, wrote_d2 = _export_texture_png(textures, pick_d2, tex_dir, td_hash) if pick_d2 else (None, False)
+                                pick_d2_hv = None
+                            rel_d2, wrote_d2 = _export_texture_png(
+                                textures,
+                                pick_d2,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_d2).lower()) if pick_d2 else None,
+                                dll_manager=dm,
+                            ) if pick_d2 else (None, False)
                             if wrote_d2:
                                 textures_exported_now += 1
                             if rel_d2:
                                 mat["diffuse2"] = rel_d2
                                 mat["diffuse2Name"] = str(pick_d2)
                                 mat["diffuse2Uv"] = "uv1"
+                                if pick_d2_hv is not None:
+                                    mat["diffuse2ParamHash"] = int(pick_d2_hv) & 0xFFFFFFFF
 
                             # Normal
-                            pick_n = _pick_texture_name_from_shader(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=("normal", "bump", "_n", "nrm", "nm_"))
+                            pick_n, pick_n_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=("normal", "bump", "_n", "nrm", "nm_"))
                             if not pick_n:
-                                pick_n = _pick_texture_name_from_shader(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=None)
+                                pick_n, pick_n_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_NORMAL_PREFERRED, require_keywords=None)
                             if not pick_n:
                                 pick_n = _pick_texture_by_keywords(textures, include_keywords=("_n", "normal", "nrm", "nm_", "bump"))
-                            rel_n, wrote_n = _export_texture_png(textures, pick_n, tex_dir, td_hash) if pick_n else (None, False)
+                                pick_n_hv = None
+                            rel_n, wrote_n = _export_texture_png(
+                                textures,
+                                pick_n,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_n).lower()) if pick_n else None,
+                                dll_manager=dm,
+                            ) if pick_n else (None, False)
                             if wrote_n:
                                 textures_exported_now += 1
                             if rel_n:
                                 mat["normal"] = rel_n
                                 mat["normalName"] = str(pick_n)
+                                if pick_n_hv is not None:
+                                    mat["normalParamHash"] = int(pick_n_hv) & 0xFFFFFFFF
+                                fmt = _format_name_for_texture(textures, pick_n)
+                                if fmt:
+                                    mat["normalFormat"] = str(fmt)
+                                mat.update(_normal_decode_flags_from_codewalker_format(pick_n, fmt))
 
                             # Detail
-                            pick_det = _pick_texture_name_from_shader(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=("detail",))
+                            pick_det, pick_det_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=("detail",))
                             if not pick_det:
-                                pick_det = _pick_texture_name_from_shader(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=None)
+                                pick_det, pick_det_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_DETAIL_MAP_SAMPLER, _SP_DETAIL_SAMPLER], require_keywords=None)
                             if not pick_det:
                                 pick_det = _pick_texture_by_keywords(textures, include_keywords=("detail",))
-                            rel_det, wrote_det = _export_texture_png(textures, pick_det, tex_dir, td_hash) if pick_det else (None, False)
+                                pick_det_hv = None
+                            rel_det, wrote_det = _export_texture_png(
+                                textures,
+                                pick_det,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_det).lower()) if pick_det else None,
+                                dll_manager=dm,
+                            ) if pick_det else (None, False)
                             if wrote_det:
                                 textures_exported_now += 1
                             if rel_det:
                                 mat["detail"] = rel_det
                                 mat["detailName"] = str(pick_det)
+                                if pick_det_hv is not None:
+                                    mat["detailParamHash"] = int(pick_det_hv) & 0xFFFFFFFF
                                 ds = _extract_vec4_from_shader(shader, _SP_DETAIL_SETTINGS)
                                 if ds and len(ds) >= 4:
                                     mat["detailSettings"] = [float(ds[0]), float(ds[1]), float(ds[2]), float(ds[3])]
 
                             # AO / occlusion
-                            pick_ao = _pick_texture_name_from_shader(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=("ao", "occl"))
+                            pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=("ao", "occl"))
                             if not pick_ao:
-                                pick_ao = _pick_texture_name_from_shader(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=None)
+                                pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=None)
                             if not pick_ao:
                                 pick_ao = _pick_texture_by_keywords(textures, include_keywords=("ao", "occl", "occ"))
-                            rel_ao, wrote_ao = _export_texture_png(textures, pick_ao, tex_dir, td_hash) if pick_ao else (None, False)
+                                pick_ao_hv = None
+                            rel_ao, wrote_ao = _export_texture_png(
+                                textures,
+                                pick_ao,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_ao).lower()) if pick_ao else None,
+                                dll_manager=dm,
+                            ) if pick_ao else (None, False)
                             if wrote_ao:
                                 textures_exported_now += 1
                             if rel_ao:
                                 mat["ao"] = rel_ao
                                 mat["aoName"] = str(pick_ao)
+                                if pick_ao_hv is not None:
+                                    mat["aoParamHash"] = int(pick_ao_hv) & 0xFFFFFFFF
                                 if "aoStrength" not in mat:
                                     mat["aoStrength"] = 1.0
 
                             # Spec
-                            pick_s = _pick_texture_name_from_shader(textures, shader, _SP_SPEC_PREFERRED, require_keywords=("spec", "srm"))
+                            pick_s, pick_s_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_SPEC_PREFERRED, require_keywords=("spec", "srm"))
                             if not pick_s:
-                                pick_s = _pick_texture_name_from_shader(textures, shader, _SP_SPEC_PREFERRED, require_keywords=None)
+                                pick_s, pick_s_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_SPEC_PREFERRED, require_keywords=None)
                             if not pick_s:
                                 pick_s = _pick_texture_by_keywords(textures, include_keywords=("spec", "srm"))
-                            rel_s, wrote_s = _export_texture_png(textures, pick_s, tex_dir, td_hash) if pick_s else (None, False)
+                                pick_s_hv = None
+                            rel_s, wrote_s = _export_texture_png(
+                                textures,
+                                pick_s,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_s).lower()) if pick_s else None,
+                                dll_manager=dm,
+                            ) if pick_s else (None, False)
                             if wrote_s:
                                 textures_exported_now += 1
                             if rel_s:
                                 mat["spec"] = rel_s
                                 mat["specName"] = str(pick_s)
+                                if pick_s_hv is not None:
+                                    mat["specParamHash"] = int(pick_s_hv) & 0xFFFFFFFF
 
                             # Emissive
                             pick_e = _pick_texture_name_from_shader(
@@ -1861,7 +2314,14 @@ def main():
                             )
                             if not pick_e:
                                 pick_e = _pick_texture_by_keywords(textures, include_keywords=("emiss", "glow", "illum", "_em", "light"))
-                            rel_e, wrote_e = _export_texture_png(textures, pick_e, tex_dir, td_hash) if pick_e else (None, False)
+                            rel_e, wrote_e = _export_texture_png(
+                                textures,
+                                pick_e,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_e).lower()) if pick_e else None,
+                                dll_manager=dm,
+                            ) if pick_e else (None, False)
                             if wrote_e:
                                 textures_exported_now += 1
                             if rel_e:
@@ -1878,7 +2338,14 @@ def main():
                                         include_keywords=("alphamask", "alpha_mask", "opacity", "mask"),
                                         exclude_keywords=("normal", "spec", "srm", "ao", "occl"),
                                     )
-                                    rel_am, wrote_am = _export_texture_png(textures, pick_am, tex_dir, td_hash) if pick_am else (None, False)
+                                    rel_am, wrote_am = _export_texture_png(
+                                        textures,
+                                        pick_am,
+                                        tex_dir,
+                                        td_hash=td_hash,
+                                        shader_tex_obj=shader_tex_objs.get(str(pick_am).lower()) if pick_am else None,
+                                        dll_manager=dm,
+                                    ) if pick_am else (None, False)
                                     if wrote_am:
                                         textures_exported_now += 1
                                     if rel_am:

@@ -21,10 +21,10 @@ vec3 mulvq(vec3 v, vec4 q) {
 // Unpack color from uint
 vec4 UnpackColor(uint color) {
     return vec4(
-        float((color >> 24) & 0xFF) / 255.0,
-        float((color >> 16) & 0xFF) / 255.0,
-        float((color >> 8) & 0xFF) / 255.0,
-        float(color & 0xFF) / 255.0
+        float((color >> 24) & 0xFFu) / 255.0,
+        float((color >> 16) & 0xFFu) / 255.0,
+        float((color >> 8) & 0xFFu) / 255.0,
+        float(color & 0xFFu) / 255.0
     );
 }
 

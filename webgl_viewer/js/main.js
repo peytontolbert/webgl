@@ -11,8 +11,10 @@ import { DrawableStreamer } from './drawable_streamer.js';
 import { TextureStreamer } from './texture_streamer.js';
 import { SkyRenderer } from './sky_renderer.js';
 import { joaat } from './joaat.js';
-import { clearAssetCacheStorage, fetchJSON, setAssetFetchConcurrency, supportsAssetCacheStorage } from './asset_fetcher.js';
+import { clearAssetCacheStorage, clearAssetMemoryCaches, fetchJSON, setAssetFetchConcurrency, supportsAssetCacheStorage } from './asset_fetcher.js';
 import { OcclusionCuller } from './occlusion.js';
+import { FileBlobReader } from './vfs/readers.js';
+import { RpfArchive } from './rpf/rpf_archive.js';
 
 const _LS_SETTINGS_KEY = 'webglgta.viewer.settings.v1';
 const _LS_VIEW_KEY = 'webglgta.viewer.view.v1';
@@ -199,6 +201,10 @@ export class App {
         // Viewer controls
         /** @type {null|'high'|'med'|'low'} */
         this.forcedModelLod = null;
+
+        // RPF (experimental)
+        this._rpfArchive = null;
+        this._rpfStatusEl = null;
 
         // Cached transforms for viewer<->data conversions
         this._dataToViewMatrix = null;
@@ -1528,7 +1534,42 @@ export class App {
         const keyState = {};
         
         window.addEventListener('keydown', (e) => {
-            keyState[e.key.toLowerCase()] = true;
+            const k = String(e.key || '').toLowerCase();
+            // One-shot debug toggles (don't spam while held).
+            if (!e.repeat) {
+                if (k === 'i') {
+                    if (this.drawableStreamer) {
+                        this.drawableStreamer.enableInteriors = !this.drawableStreamer.enableInteriors;
+                        this.drawableStreamer._dirty = true;
+                        console.log(`Interiors enabled: ${this.drawableStreamer.enableInteriors}`);
+                    }
+                    return;
+                }
+                if (k === 'u') {
+                    if (this.drawableStreamer) {
+                        this.drawableStreamer.enableRoomGating = !this.drawableStreamer.enableRoomGating;
+                        this.drawableStreamer._dirty = true;
+                        console.log(`Interior room gating enabled: ${this.drawableStreamer.enableRoomGating}`);
+                    }
+                    return;
+                }
+                if (k === 'o') {
+                    if (this.drawableStreamer) {
+                        this.drawableStreamer.enableMloEntitySets = !this.drawableStreamer.enableMloEntitySets;
+                        this.drawableStreamer._dirty = true;
+                        console.log(`MLO entity sets enabled: ${this.drawableStreamer.enableMloEntitySets}`);
+                    }
+                    return;
+                }
+                if (k === 'p') {
+                    if (this.drawableStreamer?.clearMloEntitySetOverrides) {
+                        this.drawableStreamer.clearMloEntitySetOverrides();
+                        console.log('Cleared MLO entity set overrides');
+                    }
+                    return;
+                }
+            }
+            keyState[k] = true;
         });
         
         window.addEventListener('keyup', (e) => {
@@ -1632,9 +1673,81 @@ export class App {
         this._bootStatusEl = document.getElementById('bootStatus');
         this._liveCoordsEl = document.getElementById('liveCoords');
         this._perfHudEl = document.getElementById('perfHud');
+        this._rpfStatusEl = document.getElementById('rpfStatus');
         if (this._streamDebugEl) {
             // Allow multi-line status in the debug HUD.
             this._streamDebugEl.style.whiteSpace = 'pre-line';
+        }
+
+        // RPF explorer (experimental)
+        const rpfInput = document.getElementById('rpfFileInput');
+        const mountBtn = document.getElementById('mountRpfBtn');
+        const extractBtn = document.getElementById('rpfExtractBtn');
+        const extractPathEl = document.getElementById('rpfExtractPath');
+        const setRpfStatus = (msg) => {
+            if (!this._rpfStatusEl) return;
+            this._rpfStatusEl.textContent = String(msg || '');
+        };
+        if (mountBtn && rpfInput) {
+            mountBtn.addEventListener('click', () => {
+                try { rpfInput.click(); } catch { /* ignore */ }
+            });
+            rpfInput.addEventListener('change', async () => {
+                const file = rpfInput.files && rpfInput.files[0] ? rpfInput.files[0] : null;
+                if (!file) return;
+                setRpfStatus(`Mounting ${file.name} (${Math.round((file.size || 0) / (1024 * 1024))} MB)…`);
+                try {
+                    const reader = new FileBlobReader(file);
+                    const arc = new RpfArchive(reader, { name: file.name, basePath: file.name });
+                    await arc.init();
+                    this._rpfArchive = arc;
+                    const enc = arc.encryption >>> 0;
+                    const encLabel = (enc === 0) ? 'NONE' : (enc === 0x4E45504F ? 'OPEN' : `0x${enc.toString(16)}`);
+                    setRpfStatus(
+                        `Mounted: ${file.name}\n` +
+                        `- entries: ${arc.entryCount}\n` +
+                        `- toc encryption: ${encLabel}\n` +
+                        `Tip: try extracting "common\\data\\..." or "x64a.rpf\\common\\data\\..."`
+                    );
+                } catch (e) {
+                    this._rpfArchive = null;
+                    setRpfStatus(`Failed to mount:\n${e?.stack || e?.message || String(e)}`);
+                }
+            });
+        }
+        if (extractBtn) {
+            extractBtn.addEventListener('click', async () => {
+                const arc = this._rpfArchive;
+                if (!arc) {
+                    setRpfStatus('No RPF mounted yet.');
+                    return;
+                }
+                const p = String(extractPathEl?.value || '').trim();
+                if (!p) {
+                    setRpfStatus('Enter a path to extract (example: common\\data\\levels\\gta5\\...)');
+                    return;
+                }
+                try {
+                    setRpfStatus(`Extracting:\n${p}`);
+                    const u8 = await arc.extract(p, { decompress: true });
+                    const nameGuess = (() => {
+                        const s = p.replace(/\\/g, '/');
+                        const parts = s.split('/');
+                        return parts[parts.length - 1] || 'file.bin';
+                    })();
+                    const blob = new Blob([u8], { type: 'application/octet-stream' });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = nameGuess;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch { /* ignore */ } }, 5000);
+                    setRpfStatus(`Extracted ${u8.byteLength} bytes → download started`);
+                } catch (e) {
+                    setRpfStatus(`Extract failed:\n${e?.stack || e?.message || String(e)}`);
+                }
+            });
         }
 
         const copyBtn = document.getElementById('copyLiveCoords');
@@ -1808,6 +1921,7 @@ export class App {
             const ml = Number(document.getElementById('maxMeshLoadsInFlight')?.value ?? (this.instancedModelRenderer?.maxMeshLoadsInFlight ?? 6));
             const fc = !!document.getElementById('frustumCulling')?.checked;
             const cross = !!document.getElementById('crossArchetypeInstancing')?.checked;
+            const entLod = !!document.getElementById('entityLodTraversal')?.checked;
             const radius = Number.isFinite(r) ? Math.max(1, Math.min(24, Math.floor(r))) : 2;
             const maxLoaded = Number.isFinite(m) ? Math.max(9, Math.min(4000, Math.floor(m))) : 25;
             // 0 means "no cap" (distance cutoff still applies).
@@ -1833,6 +1947,14 @@ export class App {
                 this.drawableStreamer.maxArchetypes = maxArch;
                 this.drawableStreamer.maxModelDistance = maxDist;
                 this.drawableStreamer.enableCrossArchetypeInstancing = cross;
+                // Entity-level LOD traversal: selects parent-vs-children leaves like CodeWalker.
+                // This changes chunk parsing + instance selection, so treat as a streaming-mode change.
+                if (typeof this.drawableStreamer.setEntityLodTraversalEnabled === 'function') {
+                    this.drawableStreamer.setEntityLodTraversalEnabled(entLod);
+                } else {
+                    this.drawableStreamer.enableEntityLodTraversal = entLod;
+                    this.drawableStreamer._dirty = true;
+                }
                 // Important: changing caps doesn't automatically rebuild unless chunk-set changes.
                 // Force a rebuild so the new limits take effect immediately.
                 this.drawableStreamer._dirty = true;
@@ -1861,6 +1983,8 @@ export class App {
         if (fcInput) fcInput.addEventListener('change', applyStreaming);
         const crossInput = document.getElementById('crossArchetypeInstancing');
         if (crossInput) crossInput.addEventListener('change', applyStreaming);
+        const entLodInput = document.getElementById('entityLodTraversal');
+        if (entLodInput) entLodInput.addEventListener('change', applyStreaming);
         this._applyStreamingFromUI = applyStreaming;
 
         const occ = document.getElementById('enableOcclusionCulling');
@@ -1927,6 +2051,8 @@ export class App {
         const clearCacheBtn = document.getElementById('clearAssetCache');
         if (clearCacheBtn) {
             clearCacheBtn.addEventListener('click', async () => {
+                // Clear in-memory caches immediately (these survive until reload otherwise).
+                try { clearAssetMemoryCaches(); } catch { /* ignore */ }
                 const ok = await clearAssetCacheStorage();
                 try {
                     clearCacheBtn.textContent = ok ? 'Cache cleared' : 'Cache not available';
@@ -1934,6 +2060,10 @@ export class App {
                 } catch {
                     // ignore
                 }
+                // Best-effort: force a reload so stale module/asset caches don't linger.
+                // (The "Clear cache" button is about runtime assets + viewer state; the browser HTTP cache
+                // for JS modules is outside CacheStorage. Reloading is the most reliable UX.)
+                try { window.location.reload(); } catch { /* ignore */ }
             });
         }
 
@@ -2307,13 +2437,31 @@ export class App {
             const t01 = (this.timeOfDayHours % 24.0) / 24.0;
             const ang = (t01 * Math.PI * 2.0) - (Math.PI * 0.5); // noon-ish up
             const sunDir = [Math.cos(ang) * 0.35, Math.sin(ang) * 0.95, 0.20];
-            const sunI = Math.max(0.05, Math.sin(ang) * 1.1);
+            const sunUp = Math.sin(ang); // -1..1
+            const day01 = Math.max(0.0, Math.min(1.0, (sunUp * 0.55) + 0.45)); // clamp
+            const sunI = Math.max(0.03, day01 * 1.15);
+
+            // Simple timecycle-ish sky colors (blend between a night palette and the configured day palette).
+            const nightTop = [0.02, 0.03, 0.06];
+            const nightBottom = [0.01, 0.02, 0.03];
+            const lerp3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+            const topColor = lerp3(nightTop, this.skyTopColor, day01);
+            const bottomColor = lerp3(nightBottom, this.skyBottomColor, day01);
+
+            // Moon is opposite the sun in this simple model.
+            const moonDir = [-sunDir[0], -sunDir[1], -sunDir[2]];
+            const moonI = Math.max(0.0, (1.0 - day01) * 0.35);
+            const starI = Math.max(0.0, (1.0 - day01) * 0.85);
             this.skyRenderer.render({
-                topColor: this.skyTopColor,
-                bottomColor: this.skyBottomColor,
+                topColor,
+                bottomColor,
                 sunDir,
                 sunColor: [1.0, 0.97, 0.88],
                 sunIntensity: sunI,
+                moonDir,
+                moonColor: [0.70, 0.78, 0.90],
+                moonIntensity: moonI,
+                starIntensity: starI,
             });
         }
         
@@ -2389,6 +2537,18 @@ export class App {
                         }
                     },
                 });
+
+                // If the GPU/browser rejects depth readPixels, auto-disable occlusion culling so users
+                // don't think rendering/streaming is "stuck" (occlusion is optional).
+                try {
+                    const s = this.occlusionCuller.getStats?.();
+                    if (s && s.readbackSupported === false) {
+                        this.enableOcclusionCulling = false;
+                        const occEl = document.getElementById('enableOcclusionCulling');
+                        if (occEl) occEl.checked = false;
+                        console.warn('OcclusionCuller: disabling occlusion culling (depth readback unsupported on this GPU/browser).');
+                    }
+                } catch { /* ignore */ }
             } else if (this.occlusionCuller) {
                 this.occlusionCuller.enabled = false;
             }

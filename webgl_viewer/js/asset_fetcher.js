@@ -198,6 +198,19 @@ export async function clearAssetCacheStorage() {
   }
 }
 
+export function clearAssetMemoryCaches() {
+  try {
+    _memJson.clear();
+  } catch {
+    // ignore
+  }
+  try {
+    _inflight.clear();
+  } catch {
+    // ignore
+  }
+}
+
 export async function fetchJSON(url, { usePersistentCache = true, useMemoryCache = true, priority = 'high' } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchJSON: empty url');

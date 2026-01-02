@@ -74,4 +74,21 @@ So the best parity we can reach right now is:
 - “Where is the collision surface below me?” (via bake or runtime raycast)
 - Not “simulate a GTA ped walking with physics.”
 
+---
+
+## Additional “ground-adjacent” datasets in CodeWalker (not in `Space.RayIntersect`)
+
+### Water surface (waterheight.dat + water.xml)
+
+CodeWalker has a separate water system:
+- `World/Water.cs` loads `water.xml` quads (rects with a `z` height)
+- `World/Watermaps.cs` loads `common.rpf\\data\\levels\\gta5\\waterheight.dat` (`WatermapFile`) which contains a grid of water heights (lakes/rivers/pools)
+
+`Space.RayIntersect` does **not** intersect water, so “GTA-like ground” should be treated as:
+- collision surface from YBN (and optionally HD entities), plus
+- water surface if you care about swimming/boats/spawn filtering
+
+This repo adds a water export helper:
+- `webgl/bake_water_heightmap.py` → `webgl/output/water_heightmap.png` + `water_mask.png`
+
 

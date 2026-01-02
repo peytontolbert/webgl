@@ -4,6 +4,12 @@ import { TextureManager } from './texture_manager.js';
 import { TerrainMesh } from './terrain_mesh.js';
 import { fetchBlob, fetchJSON } from './asset_fetcher.js';
 
+// Deferred terrain shaders (bundled by Vite as raw strings to avoid runtime fetch/404->HTML fallback).
+import deferredTerrainVS from './shaders/terrain.vert?raw';
+import deferredTerrainFS from './shaders/terrain.frag?raw';
+import deferredCommonGLSL from './shaders/common.glsl?raw';
+import deferredShadowGLSL from './shaders/shadowmap.glsl?raw';
+
 // Vertex shader
 const vsSource = `#version 300 es
     in vec3 aPosition;
@@ -193,6 +199,9 @@ export class TerrainRenderer {
     constructor(gl) {
         this.gl = gl;
         this.program = new ShaderProgram(gl);
+        this.gbufferProgram = new ShaderProgram(gl);
+        this.compositeProgram = new ShaderProgram(gl);
+        this.shadowProgram = new ShaderProgram(gl);
         this.textureManager = new TextureManager(gl);
         this.mesh = null;
         this.heightmap = null;
@@ -210,6 +219,37 @@ export class TerrainRenderer {
         this.modelMatrix = glMatrix.mat4.create();
         this.normalMatrix = glMatrix.mat3.create();
         this.uniforms = null;
+
+        // Deferred / CodeWalker-like shader path (js/shaders/*). Best-effort: falls back to forward shaders.
+        this.useDeferredTerrain = true;
+        this._deferredReady = false;
+        this._deferredUniforms = null;
+        this._compositeUniforms = null;
+        this._fsVao = null;
+        this._gbuffer = { fbo: null, depth: null, w: 0, h: 0, texDiffuse: null, texNormal: null, texSpec: null, texIrr: null };
+
+        // Shadow map resources (directional, single map for now).
+        this.enableDeferredShadows = true;
+        this._shadow = {
+            size: 2048,
+            fbo: null,
+            depthTex: null,
+            lightView: glMatrix.mat4.create(),
+            lightProj: glMatrix.mat4.create(),
+            // cached bounds in light-space for debugging
+            _last: null,
+            uniforms: null,
+        };
+        this._ubos = {
+            scene: null,
+            shadow: null,
+            entity: null,
+            model: null,
+            geom: null,
+        };
+        // Dummy textures for required samplers (shadow map / tint palette etc.)
+        this._dummyBlack = null;
+        this._dummyWhite = null;
         
         // Initialize textures with proper organization
         this.textures = {
@@ -451,9 +491,188 @@ export class TerrainRenderer {
                 uHasSandNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasSandNormalMap'),
                 uHasSnowNormalMap: this.gl.getUniformLocation(this.program.program, 'uHasSnowNormalMap')
             };
+
+            // Try to init the CodeWalker-like shader path (js/shaders/*) after forward shaders are available.
+            // If anything fails, we keep the forward path.
+            try {
+                await this._initDeferredShaders();
+            } catch (e) {
+                console.warn('Deferred terrain shader path unavailable; using forward terrain shaders.', e);
+                this._deferredReady = false;
+            }
         } catch (error) {
             console.error('Failed to initialize shader program:', error);
         }
+    }
+
+    _ensureDummyTextures() {
+        if (!this._dummyBlack) this._dummyBlack = this._createSolidTextureRGBA([0, 0, 0, 255]);
+        if (!this._dummyWhite) this._dummyWhite = this._createSolidTextureRGBA([255, 255, 255, 255]);
+    }
+
+    async _initDeferredShaders() {
+        const gl = this.gl;
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+        if (!isWebGL2) return;
+        if (!this.useDeferredTerrain) return;
+
+        const vsRaw = String(deferredTerrainVS ?? '');
+        const fsRaw = String(deferredTerrainFS ?? '');
+        const common = String(deferredCommonGLSL ?? '');
+        const shadowmap = String(deferredShadowGLSL ?? '');
+
+        const includeMap = {
+            'common.glsl': common,
+            'shadowmap.glsl': shadowmap,
+        };
+        const includeLoader = (name) => includeMap[String(name || '').trim()] ?? null;
+
+        const vs = await ShaderProgram.preprocessIncludes(vsRaw, includeLoader);
+        const fs = await ShaderProgram.preprocessIncludes(fsRaw, includeLoader);
+
+        const ok = await this.gbufferProgram.createProgram(vs, fs);
+        if (!ok) throw new Error('gbufferProgram.createProgram failed');
+
+        // Bind uniform blocks to fixed binding points (like constant buffer slots).
+        const prog = this.gbufferProgram.program;
+        const bindBlock = (blockName, bindingPoint) => {
+            const idx = gl.getUniformBlockIndex(prog, blockName);
+            if (idx === gl.INVALID_INDEX || idx === 0xFFFFFFFF) return false;
+            gl.uniformBlockBinding(prog, idx, bindingPoint);
+            return true;
+        };
+        bindBlock('SceneVars', 0);
+        bindBlock('ShadowmapVars', 1);
+        bindBlock('EntityVars', 2);
+        bindBlock('ModelVars', 3);
+        bindBlock('GeomVars', 4);
+
+        // Allocate UBOs (std140). Sizes are fixed from the shader layouts.
+        const makeUbo = (byteSize, bindingPoint) => {
+            const b = gl.createBuffer();
+            gl.bindBuffer(gl.UNIFORM_BUFFER, b);
+            gl.bufferData(gl.UNIFORM_BUFFER, byteSize, gl.DYNAMIC_DRAW);
+            gl.bindBufferBase(gl.UNIFORM_BUFFER, bindingPoint, b);
+            return b;
+        };
+        this._ubos.scene = makeUbo(224, 0);   // SceneVars
+        this._ubos.shadow = makeUbo(256, 1);  // ShadowmapVars (std140 padded)
+        this._ubos.entity = makeUbo(80, 2);   // EntityVars
+        this._ubos.model = makeUbo(64, 3);    // ModelVars
+        this._ubos.geom = makeUbo(16, 4);     // GeomVars
+
+        // Cache uniform locations for samplers/flags.
+        const U = (n) => gl.getUniformLocation(prog, n);
+        this._deferredUniforms = {
+            uHeightmap: U('uHeightmap'),
+            uHasHeightmap: U('uHasHeightmap'),
+            uTintPalette: U('uTintPalette'),
+            uShadowMap: U('uShadowMap'),
+
+            uColorMap0: U('uColorMap0'),
+            uColorMap1: U('uColorMap1'),
+            uColorMap2: U('uColorMap2'),
+            uColorMap3: U('uColorMap3'),
+            uColorMap4: U('uColorMap4'),
+            uBlendMask: U('uBlendMask'),
+            uNormalMap0: U('uNormalMap0'),
+            uNormalMap1: U('uNormalMap1'),
+            uNormalMap2: U('uNormalMap2'),
+            uNormalMap3: U('uNormalMap3'),
+            uNormalMap4: U('uNormalMap4'),
+
+            uEnableTexture0: U('uEnableTexture0'),
+            uEnableTexture1: U('uEnableTexture1'),
+            uEnableTexture2: U('uEnableTexture2'),
+            uEnableTexture3: U('uEnableTexture3'),
+            uEnableTexture4: U('uEnableTexture4'),
+            uEnableTextureMask: U('uEnableTextureMask'),
+            uEnableNormalMap: U('uEnableNormalMap'),
+            uEnableVertexColour: U('uEnableVertexColour'),
+
+            uSpecularIntensity: U('uSpecularIntensity'),
+            uSpecularPower: U('uSpecularPower'),
+        };
+
+        // Composite program (fullscreen triangle). Diffuse * irradiance.
+        const compVs = `#version 300 es
+out vec2 vUv;
+void main() {
+    vec2 p;
+    if (gl_VertexID == 0) p = vec2(-1.0, -1.0);
+    else if (gl_VertexID == 1) p = vec2(3.0, -1.0);
+    else p = vec2(-1.0, 3.0);
+    vUv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}`;
+        const compFs = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uDiffuseTex;
+uniform sampler2D uIrradianceTex;
+out vec4 fragColor;
+void main() {
+    vec4 d = texture(uDiffuseTex, vUv);
+    vec4 irr = texture(uIrradianceTex, vUv);
+    fragColor = vec4(d.rgb * irr.rgb, d.a);
+}`;
+        const ok2 = await this.compositeProgram.createProgram(compVs, compFs);
+        if (!ok2) throw new Error('compositeProgram.createProgram failed');
+        this._compositeUniforms = {
+            uDiffuseTex: gl.getUniformLocation(this.compositeProgram.program, 'uDiffuseTex'),
+            uIrradianceTex: gl.getUniformLocation(this.compositeProgram.program, 'uIrradianceTex'),
+        };
+
+        // Shadow depth program (renders terrain depth into a depth texture from light POV).
+        // This is intentionally small/specialized; future parity work can generalize this into a shared shadow pass.
+        const shVs = `#version 300 es
+precision highp float;
+in vec3 aPosition;
+
+uniform mat4 uModelMatrix;
+uniform mat4 uLightViewMatrix;
+uniform mat4 uLightProjMatrix;
+uniform vec3 uTerrainBounds;
+uniform vec3 uTerrainSize;
+uniform sampler2D uHeightmap;
+uniform bool uHasHeightmap;
+
+void main() {
+    vec3 worldPos;
+    if (uHasHeightmap) {
+        vec2 gridPos = aPosition.xy;
+        worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
+        worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
+        vec2 heightmapCoord = vec2(gridPos.x, 1.0 - gridPos.y);
+        float height = texture(uHeightmap, heightmapCoord).r;
+        worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
+    } else {
+        worldPos = aPosition;
+    }
+    vec4 p = uModelMatrix * vec4(worldPos, 1.0);
+    gl_Position = uLightProjMatrix * uLightViewMatrix * p;
+}`;
+        const shFs = `#version 300 es
+precision highp float;
+void main() { }
+`;
+        const ok3 = await this.shadowProgram.createProgram(shVs, shFs);
+        if (!ok3) throw new Error('shadowProgram.createProgram failed');
+        this._shadow.uniforms = {
+            uModelMatrix: gl.getUniformLocation(this.shadowProgram.program, 'uModelMatrix'),
+            uLightViewMatrix: gl.getUniformLocation(this.shadowProgram.program, 'uLightViewMatrix'),
+            uLightProjMatrix: gl.getUniformLocation(this.shadowProgram.program, 'uLightProjMatrix'),
+            uTerrainBounds: gl.getUniformLocation(this.shadowProgram.program, 'uTerrainBounds'),
+            uTerrainSize: gl.getUniformLocation(this.shadowProgram.program, 'uTerrainSize'),
+            uHeightmap: gl.getUniformLocation(this.shadowProgram.program, 'uHeightmap'),
+            uHasHeightmap: gl.getUniformLocation(this.shadowProgram.program, 'uHasHeightmap'),
+        };
+
+        // WebGL2 requires a VAO bound for drawArrays in core profile.
+        this._fsVao = gl.createVertexArray();
+
+        this._ensureDummyTextures();
+        this._deferredReady = true;
     }
     
     async loadTerrainMesh() {
@@ -564,7 +783,7 @@ export class TerrainRenderer {
             this.sceneBoundsView = { min: vmin, max: vmax };
             
             // Create mesh from heightmap data
-            this.mesh = new TerrainMesh(this.gl, this.program);
+            this.mesh = new TerrainMesh(this.gl);
             this.mesh.createFromHeightmap(
                 this.meshGrid[0],
                 this.meshGrid[1],
@@ -804,7 +1023,15 @@ export class TerrainRenderer {
     }
     
     render(viewProjectionMatrix, cameraPos = [0, 0, 0], fog = { enabled: false, color: [0.6, 0.7, 0.8], start: 1500, end: 9000 }) {
-        if (!this.mesh || !this.uniforms) return;
+        if (!this.mesh) return;
+
+        // Prefer deferred shader path when available (WebGL2 only); fall back to forward shader path.
+        if (this._deferredReady) {
+            this._renderDeferred(viewProjectionMatrix);
+            return;
+        }
+
+        if (!this.uniforms) return;
         
         this.program.use();
 
@@ -907,8 +1134,437 @@ export class TerrainRenderer {
         // This helps when using a coarse heightmap under detailed city meshes.
         gl.enable(gl.POLYGON_OFFSET_FILL);
         gl.polygonOffset(1.0, 1.0);
-        this.mesh.render();
+        this.mesh.render(this.program);
         gl.disable(gl.POLYGON_OFFSET_FILL);
+    }
+
+    _ensureGBuffer(w, h) {
+        const gl = this.gl;
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+        if (!isWebGL2) return false;
+        if (this._gbuffer.fbo && this._gbuffer.w === w && this._gbuffer.h === h) return true;
+
+        // Dispose old
+        const delTex = (t) => { try { if (t) gl.deleteTexture(t); } catch { /* ignore */ } };
+        delTex(this._gbuffer.texDiffuse);
+        delTex(this._gbuffer.texNormal);
+        delTex(this._gbuffer.texSpec);
+        delTex(this._gbuffer.texIrr);
+        if (this._gbuffer.depth) { try { gl.deleteRenderbuffer(this._gbuffer.depth); } catch { /* ignore */ } }
+        if (this._gbuffer.fbo) { try { gl.deleteFramebuffer(this._gbuffer.fbo); } catch { /* ignore */ } }
+
+        const makeColorTex = () => {
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            return t;
+        };
+
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+
+        const texDiffuse = makeColorTex();
+        const texNormal = makeColorTex();
+        const texSpec = makeColorTex();
+        const texIrr = makeColorTex();
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texDiffuse, 0);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, texNormal, 0);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, texSpec, 0);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT3, gl.TEXTURE_2D, texIrr, 0);
+
+        const depth = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+
+        gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3]);
+
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+            console.warn('G-buffer framebuffer incomplete:', status);
+            try { gl.deleteFramebuffer(fbo); } catch { /* ignore */ }
+            return false;
+        }
+
+        this._gbuffer = { fbo, depth, w, h, texDiffuse, texNormal, texSpec, texIrr };
+        return true;
+    }
+
+    _ensureShadowMap(size) {
+        const gl = this.gl;
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+        if (!isWebGL2) return false;
+        const s = (size | 0) || 2048;
+        if (this._shadow.fbo && this._shadow.depthTex && this._shadow.size === s) return true;
+
+        try {
+            if (this._shadow.depthTex) gl.deleteTexture(this._shadow.depthTex);
+        } catch { /* ignore */ }
+        try {
+            if (this._shadow.fbo) gl.deleteFramebuffer(this._shadow.fbo);
+        } catch { /* ignore */ }
+
+        const depthTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, depthTex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        // Depth texture (WebGL2 core).
+        // Use DEPTH_COMPONENT16 for broad WebGL2 compatibility.
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT16, s, s, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_SHORT, null);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthTex, 0);
+        gl.drawBuffers([gl.NONE]);
+        gl.readBuffer(gl.NONE);
+
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+            console.warn('Shadow framebuffer incomplete:', status);
+            try { gl.deleteFramebuffer(fbo); } catch { /* ignore */ }
+            try { gl.deleteTexture(depthTex); } catch { /* ignore */ }
+            return false;
+        }
+
+        this._shadow.fbo = fbo;
+        this._shadow.depthTex = depthTex;
+        this._shadow.size = s;
+        return true;
+    }
+
+    _computeDirectionalLightMatrices(lightDir) {
+        // Build a tight ortho around the terrain AABB in *model space* (whatever modelMatrix encodes),
+        // so the shadow map aligns with the same coordinate space used in the deferred shaders.
+        const gl = this.gl;
+        void gl; // keep linter quiet if gl isn't used in some environments
+
+        const ld = glMatrix.vec3.create();
+        glMatrix.vec3.set(ld, lightDir?.[0] ?? 0.5, lightDir?.[1] ?? 0.8, lightDir?.[2] ?? 0.3);
+        glMatrix.vec3.normalize(ld, ld);
+
+        const b = this.terrainBounds || [0, 0, 0];
+        const s = this.terrainSize || [0, 0, 0];
+        const minW = [b[0], b[1], b[2]];
+        const maxW = [b[0] + s[0], b[1] + s[1], b[2] + s[2]];
+
+        // 8 corners (world coords), then transform by modelMatrix into shader space.
+        const corners = [
+            [minW[0], minW[1], minW[2]], [maxW[0], minW[1], minW[2]],
+            [minW[0], maxW[1], minW[2]], [maxW[0], maxW[1], minW[2]],
+            [minW[0], minW[1], maxW[2]], [maxW[0], minW[1], maxW[2]],
+            [minW[0], maxW[1], maxW[2]], [maxW[0], maxW[1], maxW[2]],
+        ];
+        const tmp4 = glMatrix.vec4.create();
+        const pts = corners.map((c) => {
+            glMatrix.vec4.set(tmp4, c[0], c[1], c[2], 1.0);
+            glMatrix.vec4.transformMat4(tmp4, tmp4, this.modelMatrix);
+            return [tmp4[0], tmp4[1], tmp4[2]];
+        });
+
+        // Center in shader/model space.
+        const center = [0, 0, 0];
+        for (const p of pts) { center[0] += p[0]; center[1] += p[1]; center[2] += p[2]; }
+        center[0] /= pts.length; center[1] /= pts.length; center[2] /= pts.length;
+
+        // Choose a stable up vector.
+        const up = [0, 0, 1];
+        const dotUp = Math.abs(ld[0] * up[0] + ld[1] * up[1] + ld[2] * up[2]);
+        const up2 = (dotUp > 0.98) ? [0, 1, 0] : up;
+
+        // Place eye back along light dir far enough to see the whole AABB.
+        let radius = 1.0;
+        for (const p of pts) {
+            const dx = p[0] - center[0], dy = p[1] - center[1], dz = p[2] - center[2];
+            radius = Math.max(radius, Math.sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        const dist = radius * 2.0 + 10.0;
+        const eye = [center[0] - ld[0] * dist, center[1] - ld[1] * dist, center[2] - ld[2] * dist];
+
+        glMatrix.mat4.lookAt(this._shadow.lightView, eye, center, up2);
+
+        // Fit ortho bounds in light-view space.
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+        const v4 = glMatrix.vec4.create();
+        for (const p of pts) {
+            glMatrix.vec4.set(v4, p[0], p[1], p[2], 1.0);
+            glMatrix.vec4.transformMat4(v4, v4, this._shadow.lightView);
+            minX = Math.min(minX, v4[0]); maxX = Math.max(maxX, v4[0]);
+            minY = Math.min(minY, v4[1]); maxY = Math.max(maxY, v4[1]);
+            minZ = Math.min(minZ, v4[2]); maxZ = Math.max(maxZ, v4[2]);
+        }
+
+        // Convert view-space z range (likely negative) into ortho near/far distances.
+        const pad = radius * 0.05 + 5.0;
+        const near = Math.max(0.1, -maxZ - pad);
+        const far = Math.max(near + 1.0, -minZ + pad);
+        glMatrix.mat4.ortho(this._shadow.lightProj, minX - pad, maxX + pad, minY - pad, maxY + pad, near, far);
+
+        this._shadow._last = { minX, maxX, minY, maxY, minZ, maxZ, near, far, radius };
+    }
+
+    _renderShadowMap(lightDir) {
+        const gl = this.gl;
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+        if (!isWebGL2) return false;
+        if (!this.enableDeferredShadows) return false;
+        if (!this.shadowProgram?.program || !this._shadow.uniforms) return false;
+        if (!this.mesh) return false;
+        if (!this._ensureShadowMap(this._shadow.size)) return false;
+
+        // Compute matrices for this frame.
+        this._computeDirectionalLightMatrices(lightDir);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this._shadow.fbo);
+        gl.viewport(0, 0, this._shadow.size, this._shadow.size);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.clearDepth(1.0);
+        gl.clear(gl.DEPTH_BUFFER_BIT);
+
+        // Render depth.
+        this.shadowProgram.use();
+        const U = this._shadow.uniforms;
+        if (U.uModelMatrix) gl.uniformMatrix4fv(U.uModelMatrix, false, this.modelMatrix);
+        if (U.uLightViewMatrix) gl.uniformMatrix4fv(U.uLightViewMatrix, false, this._shadow.lightView);
+        if (U.uLightProjMatrix) gl.uniformMatrix4fv(U.uLightProjMatrix, false, this._shadow.lightProj);
+        if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.terrainBounds);
+        if (U.uTerrainSize) gl.uniform3fv(U.uTerrainSize, this.terrainSize);
+
+        // Heightmap on unit 0
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.heightmap || null);
+        if (U.uHeightmap) gl.uniform1i(U.uHeightmap, 0);
+        if (U.uHasHeightmap) gl.uniform1i(U.uHasHeightmap, this.heightmap ? 1 : 0);
+
+        // Slight offset reduces shadow acne on the terrain.
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(2.0, 4.0);
+        this.mesh.render(this.shadowProgram);
+        gl.disable(gl.POLYGON_OFFSET_FILL);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return true;
+    }
+
+    _updateUbo(buffer, arrayBuffer) {
+        const gl = this.gl;
+        gl.bindBuffer(gl.UNIFORM_BUFFER, buffer);
+        gl.bufferSubData(gl.UNIFORM_BUFFER, 0, arrayBuffer);
+    }
+
+    _renderDeferred(viewProjectionMatrix) {
+        const gl = this.gl;
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+        if (!isWebGL2) return;
+        if (!this._deferredReady || !this._deferredUniforms) return;
+
+        const w = gl.drawingBufferWidth | 0;
+        const h = gl.drawingBufferHeight | 0;
+        if (!this._ensureGBuffer(w, h)) return;
+
+        // Ensure we always have sane fallbacks so samplers never default to unit 0 (heightmap).
+        this._ensureTerrainTextureFallbacks();
+        this._ensureDummyTextures();
+
+        // Optional shadow map update (before UBO upload so we can fill matrices + bind the real shadow texture).
+        const lightDir = [0.5, 0.8, 0.3];
+        const shadowOk = this._renderShadowMap(lightDir);
+
+        // Update matrices
+        glMatrix.mat3.normalFromMat4(this.normalMatrix, this.modelMatrix);
+
+        // --- Update UBOs (std140) ---
+        // SceneVars (224 bytes)
+        {
+            const buf = new ArrayBuffer(224);
+            const f32 = new Float32Array(buf);
+            // mat4 uViewProjectionMatrix
+            f32.set(viewProjectionMatrix, 0);
+            // mat4 uModelMatrix
+            f32.set(this.modelMatrix, 16);
+            // mat3 uNormalMatrix (std140: 3 vec4 columns = 12 floats)
+            // Put 3x3 into 3 vec4s.
+            f32[32] = this.normalMatrix[0];  f32[33] = this.normalMatrix[1];  f32[34] = this.normalMatrix[2];  f32[35] = 0;
+            f32[36] = this.normalMatrix[3];  f32[37] = this.normalMatrix[4];  f32[38] = this.normalMatrix[5];  f32[39] = 0;
+            f32[40] = this.normalMatrix[6];  f32[41] = this.normalMatrix[7];  f32[42] = this.normalMatrix[8];  f32[43] = 0;
+            // vec3 uTerrainBounds (padded)
+            f32[44] = this.terrainBounds[0] ?? 0;
+            f32[45] = this.terrainBounds[1] ?? 0;
+            f32[46] = this.terrainBounds[2] ?? 0;
+            f32[47] = 0;
+            // vec3 uTerrainSize (padded)
+            f32[48] = this.terrainSize[0] ?? 0;
+            f32[49] = this.terrainSize[1] ?? 0;
+            f32[50] = this.terrainSize[2] ?? 0;
+            f32[51] = 0;
+            // float uTime (plus padding)
+            f32[52] = (performance.now() * 0.001) || 0;
+            this._updateUbo(this._ubos.scene, buf);
+        }
+
+        // ShadowmapVars (256 bytes) - fill light params; enable shadows if shadow map is available.
+        {
+            const buf = new ArrayBuffer(256);
+            const dv = new DataView(buf);
+            const setF = (byteOff, v) => dv.setFloat32(byteOff, Number(v) || 0, true);
+            const setU = (byteOff, v) => dv.setUint32(byteOff, (Number(v) >>> 0), true);
+
+            // vec3 uLightDir (16 bytes)
+            const ld = lightDir;
+            setF(0, ld[0]); setF(4, ld[1]); setF(8, ld[2]); setF(12, 0);
+            // vec3 uLightColor (16 bytes)
+            setF(16, 1.0); setF(20, 1.0); setF(24, 1.0); setF(28, 0);
+            // float uAmbientIntensity at offset 32
+            setF(32, 0.7);
+            const f32 = new Float32Array(buf);
+            // mat4 uLightViewMatrix at byte offset 48 (float idx 12)
+            f32.set(shadowOk ? this._shadow.lightView : glMatrix.mat4.create(), 12);
+            // mat4 uLightProjMatrix at byte offset 112 (float idx 28)
+            f32.set(shadowOk ? this._shadow.lightProj : glMatrix.mat4.create(), 28);
+            // cascade vec4s remain 0
+            // shadow params
+            setF(240, 0.0008); // bias
+            setF(244, 1.0);   // strength
+            setF(248, shadowOk ? 1.25 : 0.0);   // softness (texel radius)
+            setU(252, shadowOk ? 1 : 0);        // uEnableShadows
+
+            this._updateUbo(this._ubos.shadow, buf);
+        }
+
+        // EntityVars (80 bytes)
+        {
+            const buf = new ArrayBuffer(80);
+            const dv = new DataView(buf);
+            const setF = (o, v) => dv.setFloat32(o, Number(v) || 0, true);
+            const setU = (o, v) => dv.setUint32(o, (Number(v) >>> 0), true);
+            // uCamRel vec4 (terrain uses camera-space via uTransform; keep 0)
+            setF(0, 0); setF(4, 0); setF(8, 0); setF(12, 0);
+            // uOrientation vec4 (identity)
+            setF(16, 0); setF(20, 0); setF(24, 0); setF(28, 1);
+            // uHasSkeleton, uHasTransforms, uTintPaletteIndex, uPad1
+            setU(32, 0);
+            setU(36, 1);
+            setU(40, 0);
+            setU(44, 0);
+            // uScale vec3 padded
+            setF(48, 1); setF(52, 1); setF(56, 1); setF(60, 0);
+            // uPad2
+            setU(64, 0);
+            this._updateUbo(this._ubos.entity, buf);
+        }
+
+        // ModelVars (64 bytes): uTransform = modelMatrix
+        {
+            const buf = new ArrayBuffer(64);
+            new Float32Array(buf).set(this.modelMatrix, 0);
+            this._updateUbo(this._ubos.model, buf);
+        }
+
+        // GeomVars (16 bytes)
+        {
+            const buf = new ArrayBuffer(16);
+            const dv = new DataView(buf);
+            dv.setUint32(0, 0, true);          // uEnableTint
+            dv.setFloat32(4, 0.0, true);       // uTintYVal
+            dv.setUint32(8, 0, true);
+            dv.setUint32(12, 0, true);
+            this._updateUbo(this._ubos.geom, buf);
+        }
+
+        // --- G-buffer pass ---
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this._gbuffer.fbo);
+        gl.viewport(0, 0, w, h);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        this.gbufferProgram.use();
+
+        // Samplers: keep units within WebGL2 guaranteed minimum (16).
+        const U = this._deferredUniforms;
+        const bind2D = (unit, tex, loc) => {
+            gl.activeTexture(gl.TEXTURE0 + unit);
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            if (loc) gl.uniform1i(loc, unit);
+        };
+
+        // Unit 0: heightmap
+        bind2D(0, this.heightmap || this._dummyBlack, U.uHeightmap);
+        if (U.uHasHeightmap) gl.uniform1i(U.uHasHeightmap, this.heightmap ? 1 : 0);
+
+        // Unit 1: blend mask
+        bind2D(1, this.textures.blendMask || this._dummyWhite, U.uBlendMask);
+
+        // Units 2..5: color maps (layer1..4)
+        bind2D(2, this.textures.layer1 || this._dummyWhite, U.uColorMap0);
+        bind2D(3, this.textures.layer2 || this._dummyWhite, U.uColorMap1);
+        bind2D(4, this.textures.layer3 || this._dummyWhite, U.uColorMap2);
+        bind2D(5, this.textures.layer4 || this._dummyWhite, U.uColorMap3);
+        // Optional fifth slot (unused)
+        bind2D(6, this._dummyWhite, U.uColorMap4);
+
+        // Normal maps (unused by default)
+        bind2D(7, this._dummyWhite, U.uNormalMap0);
+        bind2D(8, this._dummyWhite, U.uNormalMap1);
+        bind2D(9, this._dummyWhite, U.uNormalMap2);
+        bind2D(10, this._dummyWhite, U.uNormalMap3);
+        bind2D(11, this._dummyWhite, U.uNormalMap4);
+
+        // Tint palette required by includes; shadow map is real if available
+        bind2D(12, this._dummyWhite, U.uTintPalette);
+        bind2D(13, (shadowOk && this._shadow.depthTex) ? this._shadow.depthTex : this._dummyWhite, U.uShadowMap);
+
+        // Flags
+        if (U.uEnableTexture0) gl.uniform1i(U.uEnableTexture0, 1);
+        if (U.uEnableTexture1) gl.uniform1i(U.uEnableTexture1, 1);
+        if (U.uEnableTexture2) gl.uniform1i(U.uEnableTexture2, 1);
+        if (U.uEnableTexture3) gl.uniform1i(U.uEnableTexture3, 1);
+        if (U.uEnableTexture4) gl.uniform1i(U.uEnableTexture4, 0);
+        if (U.uEnableTextureMask) gl.uniform1i(U.uEnableTextureMask, 1);
+        if (U.uEnableNormalMap) gl.uniform1i(U.uEnableNormalMap, 0);
+        if (U.uEnableVertexColour) gl.uniform1i(U.uEnableVertexColour, 0);
+        if (U.uSpecularIntensity) gl.uniform1f(U.uSpecularIntensity, 0.15);
+        if (U.uSpecularPower) gl.uniform1f(U.uSpecularPower, 16.0);
+
+        // Depth-bias terrain slightly to reduce z-fighting.
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(1.0, 1.0);
+        this.mesh.render(this.gbufferProgram);
+        gl.disable(gl.POLYGON_OFFSET_FILL);
+
+        // Copy terrain depth into default framebuffer so subsequent passes (models/buildings) can depth-test.
+        try {
+            gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._gbuffer.fbo);
+            gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+            gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+        } catch {
+            // ignore
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+        // --- Composite to screen ---
+        gl.viewport(0, 0, w, h);
+        gl.disable(gl.DEPTH_TEST);
+        gl.depthMask(false);
+
+        this.compositeProgram.use();
+        gl.bindVertexArray(this._fsVao);
+        bind2D(0, this._gbuffer.texDiffuse, this._compositeUniforms?.uDiffuseTex);
+        bind2D(1, this._gbuffer.texIrr, this._compositeUniforms?.uIrradianceTex);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.bindVertexArray(null);
+        gl.depthMask(true);
     }
     
     dispose() {
@@ -942,5 +1598,17 @@ export class TerrainRenderer {
         if (this.program) {
             this.program.dispose();
         }
+        if (this.gbufferProgram) {
+            this.gbufferProgram.dispose();
+        }
+        if (this.compositeProgram) {
+            this.compositeProgram.dispose();
+        }
+        if (this.shadowProgram) {
+            this.shadowProgram.dispose();
+        }
+        // Shadow map resources
+        try { if (this._shadow?.depthTex) this.gl.deleteTexture(this._shadow.depthTex); } catch { /* ignore */ }
+        try { if (this._shadow?.fbo) this.gl.deleteFramebuffer(this._shadow.fbo); } catch { /* ignore */ }
     }
 } 

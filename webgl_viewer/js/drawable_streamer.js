@@ -54,6 +54,38 @@ export class DrawableStreamer {
         // This can reduce draw calls when many different hashes share the same exported mesh bins/materials.
         this.enableCrossArchetypeInstancing = true;
 
+        // Entity-level LOD traversal (CodeWalker-style parent-vs-children leaf selection).
+        // NOTE: requires updated `entities_chunks/*.jsonl` that include:
+        // - ymap_entity_index
+        // - parent_index / num_children
+        // - lod_dist / child_lod_dist
+        // This path is slower and currently disables the ENT1 fast-path (ENT1 doesn't carry hierarchy info).
+        this.enableEntityLodTraversal = false;
+        this.entityLodDistMult = 1.0;
+        this.entityLodUpdateMinMove = 12.0; // data-space units
+        this.entityLodUpdateMinMs = 200;    // ms throttle
+        this._entityNodesByKey = new Map(); // key -> node
+        this._chunkEntityKeys = new Map();  // chunkKey -> Set<nodeKey>
+        this._pendingChildrenByParentKey = new Map(); // parentKey -> Set<childKey>
+        this._dirtyEntityLod = true;
+        this._lastEntityLodCam = null; // [x,y,z] in data-space
+        this._lastEntityLodMs = 0;
+        this._lastEntityLodLeafCount = 0;
+
+        // Interiors / MLOs (minimal viable)
+        this.enableInteriors = true;
+        this.enableRoomGating = true;         // portal/room gating
+        this.interiorPortalDepth = 2;         // BFS depth through portals from current room
+        this.enableMloEntitySets = true;      // gate entity-set entities
+
+        this._mloDefs = new Map();            // mloArchetypeHash -> def JSON
+        this._mloDefsLoading = new Set();     // hashes currently loading
+        this._mloSetOverrides = new Map();    // key `${parentGuid}:${setHash}` -> boolean
+        this._activeInterior = null;          // { parentGuid, archHash, roomIndex, visibleRooms:Set<number> }
+        this._activeInteriorKey = '';         // cached change detector
+        this._mloInstancesLast = [];          // last discovered MLO instances (from last rebuild)
+        this._lastCamDataPos = [0, 0, 0];     // updated each frame (data-space)
+
         /**
          * Force a specific LOD for all streamed drawables.
          * null => automatic distance-based choice.
@@ -70,6 +102,41 @@ export class DrawableStreamer {
         this._chunkWorkerNextReqId = 1;
         /** @type {Map<number, { resolve: Function, reject: Function }>} */
         this._chunkWorkerPending = new Map();
+    }
+
+    setEntityLodTraversalEnabled(enabled) {
+        const on = !!enabled;
+        if (this.enableEntityLodTraversal === on) return;
+        this.enableEntityLodTraversal = on;
+
+        // ENT1 fast-path doesn't carry hierarchy; disable it when entity LOD is enabled.
+        if (this.enableEntityLodTraversal) this.preferBinary = false;
+
+        // Reset streamed data so we don't mix modes (also forces reload).
+        try {
+            for (const k of this._prevDesiredInstanceKeys) {
+                const [h, lod] = String(k).split(':', 2);
+                if (h) void this.modelRenderer?.setInstancesForArchetype?.(h, lod || 'high', null);
+            }
+        } catch { /* ignore */ }
+        this._prevDesiredInstanceKeys = new Set();
+
+        this.loading = new Set();
+        this.loaded = new Set();
+        this.chunkInstances = new Map();
+        this.chunkMinDist = new Map();
+        this.chunkArchetypeCounts = new Map();
+        this.lastLoadStats = null;
+        this.coverageStats = null;
+        this._dirty = true;
+
+        this._entityNodesByKey = new Map();
+        this._chunkEntityKeys = new Map();
+        this._pendingChildrenByParentKey = new Map();
+        this._dirtyEntityLod = true;
+        this._lastEntityLodCam = null;
+        this._lastEntityLodMs = 0;
+        this._lastEntityLodLeafCount = 0;
     }
 
     _getChunkWorker() {
@@ -197,10 +264,28 @@ export class DrawableStreamer {
             return;
         }
 
-        // Probe once to see if the ENT1 binary directory exists, so we don't spam 404s.
+        // Probe once to see if ENT1 binary tiles are actually present.
+        // Avoid probing a directory (static servers often 404/deny directory listings),
+        // and be resilient to servers that don't support HEAD.
         try {
-            const resp = await fetch('assets/entities_chunks_inst/', { cache: 'no-store' });
-            if (!resp.ok) this.preferBinary = false;
+            const chunks = this.index?.chunks || {};
+            const firstKey = Object.keys(chunks)[0];
+            const firstMeta = firstKey ? chunks[firstKey] : null;
+            const firstJsonl = String(firstMeta?.file || '');
+            const binFile = (firstJsonl
+                ? firstJsonl.replace(/\.jsonl(\.gz)?$/i, '.bin')
+                : (firstKey ? `${firstKey}.bin` : ''));
+
+            if (!binFile) {
+                this.preferBinary = false;
+            } else {
+                const url = `assets/entities_chunks_inst/${binFile}`;
+                let resp = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+                if (!resp.ok && (resp.status === 405 || resp.status === 501)) {
+                    resp = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-31' }, cache: 'no-store' });
+                }
+                this.preferBinary = !!resp.ok;
+            }
         } catch {
             this.preferBinary = false;
         } finally {
@@ -334,9 +419,254 @@ export class DrawableStreamer {
     _instanceStrideFloatsForLen(len) {
         const n = Number(len ?? 0);
         if (!Number.isFinite(n) || n <= 0) return 16;
-        // New layout: 16 (mat4) + 1 (tintIndex)
+        // Layouts:
+        // - v0: 16 (mat4)
+        // - v1: 17 (mat4 + tintIndex)
+        // - v3: 21 (mat4 + tintIndex + guid + mloParentGuid + mloEntitySetHash + mloFlags)
+        if ((n % 21) === 0) return 21;
         if ((n % 17) === 0) return 17;
         return 16;
+    }
+
+    async _ensureMloDefLoaded(archHash) {
+        const h = String(archHash ?? '').trim();
+        if (!h) return;
+        if (this._mloDefs.has(h) || this._mloDefsLoading.has(h)) return;
+        this._mloDefsLoading.add(h);
+        try {
+            const def = await fetchJSON(`assets/interiors/${h}.json`);
+            if (def && typeof def === 'object') this._mloDefs.set(h, def);
+        } catch {
+            // ignore missing interiors defs
+        } finally {
+            this._mloDefsLoading.delete(h);
+        }
+    }
+
+    _pointInAABB(p, minV, maxV) {
+        return (p[0] >= minV[0] && p[0] <= maxV[0]) &&
+               (p[1] >= minV[1] && p[1] <= maxV[1]) &&
+               (p[2] >= minV[2] && p[2] <= maxV[2]);
+    }
+
+    _computeVisibleRooms(def, startRoomIdx) {
+        const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
+        const portals = Array.isArray(def?.portals) ? def.portals : [];
+        const maxDepth = Math.max(0, Math.min(8, Math.floor(this.interiorPortalDepth || 0)));
+        const vis = new Set();
+        if (!(Number.isFinite(startRoomIdx) && startRoomIdx >= 0)) return vis;
+        vis.add(startRoomIdx);
+        if (!this.enableRoomGating || maxDepth <= 0) return vis;
+
+        // Build adjacency from portals.
+        /** @type {Map<number, number[]>} */
+        const adj = new Map();
+        for (const p of portals) {
+            const a = Number(p?.roomFrom);
+            const b = Number(p?.roomTo);
+            if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+            if (a < 0 || b < 0 || a >= rooms.length || b >= rooms.length) continue;
+            if (!adj.has(a)) adj.set(a, []);
+            if (!adj.has(b)) adj.set(b, []);
+            adj.get(a).push(b);
+            adj.get(b).push(a);
+        }
+
+        /** @type {Array<{r:number,d:number}>} */
+        const q = [{ r: startRoomIdx, d: 0 }];
+        while (q.length) {
+            const { r, d } = q.shift();
+            if (d >= maxDepth) continue;
+            const ns = adj.get(r) || [];
+            for (const n of ns) {
+                if (vis.has(n)) continue;
+                vis.add(n);
+                q.push({ r: n, d: d + 1 });
+            }
+        }
+        return vis;
+    }
+
+    _isMloSetEnabled(parentGuid, setHash) {
+        if (!this.enableMloEntitySets) return true;
+        const pg = (Number(parentGuid) >>> 0);
+        const sh = (Number(setHash) >>> 0);
+        if (!pg || !sh) return true; // not an entity-set child
+        const key = `${pg}:${sh}`;
+        const v = this._mloSetOverrides.get(key);
+        return (v === undefined) ? true : !!v;
+    }
+
+    _filterEntriesForActiveInterior(entries) {
+        if (!this.enableInteriors) return entries;
+
+        // Discover MLO instances present in the loaded set (metadata stride=21).
+        /** @type {Array<{ parentGuid:number, archHash:string, mat16:Float32Array }>} */
+        const mloInstances = [];
+        for (const e of entries) {
+            const mats = e.mats;
+            const stride = this._instanceStrideFloatsForLen(mats.length ?? 0);
+            if (stride < 21) continue;
+            for (let i = 0; i + 20 < mats.length; i += stride) {
+                const flags = (mats[i + 20] >>> 0);
+                if ((flags & 1) === 0) continue; // not isMloInstance
+                const guid = (mats[i + 17] >>> 0);
+                if (!guid) continue;
+                // Copy mat4 floats (avoid aliasing into the big array).
+                const m = new Float32Array(16);
+                for (let k = 0; k < 16; k++) m[k] = mats[i + k];
+                mloInstances.push({ parentGuid: guid, archHash: String(e.hash), mat16: m });
+                void this._ensureMloDefLoaded(String(e.hash));
+            }
+        }
+        this._mloInstancesLast = mloInstances;
+
+        // Compute active interior (if camera is inside any room AABB in local space).
+        let active = null;
+        const cam = this._lastCamDataPos || [0, 0, 0];
+        for (const inst of mloInstances) {
+            const def = this._mloDefs.get(String(inst.archHash));
+            if (!def) continue;
+            const rooms = Array.isArray(def.rooms) ? def.rooms : [];
+            if (rooms.length === 0) continue;
+
+            const inv = glMatrix.mat4.create();
+            if (!glMatrix.mat4.invert(inv, inst.mat16)) continue;
+            const v4 = glMatrix.vec4.fromValues(cam[0], cam[1], cam[2], 1.0);
+            const out = glMatrix.vec4.create();
+            glMatrix.vec4.transformMat4(out, v4, inv);
+            const local = [out[0], out[1], out[2]];
+
+            let roomIdx = -1;
+            for (let ri = 0; ri < rooms.length; ri++) {
+                const r = rooms[ri];
+                const mn = r?.bbMin;
+                const mx = r?.bbMax;
+                if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) continue;
+                if (this._pointInAABB(local, mn, mx)) { roomIdx = ri; break; }
+            }
+            if (roomIdx >= 0) {
+                const visibleRooms = this._computeVisibleRooms(def, roomIdx);
+                active = { parentGuid: inst.parentGuid, archHash: String(inst.archHash), roomIndex: roomIdx, visibleRooms, invMat: inv };
+                break;
+            }
+        }
+
+        const key = active ? `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${Array.from(active.visibleRooms).sort((a,b)=>a-b).join(',')}` : '';
+        this._activeInterior = active;
+        this._activeInteriorKey = key;
+
+        // If we are not inside any interior, drop all interior-child instances.
+        if (!active) {
+            const outEntries = [];
+            for (const e of entries) {
+                const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
+                if (stride < 21) { outEntries.push(e); continue; }
+                const filtered = [];
+                const a = e.mats;
+                for (let i = 0; i + (stride - 1) < a.length; i += stride) {
+                    const mloParentGuid = (a[i + 18] >>> 0);
+                    if (mloParentGuid) continue; // interior child: hide when not inside
+                    for (let k = 0; k < stride; k++) filtered.push(a[i + k]);
+                }
+                outEntries.push({ ...e, mats: filtered });
+            }
+            return outEntries;
+        }
+
+        // Inside one interior: only render that interior's children, with room + entity-set gating.
+        const outEntries = [];
+        for (const e of entries) {
+            const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
+            if (stride < 21) { outEntries.push(e); continue; }
+            const filtered = [];
+            const a = e.mats;
+            for (let i = 0; i + (stride - 1) < a.length; i += stride) {
+                const mloParentGuid = (a[i + 18] >>> 0);
+                const mloSetHash = (a[i + 19] >>> 0);
+                if (mloParentGuid) {
+                    if (mloParentGuid !== (active.parentGuid >>> 0)) continue;
+                    if (!this._isMloSetEnabled(mloParentGuid, mloSetHash)) continue;
+
+                    if (this.enableRoomGating && active.invMat) {
+                        const tx = a[i + 12], ty = a[i + 13], tz = a[i + 14];
+                        const v4 = glMatrix.vec4.fromValues(tx, ty, tz, 1.0);
+                        const out = glMatrix.vec4.create();
+                        glMatrix.vec4.transformMat4(out, v4, active.invMat);
+                        const local = [out[0], out[1], out[2]];
+                        const def = this._mloDefs.get(String(active.archHash));
+                        const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
+                        let ri = -1;
+                        for (let rj = 0; rj < rooms.length; rj++) {
+                            const r = rooms[rj];
+                            const mn = r?.bbMin;
+                            const mx = r?.bbMax;
+                            if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) continue;
+                            if (this._pointInAABB(local, mn, mx)) { ri = rj; break; }
+                        }
+                        if (ri >= 0 && !active.visibleRooms.has(ri)) continue;
+                    }
+                }
+                for (let k = 0; k < stride; k++) filtered.push(a[i + k]);
+            }
+            outEntries.push({ ...e, mats: filtered });
+        }
+        return outEntries;
+    }
+
+    _computeActiveInteriorFromCache() {
+        if (!this.enableInteriors) return { active: null, key: '' };
+        const cam = this._lastCamDataPos || [0, 0, 0];
+        for (const inst of (this._mloInstancesLast || [])) {
+            const def = this._mloDefs.get(String(inst.archHash));
+            if (!def) continue;
+            const rooms = Array.isArray(def.rooms) ? def.rooms : [];
+            if (rooms.length === 0) continue;
+
+            const inv = glMatrix.mat4.create();
+            if (!glMatrix.mat4.invert(inv, inst.mat16)) continue;
+            const v4 = glMatrix.vec4.fromValues(cam[0], cam[1], cam[2], 1.0);
+            const out = glMatrix.vec4.create();
+            glMatrix.vec4.transformMat4(out, v4, inv);
+            const local = [out[0], out[1], out[2]];
+
+            let roomIdx = -1;
+            for (let ri = 0; ri < rooms.length; ri++) {
+                const r = rooms[ri];
+                const mn = r?.bbMin;
+                const mx = r?.bbMax;
+                if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) continue;
+                if (this._pointInAABB(local, mn, mx)) { roomIdx = ri; break; }
+            }
+            if (roomIdx >= 0) {
+                const visibleRooms = this._computeVisibleRooms(def, roomIdx);
+                const active = { parentGuid: inst.parentGuid, archHash: String(inst.archHash), roomIndex: roomIdx, visibleRooms };
+                const key = `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${Array.from(active.visibleRooms).sort((a,b)=>a-b).join(',')}`;
+                return { active, key };
+            }
+        }
+        return { active: null, key: '' };
+    }
+
+    setMloEntitySetEnabled(parentGuid, setHash, enabled) {
+        const pg = (Number(parentGuid) >>> 0);
+        const sh = (Number(setHash) >>> 0);
+        if (!pg || !sh) return;
+        const key = `${pg}:${sh}`;
+        this._mloSetOverrides.set(key, !!enabled);
+        this._dirty = true;
+    }
+
+    clearMloEntitySetOverrides(parentGuid = null) {
+        if (parentGuid === null || parentGuid === undefined) {
+            this._mloSetOverrides.clear();
+        } else {
+            const pg = (Number(parentGuid) >>> 0);
+            for (const k of Array.from(this._mloSetOverrides.keys())) {
+                if (String(k).startsWith(`${pg}:`)) this._mloSetOverrides.delete(k);
+            }
+        }
+        this._dirty = true;
     }
 
     _safeTintIndex(v) {
@@ -344,6 +674,82 @@ export class DrawableStreamer {
         if (!Number.isFinite(n0)) return 0;
         const n = Math.floor(n0);
         return Math.max(0, Math.min(255, n));
+    }
+
+    _safeNum(x, fallback = 0.0) {
+        const n = Number(x);
+        return Number.isFinite(n) ? n : fallback;
+    }
+
+    _dist3(ax, ay, az, bx, by, bz) {
+        const dx = ax - bx;
+        const dy = ay - by;
+        const dz = az - bz;
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    _entityKeyFromObj(obj) {
+        const ymap = String(obj?.ymap || '').trim();
+        const idx = Number(obj?.ymap_entity_index);
+        if (!ymap) return null;
+        if (!Number.isFinite(idx) || idx < 0) return null;
+        return `${ymap}|${(idx | 0)}`;
+    }
+
+    _entityKeyFallback(obj, chunkKey, lineNo) {
+        // Best-effort fallback when exports don't include `ymap_entity_index`.
+        // This enables the "entity LOD traversal" code path to still *render something*
+        // (as a flat leaf set) instead of silently drawing nothing.
+        const ymap = String(obj?.ymap || '').trim();
+        if (!ymap) return null;
+        const n = Number(lineNo);
+        const ln = Number.isFinite(n) ? (n | 0) : 0;
+        return `${ymap}|__chunk:${String(chunkKey || '')}__line:${ln}`;
+    }
+
+    _addPendingChild(parentKey, childKey) {
+        if (!parentKey || !childKey) return;
+        let s = this._pendingChildrenByParentKey.get(parentKey);
+        if (!s) {
+            s = new Set();
+            this._pendingChildrenByParentKey.set(parentKey, s);
+        }
+        s.add(childKey);
+    }
+
+    _removePendingChild(parentKey, childKey) {
+        if (!parentKey || !childKey) return;
+        const s = this._pendingChildrenByParentKey.get(parentKey);
+        if (!s) return;
+        s.delete(childKey);
+        if (s.size === 0) this._pendingChildrenByParentKey.delete(parentKey);
+    }
+
+    _removeChunkEntities(chunkKey) {
+        const keys = this._chunkEntityKeys.get(chunkKey);
+        if (!keys) return;
+        for (const k of keys) {
+            const node = this._entityNodesByKey.get(k);
+            if (!node) continue;
+
+            if (node.parentKey) {
+                const p = this._entityNodesByKey.get(node.parentKey);
+                if (p && p.children) p.children.delete(k);
+                this._removePendingChild(node.parentKey, k);
+            }
+
+            // Children remain pending on missing parent so they won't be treated as roots.
+            if (node.children && node.children.size > 0) {
+                for (const ck of node.children) {
+                    const cn = this._entityNodesByKey.get(ck);
+                    if (cn && cn.parentKey === k) this._addPendingChild(k, ck);
+                }
+            }
+
+            this._entityNodesByKey.delete(k);
+        }
+        this._chunkEntityKeys.delete(chunkKey);
+        this._dirtyEntityLod = true;
     }
 
     async _loadChunk(key, { priority = 'high' } = {}) {
@@ -357,6 +763,157 @@ export class DrawableStreamer {
         try {
             const jsonlPath = `assets/${this.index.chunks_dir}/${meta.file}`;
 
+            // Entity-level LOD traversal needs hierarchy fields (not present in ENT1 bins),
+            // so we always parse JSONL in this mode.
+            if (this.enableEntityLodTraversal) {
+                const camData = this._cameraToDataSpace(window.__appCameraPosForDrawableStreamer || [0, 0, 0]);
+                const cx = this._safeNum(camData?.[0], 0.0);
+                const cy = this._safeNum(camData?.[1], 0.0);
+                const cz = this._safeNum(camData?.[2], 0.0);
+
+                const chunkKeys = new Set();
+                const newHashes = new Set();
+                let totalLines = 0;
+                let parsed = 0;
+                let withArchetype = 0;
+                let badKey = 0;
+                let badArchetype = 0;
+                let usedFallbackKeys = 0;
+                let warnedMissingHierarchy = false;
+
+                await fetchNDJSON(jsonlPath, {
+                    usePersistentCache: this.usePersistentCacheForChunks,
+                    priority,
+                    onObject: (obj) => {
+                        totalLines++;
+                        if (!obj) return;
+                        parsed++;
+
+                        const a = obj?.archetype;
+                        if (a === undefined || a === null) return;
+                        withArchetype++;
+
+                        let nodeKey = this._entityKeyFromObj(obj);
+                        if (!nodeKey) {
+                            // If the export omitted `ymap_entity_index`, we can still build instances
+                            // (but we can't reconstruct parent/child hierarchy).
+                            nodeKey = this._entityKeyFallback(obj, key, totalLines);
+                            if (nodeKey) {
+                                usedFallbackKeys++;
+                                if (!warnedMissingHierarchy) {
+                                    warnedMissingHierarchy = true;
+                                    console.warn(
+                                        'Entity LOD traversal: entities_chunks/*.jsonl is missing `ymap_entity_index` (and likely parent/child fields). ' +
+                                        'Falling back to flat leaf selection. Re-export entities_chunks with hierarchy fields for CodeWalker-style traversal.'
+                                    );
+                                }
+                            } else {
+                                badKey++;
+                                return;
+                            }
+                        }
+
+                        const hash = this.modelManager?.normalizeId?.(a);
+                        if (!hash) {
+                            badArchetype++;
+                            return;
+                        }
+                        newHashes.add(hash);
+
+                        const ymap = String(obj?.ymap || '').trim();
+                        const parentIndex = Number(obj?.parent_index);
+                        // If exports omitted hierarchy fields, treat everything as a root.
+                        const parentKey = (Number.isFinite(parentIndex) && parentIndex >= 0 && ymap && obj?.ymap_entity_index !== undefined)
+                            ? `${ymap}|${(parentIndex | 0)}`
+                            : null;
+                        const numChildren = Number(obj?.num_children);
+
+                        const pp = obj?.position || [0, 0, 0];
+                        const px = this._safeNum(pp?.[0], 0.0);
+                        const py = this._safeNum(pp?.[1], 0.0);
+                        const pz = this._safeNum(pp?.[2], 0.0);
+
+                        const dist = this._dist3(px, py, pz, cx, cy, cz);
+                        // Many older exports had lod_dist=0 for everything; treat 0 as "no LOD cull"
+                        // and rely on maxModelDistance instead.
+                        const lodDistRaw = this._safeNum(obj?.lod_dist, 0.0);
+                        const childLodDistRaw = this._safeNum(obj?.child_lod_dist, 0.0);
+                        const fallbackLod = Number.isFinite(this.maxModelDistance) ? Math.max(0, this.maxModelDistance) : 350.0;
+                        const lodDist = (lodDistRaw > 0.0) ? lodDistRaw : fallbackLod;
+                        const childLodDist = (childLodDistRaw > 0.0) ? childLodDistRaw : fallbackLod;
+
+                        const m16 = this._entityToMat4(obj);
+                        const mat17 = new Float32Array(17);
+                        mat17.set(m16, 0);
+                        mat17[16] = this._safeTintIndex(obj?.tintIndex ?? obj?.tint);
+
+                        const node = {
+                            key: nodeKey,
+                            hash,
+                            ymap,
+                            parentKey,
+                            numChildren: (Number.isFinite(numChildren) ? Math.max(0, (numChildren | 0)) : 0),
+                            lodDist,
+                            childLodDist,
+                            px, py, pz,
+                            dist,
+                            mat17,
+                            children: new Set(),
+                        };
+
+                        // If we're replacing an existing node, detach it from any old parent links.
+                        const prev = this._entityNodesByKey.get(nodeKey);
+                        if (prev && prev.parentKey && prev.parentKey !== parentKey) {
+                            const p = this._entityNodesByKey.get(prev.parentKey);
+                            if (p && p.children) p.children.delete(nodeKey);
+                            this._removePendingChild(prev.parentKey, nodeKey);
+                        }
+
+                        this._entityNodesByKey.set(nodeKey, node);
+                        chunkKeys.add(nodeKey);
+
+                        // Attach to parent if present (or pend until parent loads).
+                        if (parentKey) {
+                            const p = this._entityNodesByKey.get(parentKey);
+                            if (p && p.children) {
+                                p.children.add(nodeKey);
+                            } else {
+                                this._addPendingChild(parentKey, nodeKey);
+                            }
+                        }
+
+                        // If any children were waiting for us, attach them now.
+                        const pending = this._pendingChildrenByParentKey.get(nodeKey);
+                        if (pending && pending.size > 0) {
+                            for (const ck of pending) node.children.add(ck);
+                            this._pendingChildrenByParentKey.delete(nodeKey);
+                        }
+                    },
+                });
+
+                // Prefetch mesh meta for discovered hashes so real meshes appear ASAP.
+                for (const h of newHashes) {
+                    try { this.modelManager?.prefetchMeta?.(h); } catch { /* ignore */ }
+                }
+
+                this._chunkEntityKeys.set(key, chunkKeys);
+                this.loaded.add(key);
+                this._dirty = true;
+                this._dirtyEntityLod = true;
+                this.lastLoadStats = {
+                    key,
+                    totalLines,
+                    parsed,
+                    withArchetype,
+                    badArchetype,
+                    entityLodMode: true,
+                    nodes: chunkKeys.size,
+                    badKey,
+                    usedFallbackKeys,
+                };
+                return;
+            }
+
             const byHash = new Map(); // hash -> number[] mats
             const minDistByHash = new Map(); // hash -> number
             let archetypeCounts = new Map(); // hash -> count
@@ -367,8 +924,9 @@ export class DrawableStreamer {
             // Format (ENT1):
             // - 4 bytes: 'ENT1'
             // - u32: count
-            // - count records: <I3f4f3f> = archetypeHash, pos(xyz), quat(xyzw), scale(xyz)
-            // Optional v2: <I3f4f3fI> adds u32 tintIndex after scale (stride=48).
+            // - count records: v1 <I3f4f3f> = archetypeHash, pos(xyz), quat(xyzw), scale(xyz)
+            // - v2 <I3f4f3fI> adds u32 tintIndex after scale (stride=48).
+            // - v3 <I3f4f3f5I> adds u32 tintIndex + guid + mloParentGuid + mloEntitySetHash + flags (stride=64).
             let usedBinary = false;
             if (this.preferBinary) {
                 try {
@@ -384,8 +942,8 @@ export class DrawableStreamer {
                             String.fromCharCode(dv.getUint8(3));
                         if (magic === 'ENT1') {
                             const count = dv.getUint32(4, true);
-                            // v1 stride=44, v2 stride=48 (tintIndex).
-                            const stride = (dv.byteLength >= (8 + count * 48)) ? 48 : 44;
+                            // v1 stride=44, v2 stride=48 (tintIndex), v3 stride=64 (mlo metadata)
+                            const stride = (dv.byteLength >= (8 + count * 64)) ? 64 : ((dv.byteLength >= (8 + count * 48)) ? 48 : 44);
                             const start = 8;
                             const need = start + count * stride;
                             if (count >= 0 && need <= dv.byteLength) {
@@ -427,6 +985,10 @@ export class DrawableStreamer {
                                         const sy = dv.getFloat32(off + 36, true);
                                         const sz = dv.getFloat32(off + 40, true);
                                         const tintIndex = (stride >= 48) ? (dv.getUint32(off + 44, true) >>> 0) : 0;
+                                        const guid = (stride >= 64) ? (dv.getUint32(off + 48, true) >>> 0) : 0;
+                                        const mloParentGuid = (stride >= 64) ? (dv.getUint32(off + 52, true) >>> 0) : 0;
+                                        const mloSetHash = (stride >= 64) ? (dv.getUint32(off + 56, true) >>> 0) : 0;
+                                        const mloFlags = (stride >= 64) ? (dv.getUint32(off + 60, true) >>> 0) : 0;
 
                                         archetypeCounts.set(hash, (archetypeCounts.get(hash) ?? 0) + 1);
 
@@ -452,6 +1014,11 @@ export class DrawableStreamer {
                                         }
                                         for (let k = 0; k < 16; k++) arr.push(m[k]);
                                         arr.push(this._safeTintIndex(tintIndex));
+                                        // v3 metadata (always present in our in-memory layout; zeros for older bins)
+                                        arr.push(Number(guid >>> 0));
+                                        arr.push(Number(mloParentGuid >>> 0));
+                                        arr.push(Number(mloSetHash >>> 0));
+                                        arr.push(Number(mloFlags >>> 0));
                                     }
                                 }
                             }
@@ -531,6 +1098,17 @@ export class DrawableStreamer {
                             }
                             for (let i = 0; i < 16; i++) arr.push(m[i]);
                             arr.push(tintIndex);
+                            // v3 metadata (always present in our in-memory layout; zeros if absent)
+                            const mloParentGuid = (Number(obj?.mlo_parent_guid ?? 0) >>> 0);
+                            const mloSetHash = (Number(obj?.mlo_entity_set_hash ?? 0) >>> 0);
+                            const flags =
+                                ((obj?.is_mlo_instance ? 1 : 0) >>> 0) |
+                                ((mloParentGuid ? 1 : 0) << 1) |
+                                ((mloSetHash ? 1 : 0) << 2);
+                            arr.push(Number((Number(obj?.guid ?? 0) >>> 0)));
+                            arr.push(Number(mloParentGuid));
+                            arr.push(Number(mloSetHash));
+                            arr.push(Number(flags >>> 0));
                         },
                     });
                 }
@@ -732,12 +1310,15 @@ export class DrawableStreamer {
 
         // Distance-first selection (closest archetypes first), but prefer REAL meshes over placeholders
         // so placeholders don't crowd out real geometry under maxArchetypes.
-        const entries = Array.from(agg.entries()).map(([hash, mats]) => ({
+        let entries = Array.from(agg.entries()).map(([hash, mats]) => ({
             hash,
             mats,
             d: minD.get(hash) ?? 1e30,
             isPlaceholder: !(this.modelManager?.hasRealMesh?.(hash) ?? true),
         }));
+
+        // Apply interior visibility gating (drops interior children unless camera is inside).
+        entries = this._filterEntriesForActiveInterior(entries);
         entries.sort((a, b) => {
             const pa = a.isPlaceholder ? 1 : 0;
             const pb = b.isPlaceholder ? 1 : 0;
@@ -890,10 +1471,150 @@ export class DrawableStreamer {
         return 'low';
     }
 
+    _selectVisibleLeavesCodeWalkerStyle(camDataPos) {
+        const cx = this._safeNum(camDataPos?.[0], 0.0);
+        const cy = this._safeNum(camDataPos?.[1], 0.0);
+        const cz = this._safeNum(camDataPos?.[2], 0.0);
+        const lodMult = Number.isFinite(this.entityLodDistMult) ? this.entityLodDistMult : 1.0;
+
+        // Roots are entities with no parent_index. If parent_index exists but parent isn't loaded yet,
+        // we DO NOT promote the child to root (prevents drawing children early).
+        const roots = [];
+        for (const n of this._entityNodesByKey.values()) {
+            if (n && !n.parentKey) roots.push(n);
+        }
+
+        const leaves = [];
+
+        const recurse = (ent) => {
+            if (!ent) return;
+            ent.dist = this._dist3(ent.px, ent.py, ent.pz, cx, cy, cz);
+
+            // Mirrors CodeWalker.GetEntityChildren:
+            // - all children must be present: childrenCount >= numChildren
+            // - recurse if within ChildLodDist OR any child is within its own LodDist
+            let clist = null;
+            const wantChildren = (ent.numChildren | 0);
+            const haveChildren = ent.children ? ent.children.size : 0;
+            if (wantChildren > 0 && haveChildren >= wantChildren) {
+                if (ent.dist <= (Number(ent.childLodDist || 0.0) * lodMult)) {
+                    clist = ent.children;
+                } else {
+                    for (const ck of ent.children) {
+                        const child = this._entityNodesByKey.get(ck);
+                        if (!child) continue;
+                        child.dist = this._dist3(child.px, child.py, child.pz, cx, cy, cz);
+                        if (child.dist <= (Number(child.lodDist || 0.0) * lodMult)) {
+                            clist = ent.children;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (clist) {
+                for (const ck of clist) {
+                    const child = this._entityNodesByKey.get(ck);
+                    if (!child) continue;
+                    recurse(child);
+                }
+                return;
+            }
+
+            // Leaf: only render if within LodDist
+            if (ent.dist <= (Number(ent.lodDist || 0.0) * lodMult)) {
+                leaves.push(ent);
+            }
+        };
+
+        for (const r of roots) {
+            r.dist = this._dist3(r.px, r.py, r.pz, cx, cy, cz);
+            if (r.dist <= (Number(r.lodDist || 0.0) * lodMult)) {
+                recurse(r);
+            }
+        }
+
+        return leaves;
+    }
+
+    _rebuildInstancesFromEntityLeaves(leaves) {
+        const byHash = new Map();      // hash -> number[] (mat17 packed)
+        const minD = new Map();        // hash -> min distance
+
+        for (const e of leaves) {
+            const hash = String(e?.hash || '');
+            if (!hash) continue;
+            const d = Number(e?.dist ?? 0.0);
+
+            // Distance cutoff
+            const maxD = Number.isFinite(this.maxModelDistance) ? Math.max(0, this.maxModelDistance) : 1e30;
+            if (d > maxD) continue;
+
+            const prev = minD.get(hash);
+            if (prev === undefined || d < prev) minD.set(hash, d);
+
+            let arr = byHash.get(hash);
+            if (!arr) {
+                arr = [];
+                byHash.set(hash, arr);
+            }
+            const m = e.mat17;
+            for (let i = 0; i < 17; i++) arr.push(m[i]);
+        }
+
+        let entries = Array.from(byHash.entries()).map(([hash, mats]) => ({
+            hash,
+            mats,
+            d: minD.get(hash) ?? 1e30,
+            isPlaceholder: !(this.modelManager?.hasRealMesh?.(hash) ?? true),
+        }));
+        entries.sort((a, b) => {
+            const pa = a.isPlaceholder ? 1 : 0;
+            const pb = b.isPlaceholder ? 1 : 0;
+            if (pa !== pb) return pa - pb;
+            return a.d - b.d;
+        });
+
+        const maxArch = (this.maxArchetypes | 0);
+        const keep = (maxArch > 0) ? entries.slice(0, maxArch) : entries;
+
+        // Disable cross-archetype instancing for this path for now (simpler + correctness first).
+        // Clear any stale buckets, if present.
+        if (this._prevDesiredBucketIds && this.modelRenderer?.setInstancesForBucket) {
+            for (const bid of this._prevDesiredBucketIds) {
+                void this.modelRenderer.setInstancesForBucket(bid, 'high', '__clear__', null, null);
+            }
+            this._prevDesiredBucketIds = new Set();
+        }
+
+        const desiredKeys = new Set();
+        for (const e of keep) {
+            const lod = this._chooseLod(e.hash, e.d);
+            desiredKeys.add(`${String(e.hash)}:${String(lod)}`);
+            void this.modelRenderer.setInstancesForArchetype(e.hash, lod, new Float32Array(e.mats), e.d);
+        }
+        for (const k of this._prevDesiredInstanceKeys) {
+            if (!desiredKeys.has(k)) {
+                const [h, lod] = String(k).split(':', 2);
+                if (h) void this.modelRenderer.setInstancesForArchetype(h, lod || 'high', null);
+            }
+        }
+        this._prevDesiredInstanceKeys = desiredKeys;
+
+        this.coverageStats = {
+            mode: 'entityLodTraversal',
+            loadedChunks: this.loaded.size,
+            loadedEntities: this._entityNodesByKey.size,
+            visibleLeaves: leaves.length,
+            instancedArchetypes: keep.length,
+        };
+    }
+
     _trim(wantedSet, wantedOrdered = null) {
         let changed = false;
         for (const key of Array.from(this.loaded)) {
             if (!wantedSet.has(key)) {
+                if (this.enableEntityLodTraversal) this._removeChunkEntities(key);
                 this.loaded.delete(key);
                 this.chunkInstances.delete(key);
                 this.chunkMinDist.delete(key);
@@ -921,6 +1642,7 @@ export class DrawableStreamer {
         const toDrop = loadedSorted.slice(0, extra).map(e => e.k);
 
         for (const key of toDrop) {
+            if (this.enableEntityLodTraversal) this._removeChunkEntities(key);
             this.loaded.delete(key);
             this.chunkInstances.delete(key);
             this.chunkMinDist.delete(key);
@@ -935,12 +1657,49 @@ export class DrawableStreamer {
         // Expose camera position for distance computations inside chunk load (async).
         // (We avoid capturing camera object into async closures.)
         window.__appCameraPosForDrawableStreamer = [camera.position[0], camera.position[1], camera.position[2]];
+        try {
+            const c = this._cameraToDataSpace(camera.position);
+            this._lastCamDataPos = [c[0], c[1], c[2]];
+        } catch {
+            this._lastCamDataPos = [0, 0, 0];
+        }
+
         const wanted = this._wantedKeysForCamera(camera, centerDataPos);
         const wantedSet = new Set(wanted);
         this._trim(wantedSet, wanted);
-        if (this._dirty) {
-            this._dirty = false;
-            this._rebuildAllInstances();
+
+        if (this.enableEntityLodTraversal) {
+            const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            const cam = this._lastCamDataPos || [0, 0, 0];
+            const last = this._lastEntityLodCam;
+            const moved = last ? this._dist3(cam[0], cam[1], cam[2], last[0], last[1], last[2]) : 1e30;
+
+            const moveOk = moved >= (Number(this.entityLodUpdateMinMove) || 0.0);
+            const timeOk = (now - (Number(this._lastEntityLodMs) || 0)) >= (Number(this.entityLodUpdateMinMs) || 0);
+            const dirtyNow = !!(this._dirty || this._dirtyEntityLod);
+
+            // If chunk-set changed, rebuild immediately. Otherwise throttle rebuilds while moving.
+            if (dirtyNow || (moveOk && timeOk)) {
+                this._dirty = false;
+                this._dirtyEntityLod = false;
+                this._lastEntityLodCam = [cam[0], cam[1], cam[2]];
+                this._lastEntityLodMs = now;
+
+                const leaves = this._selectVisibleLeavesCodeWalkerStyle(cam);
+                this._lastEntityLodLeafCount = leaves.length;
+                this._rebuildInstancesFromEntityLeaves(leaves);
+            }
+        } else {
+            // Interior visibility can change as the camera moves (enter/exit rooms), even when chunk set is stable.
+            // Use the cached MLO instance list from the last rebuild to decide if we should rebuild.
+            if (this.enableInteriors && this._mloInstancesLast && this._mloInstancesLast.length > 0) {
+                const { key } = this._computeActiveInteriorFromCache();
+                if (key !== this._activeInteriorKey) this._dirty = true;
+            }
+            if (this._dirty) {
+                this._dirty = false;
+                this._rebuildAllInstances();
+            }
         }
 
         const budget = Math.max(1, Math.floor(this.maxNewLoadsPerUpdate));

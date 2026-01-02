@@ -12,6 +12,9 @@ This documentation provides a comprehensive reference for CodeWalker's systems a
    - Light Systems
    - Occluder Systems
 
+## Parity / Integration Reports
+- [CodeWalker ↔ WebGL Viewer parity](CODEWALKER_PARITY_WEBGL_VIEWER.md)
+
 2. [RPF System](rpf_system.md)
    - RPF File Structure
    - RPF Manager

@@ -1,6 +1,8 @@
 // Web Worker: fetch + parse a large JSON manifest off the main thread.
 // This avoids freezing the UI when assets/models/manifest.json is ~tens of MB.
 
+import { fetchJSON } from './asset_fetcher.js';
+
 self.onmessage = async (e) => {
   const msg = e?.data || {};
   const url = String(msg.url || '');
@@ -10,14 +12,9 @@ self.onmessage = async (e) => {
   }
 
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      self.postMessage({ ok: false, error: `Failed to fetch ${url} (status=${resp.status})` });
-      return;
-    }
-
-    // Use Response.json() in the worker; parsing still needs full data, but doesn’t block the UI thread.
-    const data = await resp.json();
+    // Use the shared fetch helper for consistency (cache + concurrency limits).
+    // Parsing still happens in the worker so it won’t freeze the UI thread.
+    const data = await fetchJSON(url, { usePersistentCache: true, useMemoryCache: false, priority: 'high' });
     self.postMessage({ ok: true, data });
   } catch (err) {
     self.postMessage({ ok: false, error: (err && (err.stack || err.message)) ? (err.stack || err.message) : String(err) });

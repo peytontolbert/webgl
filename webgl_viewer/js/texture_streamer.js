@@ -260,7 +260,7 @@ export class TextureStreamer {
         })();
         try { gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); } catch { /* ignore */ }
 
-        // Choose sRGB internalFormat only for color textures, when supported and format is SRGB.
+        // Choose sRGB internalFormat only for color textures, when supported and vkFormat is SRGB.
         const cs = this._colorSpaceForKind(kind);
         const srgb = this._getSrgbSupport();
         const wantSrgb = (cs === 'srgb') && (vkFormat === VK_RGBA8_SRGB) && srgb.ok;
@@ -285,12 +285,42 @@ export class TextureStreamer {
             uploadedBytes += expected;
         }
 
-        // Texture params: if KTX2 has mips, use them; else stay non-mipped.
+        // Texture params:
+        // - If KTX2 includes mip levels, use them when allowed.
+        // - IMPORTANT for GTA parity: most materials rely on tiling (UVs outside 0..1),
+        //   so prefer REPEAT when possible (WebGL2 or power-of-two textures).
+        const isWebGL2 = (() => {
+            try {
+                return (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+            } catch {
+                return false;
+            }
+        })();
+        const isPot = this._isPowerOfTwo(pixelWidth) && this._isPowerOfTwo(pixelHeight);
+        const canRepeat = isWebGL2 || isPot;
+        const canMips = isWebGL2 || isPot;
         const hasMips = levels > 1;
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, hasMips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+        const useMips = hasMips && canMips;
+
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, useMips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, canRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, canRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+
+        if (useMips) {
+            // Anisotropic filtering greatly improves texture sharpness at grazing angles.
+            try {
+                const extAniso =
+                    gl.getExtension('EXT_texture_filter_anisotropic')
+                    || gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic')
+                    || gl.getExtension('MOZ_EXT_texture_filter_anisotropic');
+                if (extAniso) {
+                    const maxA = gl.getParameter(extAniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) || 1;
+                    const wantA = Math.min(8, Math.max(1, Number(maxA) || 1));
+                    gl.texParameterf(gl.TEXTURE_2D, extAniso.TEXTURE_MAX_ANISOTROPY_EXT, wantA);
+                }
+            } catch { /* ignore */ }
+        }
 
         try {
             if (prevFlip !== null) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, prevFlip);
@@ -305,7 +335,7 @@ export class TextureStreamer {
             throw e;
         }
 
-        return { tex, bytes: uploadedBytes, width: pixelWidth, height: pixelHeight, levels };
+        return { tex, bytes: uploadedBytes, width: pixelWidth, height: pixelHeight, levels, uploadedAsSrgb: wantSrgb, vkFormat };
     }
 
     _cacheKey(baseUrl, tier, kind = 'diffuse') {
@@ -408,6 +438,30 @@ export class TextureStreamer {
         return this.placeholder;
     }
 
+    /**
+     * Return texture + metadata so renderers can decide whether shader-side sRGB decode is needed.
+     * @returns {{ tex: WebGLTexture, isPlaceholder: boolean, uploadedAsSrgb: boolean }}
+     */
+    getWithInfo(url, { distance = 0, kind = 'diffuse', tier = null } = {}) {
+        const baseUrl = String(url || '');
+        if (!baseUrl) return { tex: this.placeholder, isPlaceholder: true, uploadedAsSrgb: false };
+        const desired = this._clampTierToAllowed(tier ?? this._tierForDistance(distance, kind));
+        const wantOrder = (desired === 'high')
+            ? ['high', 'medium', 'low']
+            : (desired === 'medium')
+                ? ['medium', 'low']
+                : ['low'];
+        for (const t of wantOrder) {
+            const k = this._cacheKey(baseUrl, t, kind);
+            const e = this.cache.get(k);
+            if (e?.tex) {
+                e.lastUse = performance.now();
+                return { tex: e.tex, isPlaceholder: false, uploadedAsSrgb: !!e.uploadedAsSrgb };
+            }
+        }
+        return { tex: this.placeholder, isPlaceholder: true, uploadedAsSrgb: false };
+    }
+
     prefetch(url) {
         // Back-compat helper: schedule a low-priority request.
         const baseUrl = String(url || '');
@@ -463,7 +517,7 @@ export class TextureStreamer {
         }
         if (existing?.loading) return this.placeholder;
 
-        this.cache.set(key, { baseUrl, tier: t, tex: null, bytes: 0, lastUse: performance.now(), loading: true });
+        this.cache.set(key, { baseUrl, tier: t, tex: null, bytes: 0, lastUse: performance.now(), loading: true, uploadedAsSrgb: false });
 
         try {
             // LOW priority: textures are important for quality, but should not starve chunk/mesh/meta loads.
@@ -530,7 +584,7 @@ export class TextureStreamer {
                 const ab = await blob.arrayBuffer();
                 const out = this._uploadKtx2(ab, { kind, tier: t });
                 this.totalBytes += out.bytes;
-                this.cache.set(key, { baseUrl, tier: t, tex: out.tex, bytes: out.bytes, lastUse: performance.now(), loading: false });
+                this.cache.set(key, { baseUrl, tier: t, tex: out.tex, bytes: out.bytes, lastUse: performance.now(), loading: false, uploadedAsSrgb: !!out.uploadedAsSrgb });
                 this._evictIfNeeded();
                 return out.tex;
             }
@@ -695,7 +749,10 @@ export class TextureStreamer {
             const baseBytes = img.width * img.height * 4;
             const bytes = Math.floor(baseBytes * (useMips ? (4.0 / 3.0) : 1.0));
             this.totalBytes += bytes;
-            this.cache.set(key, { baseUrl, tier: t, tex, bytes, lastUse: performance.now(), loading: false });
+            // Browser-image uploads can request sRGB internalFormat when supported (see internalFormat selection above).
+            // Record whether this entry was uploaded as sRGB so shaders can decide whether to decode.
+            const uploadedAsSrgb = (cs === 'srgb' && srgb.ok);
+            this.cache.set(key, { baseUrl, tier: t, tex, bytes, lastUse: performance.now(), loading: false, uploadedAsSrgb });
             this._evictIfNeeded();
             return tex;
         } catch (e) {

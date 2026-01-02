@@ -76,17 +76,17 @@ void main() {
         // Calculate grid position (aPosition.xy is in [0, 1] range)
         vec2 gridPos = aPosition.xy;
         
-        // Calculate world position using GTA5's coordinate system
-        worldPos.x = uTerrainBounds.x + (gridPos.x / (uTerrainSize.x - 1.0)) * (uTerrainBounds.x + uTerrainSize.x);
-        worldPos.y = uTerrainBounds.y + (gridPos.y / (uTerrainSize.y - 1.0)) * (uTerrainBounds.y + uTerrainSize.y);
+        // Expand normalized grid [0..1] into data/world space using bounds + extents.
+        // (Matches the runtime terrain renderer’s convention.)
+        worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
+        worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
         
         // Sample height from heightmap
         vec2 heightmapCoord = vec2(gridPos.x, 1.0 - gridPos.y);
         float height = texture(uHeightmap, heightmapCoord).r;
         
-        // Scale height to match the terrain bounds
-        float heightScale = uTerrainSize.z / 255.0;
-        worldPos.z = uTerrainBounds.z + height * heightScale;
+        // Heightmap is R8 normalized to 0..1, so scale directly by terrain Z extent.
+        worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
     } else {
         worldPos = aPosition;
     }

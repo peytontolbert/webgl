@@ -30,6 +30,7 @@ export class OcclusionCuller {
         this._depthTex = null;
         this._fbo = null;
         this._depthU32 = null;
+        this._depthF32 = null;
         this._useFloatReadback = false;
         this._readbackSupported = true;
         this._warnedReadback = false;
@@ -57,7 +58,14 @@ export class OcclusionCuller {
     }
 
     getStats() {
-        return { ...this._lastStats, width: this.width, height: this.height, enabled: !!this.enabled };
+        return {
+            ...this._lastStats,
+            width: this.width,
+            height: this.height,
+            enabled: !!this.enabled,
+            readbackSupported: !!this._readbackSupported,
+            readbackMode: this._useFloatReadback ? 'float' : 'u16',
+        };
     }
 
     /**
@@ -206,6 +214,11 @@ export class OcclusionCuller {
 
     _sampleDepth01(x, y) {
         const idx = (y * this.width + x);
+        if (this._depthF32) {
+            // DEPTH_COMPONENT + FLOAT readPixels returns normalized depth in [0..1] (implementation may clamp).
+            const d = this._depthF32[idx];
+            return Number.isFinite(d) ? d : NaN;
+        }
         if (this._depthU32) {
             // DEPTH_COMPONENT + UNSIGNED_SHORT readPixels returns 0..65535 mapping to [0..1].
             return this._depthU32[idx] / 65535.0;
@@ -280,6 +293,7 @@ export class OcclusionCuller {
         // Allocate CPU readback buffers.
         // Keep the field name _depthU32 to minimize changes elsewhere, but it now stores u16 depth samples.
         this._depthU32 = new Uint16Array(this.width * this.height);
+        this._depthF32 = null;
         this._useFloatReadback = false; // legacy
         this._lastStats.lastReadbackOk = false;
         this._readbackSupported = true;
@@ -310,6 +324,27 @@ export class OcclusionCuller {
             ok = false;
         }
 
+        // Fallback: some ANGLE/GPU combos reject DEPTH_COMPONENT + UNSIGNED_SHORT with INVALID_ENUM.
+        // Try float readback (still normalized 0..1), which tends to be more broadly supported.
+        if (!ok) {
+            try {
+                if (!this._depthF32 || this._depthF32.length !== (this.width * this.height)) {
+                    this._depthF32 = new Float32Array(this.width * this.height);
+                }
+                try { gl.getError(); } catch { /* ignore */ }
+                gl.readPixels(0, 0, this.width, this.height, gl.DEPTH_COMPONENT, gl.FLOAT, this._depthF32);
+                const e2 = gl.getError();
+                ok = (e2 === gl.NO_ERROR);
+                this._useFloatReadback = ok;
+            } catch {
+                ok = false;
+                this._useFloatReadback = false;
+            }
+        } else {
+            // Successful u16 readback => ignore any float buffer.
+            this._depthF32 = null;
+        }
+
         gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
         this._lastStats.lastReadbackOk = !!ok;
         if (!ok) {
@@ -333,6 +368,7 @@ export class OcclusionCuller {
         this._depthTex = null;
         this._fbo = null;
         this._depthU32 = null;
+        this._depthF32 = null;
         this._useFloatReadback = false;
         this._lastStats.lastReadbackOk = false;
     }

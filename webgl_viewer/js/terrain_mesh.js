@@ -1,8 +1,8 @@
 export class TerrainMesh {
-    constructor(gl, program) {
+    constructor(gl) {
         this.gl = gl;
-        this.program = program;
-        this.vao = null;
+        /** @type {Map<any, any>} */
+        this._vaosByProgram = new Map(); // Map<WebGLProgram, WebGLVertexArrayObject>
         this.vertexBuffer = null;
         this.indexBuffer = null;
         this.vertexCount = 0;
@@ -119,16 +119,30 @@ export class TerrainMesh {
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indexArray, gl.STATIC_DRAW);
 
-        // Create and configure VAO so other renderers don't clobber attribute state.
-        this.vao = gl.createVertexArray();
-        gl.bindVertexArray(this.vao);
+        this.vertexCount = vcount;
+        this.indexCount = indices.length;
+    }
+
+    /**
+     * @param {{ program: any }} shaderProgram - expects a `.program` WebGLProgram handle (see ShaderProgram).
+     * @returns {any} WebGLVertexArrayObject
+     */
+    _getOrCreateVao(shaderProgram) {
+        const gl = this.gl;
+        const prog = shaderProgram?.program;
+        if (!prog) return null;
+        if (this._vaosByProgram.has(prog)) return this._vaosByProgram.get(prog);
+        if (!this.vertexBuffer || !this.indexBuffer || !this.indexType) return null;
+
+        const vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
 
         // Bind buffers while VAO is bound (captures bindings + attrib pointers)
         gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
 
         const bindAttrib = (name, size, offsetBytes) => {
-            const loc = gl.getAttribLocation(this.program.program, name);
+            const loc = gl.getAttribLocation(prog, name);
             if (loc === -1) return;
             gl.enableVertexAttribArray(loc);
             gl.vertexAttribPointer(loc, size, gl.FLOAT, false, this.vertexStride, offsetBytes);
@@ -142,24 +156,27 @@ export class TerrainMesh {
         bindAttrib('aColor0', 2, 48);
 
         gl.bindVertexArray(null);
-
-        this.vertexCount = vcount;
-        this.indexCount = indices.length;
+        this._vaosByProgram.set(prog, vao);
+        return vao;
     }
 
-    render() {
-        if (!this.vao || !this.indexBuffer || !this.indexType) return;
+    /**
+     * @param {{ program: any }} shaderProgram - expects a `.program` WebGLProgram handle (see ShaderProgram).
+     */
+    render(shaderProgram) {
+        const vao = this._getOrCreateVao(shaderProgram);
+        if (!vao || !this.indexBuffer || !this.indexType) return;
         const gl = this.gl;
-        gl.bindVertexArray(this.vao);
+        gl.bindVertexArray(vao);
         gl.drawElements(gl.TRIANGLES, this.indexCount, this.indexType, 0);
         gl.bindVertexArray(null);
     }
 
     dispose() {
-        if (this.vao) {
-            this.gl.deleteVertexArray(this.vao);
-            this.vao = null;
+        for (const vao of this._vaosByProgram.values()) {
+            try { this.gl.deleteVertexArray(vao); } catch { /* ignore */ }
         }
+        this._vaosByProgram.clear();
         if (this.vertexBuffer) {
             this.gl.deleteBuffer(this.vertexBuffer);
             this.vertexBuffer = null;

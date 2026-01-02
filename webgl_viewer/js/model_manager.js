@@ -32,6 +32,30 @@ export class ModelManager {
         // we still want "0 missing": render a small placeholder mesh instead.
         this.enablePlaceholderMeshes = true;
         this._placeholderMesh = this._createPlaceholderMesh();
+
+        // Optional CodeWalker shader param name map (hash -> enum name).
+        // When present (assets/shader_param_names.json), we can resolve shaderParams.*ByHash into
+        // friendly names and auto-populate common material fields from vectorsByHash.
+        this._shaderParamNameMap = null; // { [hashStr]: name }
+        this._shaderParamNameMapPromise = null; // Promise<void> | null
+    }
+
+    _kickoffShaderParamNameMapLoad() {
+        if (this._shaderParamNameMap || this._shaderParamNameMapPromise) return;
+        this._shaderParamNameMapPromise = (async () => {
+            try {
+                const data = await fetchJSON('assets/shader_param_names.json', { priority: 'low' });
+                const byHash = data?.byHash;
+                if (byHash && typeof byHash === 'object') {
+                    this._shaderParamNameMap = byHash;
+                }
+            } catch {
+                // Optional file; ignore.
+            } finally {
+                // Prevent unbounded promise retention even if it failed.
+                this._shaderParamNameMapPromise = null;
+            }
+        })();
     }
 
     /**
@@ -146,6 +170,247 @@ export class ModelManager {
         return out;
     }
 
+    _looksLikePathOrFile(s) {
+        const t = String(s || '').trim();
+        if (!t) return false;
+        if (t.includes('/') || t.includes('\\')) return true;
+        // Common texture extensions we might see in manifests.
+        if (/\.(png|ktx2|jpg|jpeg|webp|dds)$/i.test(t)) return true;
+        return false;
+    }
+
+    _slugifyTextureName(name) {
+        // Match exporter-style filenames like "<hash>_prop_lod.png" from "Prop_LOD".
+        const s = String(name || '').trim().toLowerCase();
+        if (!s) return '';
+        return s
+            .replace(/[^a-z0-9]+/g, '_')
+            .replace(/^_+/, '')
+            .replace(/_+$/, '');
+    }
+
+    _textureRelFromShaderParamValue(v) {
+        // ShaderParam payloads commonly store just a texture name (e.g. "Prop_LOD"),
+        // but may also store a direct relative path.
+        const s0 = String(v || '').trim();
+        if (!s0) return null;
+        const s = s0.replace(/\\/g, '/');
+        if (this._looksLikePathOrFile(s)) {
+            // Keep as a manifest-relative path; strip any leading "assets/" to avoid doubling.
+            return s.replace(/^assets\//i, '');
+        }
+
+        const slug = this._slugifyTextureName(s);
+        const h = joaat(s);
+        // Viewer expects texture files to live under assets/models_textures/...
+        //
+        // IMPORTANT: The export pipeline commonly writes *hash-only* filenames (e.g. "123.png")
+        // into assets/models_textures/. Using hash+slug here causes lots of avoidable 404s when
+        // only the hash-only variant exists.
+        //
+        // Manifests typically store paths relative to assets/ (without the assets/ prefix).
+        // If/when we need human-readable names, we can build them into an index instead.
+        return `models_textures/${h}.png`;
+    }
+
+    _resolveShaderParamName(hashStr) {
+        const h = String(hashStr || '').trim();
+        if (!h) return null;
+        const m = this._shaderParamNameMap;
+        if (m && typeof m === 'object') {
+            const n = m[h] ?? m[String(Number(h))];
+            if (typeof n === 'string' && n) return n;
+        }
+        return null;
+    }
+
+    _vec4First(v, fallback = null) {
+        // shaderParams.vectorsByHash values are arrays (vec4-ish). Sometimes scalars are stored as [x,0,0,0].
+        if (!Array.isArray(v) || v.length < 1) return fallback;
+        const x = Number(v[0]);
+        return Number.isFinite(x) ? x : fallback;
+    }
+
+    _vec3FromVec4(v, fallback = null) {
+        if (!Array.isArray(v) || v.length < 3) return fallback;
+        const x = Number(v[0]), y = Number(v[1]), z = Number(v[2]);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return fallback;
+        return [x, y, z];
+    }
+
+    _resolveShaderParamsForDebugInPlace(mat) {
+        // Provide a resolved view of shaderParams for debugging / parity checks.
+        if (!mat || typeof mat !== 'object') return;
+        if (mat.shaderParamsResolved) return;
+        const sp = mat.shaderParams;
+        if (!sp || typeof sp !== 'object') return;
+
+        // Kick off map load (async). Resolution will become available later in the session.
+        if (!this._shaderParamNameMap) this._kickoffShaderParamNameMapLoad();
+
+        const texByHash = sp.texturesByHash;
+        const vecByHash = sp.vectorsByHash;
+        const map = this._shaderParamNameMap;
+        if (!map || typeof map !== 'object') return; // can't resolve yet
+
+        /** @type {Record<string, any>} */
+        const texturesByName = {};
+        /** @type {Record<string, any>} */
+        const vectorsByName = {};
+
+        if (texByHash && typeof texByHash === 'object') {
+            for (const [k, v] of Object.entries(texByHash)) {
+                const name = this._resolveShaderParamName(k) || k;
+                texturesByName[String(name)] = v;
+            }
+        }
+        if (vecByHash && typeof vecByHash === 'object') {
+            for (const [k, v] of Object.entries(vecByHash)) {
+                const name = this._resolveShaderParamName(k) || k;
+                vectorsByName[String(name)] = v;
+            }
+        }
+        mat.shaderParamsResolved = { texturesByName, vectorsByName };
+    }
+
+    _applyCommonMaterialFieldsFromShaderParamsInPlace(mat) {
+        // Convert common CodeWalker shader scalar/vector params into viewer-friendly material fields
+        // that InstancedModelRenderer already understands.
+        if (!mat || typeof mat !== 'object') return;
+        const sp = mat.shaderParams;
+        const vecByHash = (sp && typeof sp === 'object') ? sp.vectorsByHash : null;
+        if (!vecByHash || typeof vecByHash !== 'object') return;
+
+        // Kick off async map load; we'll also support a minimal hardcoded mapping (hash-based)
+        // for the most important fields so this works even without shader_param_names.json.
+        if (!this._shaderParamNameMap) this._kickoffShaderParamNameMapLoad();
+
+        const setIfAbsentNum = (key, val) => {
+            if (val === null || val === undefined) return;
+            if (mat[key] !== undefined && mat[key] !== null) return;
+            const n = Number(val);
+            if (!Number.isFinite(n)) return;
+            mat[key] = n;
+        };
+        const setIfAbsentArr3 = (key, v3) => {
+            if (!v3) return;
+            if (mat[key] !== undefined && mat[key] !== null) return;
+            mat[key] = v3;
+        };
+
+        const getVec = (hashStr) => vecByHash[String(hashStr)] ?? vecByHash[Number(hashStr)] ?? null;
+
+        // Hardcoded hashes (from CodeWalker ShaderParams.cs)
+        // bumpiness=4134611841, SpecularIntensity=2841625909, SpecularPower=2313518026,
+        // AlphaScale=931055822, alphaTestValue=3310830370, emissiveMultiplier=1592520008,
+        // globalAnimUV0=3617324062, globalAnimUV1=3126116752
+        setIfAbsentNum('bumpiness', this._vec4First(getVec('4134611841'), null));
+        setIfAbsentNum('specularIntensity', this._vec4First(getVec('2841625909'), null));
+        setIfAbsentNum('specularPower', this._vec4First(getVec('2313518026'), null));
+        setIfAbsentNum('alphaScale', this._vec4First(getVec('931055822'), null));
+        setIfAbsentNum('alphaCutoff', this._vec4First(getVec('3310830370'), null));
+        setIfAbsentNum('emissiveIntensity', this._vec4First(getVec('1592520008'), null));
+        setIfAbsentArr3('globalAnimUV0', this._vec3FromVec4(getVec('3617324062'), null));
+        setIfAbsentArr3('globalAnimUV1', this._vec3FromVec4(getVec('3126116752'), null));
+
+        // If we have a name map, also accept name-based fields (future-proof).
+        const map = this._shaderParamNameMap;
+        if (!map || typeof map !== 'object') return;
+        for (const [hashStr, v] of Object.entries(vecByHash)) {
+            const nm = this._resolveShaderParamName(hashStr);
+            if (!nm) continue;
+            if (nm === 'bumpiness') setIfAbsentNum('bumpiness', this._vec4First(v, null));
+            else if (nm === 'SpecularIntensity' || nm === 'gSpecularIntensity') setIfAbsentNum('specularIntensity', this._vec4First(v, null));
+            else if (nm === 'SpecularPower' || nm === 'gSpecularExponent' || nm === 'specularExponent') setIfAbsentNum('specularPower', this._vec4First(v, null));
+            else if (nm === 'AlphaScale') setIfAbsentNum('alphaScale', this._vec4First(v, null));
+            else if (nm === 'alphaTestValue') setIfAbsentNum('alphaCutoff', this._vec4First(v, null));
+            else if (nm === 'emissiveMultiplier') setIfAbsentNum('emissiveIntensity', this._vec4First(v, null));
+            else if (nm === 'globalAnimUV0') setIfAbsentArr3('globalAnimUV0', this._vec3FromVec4(v, null));
+            else if (nm === 'globalAnimUV1') setIfAbsentArr3('globalAnimUV1', this._vec3FromVec4(v, null));
+        }
+    }
+
+    _normalizeMaterialFromShaderParamsInPlace(mat) {
+        // Some exporters only populate `shaderParams.texturesByHash` (CodeWalker-style),
+        // and omit viewer-friendly keys like `diffuse` / `normal` / `spec`.
+        // We patch-in best-effort defaults so textures are at least requested.
+        if (!mat || typeof mat !== 'object') return;
+        const sp = mat.shaderParams;
+        const texByHash = (sp && typeof sp === 'object') ? sp.texturesByHash : null;
+        if (!texByHash || typeof texByHash !== 'object') return;
+
+        // CodeWalker ShaderParamNames hashes (see CodeWalker.Core/GameFiles/Resources/ShaderParams.cs).
+        // We only map fields the viewer actually understands.
+        //
+        // Observed in your manifest.json (top keys):
+        // - DiffuseSampler=4059966321
+        // - BumpSampler=1186448975
+        // - SpecSampler=1619499462
+        // - DetailSampler=3393362404
+        // - DiffuseSampler2=181641832
+        // - TextureSampler_layer0=3576369631  (layered materials; best-effort fallback to diffuse)
+        // - DiffuseHfSampler=2946270081       (best-effort fallback to diffuse)
+        // - BumpSampler_layer0..3=1073714531/1422769919/2745359528/2975430677 (fallback to normal)
+        const SLOTS = [
+            { key: 'diffuse', hashes: ['4059966321', '3576369631', '2946270081'] },
+            { key: 'diffuse2', hashes: ['181641832'] },
+            { key: 'normal', hashes: ['1186448975', '1073714531', '1422769919', '2745359528', '2975430677'] },
+            { key: 'spec', hashes: ['1619499462'] },
+            { key: 'detail', hashes: ['3393362404'] },
+            { key: 'ao', hashes: ['1212577329'] },
+            { key: 'alphaMask', hashes: ['1705051233'] },
+        ];
+
+        const getHashVal = (hashStr) => {
+            const h = String(hashStr || '');
+            return texByHash[h] ?? texByHash[Number(h)] ?? null;
+        };
+
+        for (const s of SLOTS) {
+            if (typeof mat[s.key] === 'string' && mat[s.key]) continue; // already present
+            for (const hash of (s.hashes || [])) {
+                const v = getHashVal(hash);
+                if (typeof v !== 'string' || !v) continue;
+                const rel = this._textureRelFromShaderParamValue(v);
+                if (rel) {
+                    mat[s.key] = rel;
+                    break;
+                }
+            }
+        }
+
+        // Also pull common scalar/vector fields out of vectorsByHash where possible.
+        try { this._applyCommonMaterialFieldsFromShaderParamsInPlace(mat); } catch { /* ignore */ }
+        try { this._resolveShaderParamsForDebugInPlace(mat); } catch { /* ignore */ }
+    }
+
+    _normalizeManifestMeshEntryInPlace(entry) {
+        if (!entry || typeof entry !== 'object') return;
+        if (entry.__viewerNormalizedMaterials) return;
+
+        try {
+            this._normalizeMaterialFromShaderParamsInPlace(entry.material);
+        } catch { /* ignore */ }
+
+        try {
+            const lods = entry.lods;
+            if (lods && typeof lods === 'object') {
+                for (const lodMeta of Object.values(lods)) {
+                    if (!lodMeta || typeof lodMeta !== 'object') continue;
+                    const subs = lodMeta.submeshes;
+                    if (!Array.isArray(subs)) continue;
+                    for (const sm of subs) {
+                        if (!sm || typeof sm !== 'object') continue;
+                        this._normalizeMaterialFromShaderParamsInPlace(sm.material);
+                    }
+                }
+            }
+        } catch { /* ignore */ }
+
+        // Mark so we don't redo this work on every call site.
+        entry.__viewerNormalizedMaterials = true;
+    }
+
     /**
      * Build a stable "material signature" string so we can group meshes/submeshes that
      * effectively use the same material (diffuse/normal/spec + scalar params + UV transform).
@@ -174,6 +439,13 @@ export class ModelManager {
             aoKtx2: (typeof m.aoKtx2 === 'string' && m.aoKtx2) ? m.aoKtx2 : null,
             alphaMask: (typeof m.alphaMask === 'string' && m.alphaMask) ? m.alphaMask : null,
             alphaMaskKtx2: (typeof m.alphaMaskKtx2 === 'string' && m.alphaMaskKtx2) ? m.alphaMaskKtx2 : null,
+            // Per-texture UV selectors (viewer-side feature; prevents batching incompatible UV choices).
+            // Accept either "*UvSet" numeric fields or "*Uv" string fields ("uv0"/"uv1"/"uv2").
+            normalUvSet: (m.normalUvSet ?? m.normalUv ?? null),
+            specUvSet: (m.specUvSet ?? m.specUv ?? null),
+            detailUvSet: (m.detailUvSet ?? m.detailUv ?? null),
+            aoUvSet: (m.aoUvSet ?? m.aoUv ?? null),
+            emissiveUvSet: (m.emissiveUvSet ?? m.emissiveUv ?? null),
             uv0ScaleOffset: this._normalizeUv0ScaleOffset(m.uv0ScaleOffset),
             globalAnimUV0: (Array.isArray(m.globalAnimUV0) && m.globalAnimUV0.length >= 3)
                 ? [this._roundNum(m.globalAnimUV0[0]), this._roundNum(m.globalAnimUV0[1]), this._roundNum(m.globalAnimUV0[2])]
@@ -518,6 +790,9 @@ export class ModelManager {
         if (!h) return [];
         if (!this.manifest || !this.manifest.meshes || !this.manifest.meshes[h]) return [];
         const metaEntry = this.manifest.meshes[h];
+        // Normalize materials lazily (only for entries we actually touch at runtime).
+        // This keeps startup fast even with huge manifests.
+        this._normalizeManifestMeshEntryInPlace(metaEntry);
         const lodMeta = this._getLodMetaEntry(h, lod);
         if (!lodMeta) return [];
         const entryMat = metaEntry?.material ?? null;

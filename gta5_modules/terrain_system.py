@@ -317,6 +317,9 @@ class TerrainSystem:
         # real per-cell LODs; this is kept for future work and debug tooling.
         self.lod_cell_levels: List[Dict[str, Any]] = []
         self.initialized: bool = False
+
+        # Parity/provenance
+        self.parity_texture_sources: list[dict] = []
         
     def extract_terrain(self) -> bool:
         """Extract terrain data from game files"""
@@ -1184,7 +1187,37 @@ class TerrainSystem:
                 "cs_rsn_sl_uwshell_0001",
             ]
 
+            # Prefer DLC-aware resolution via GameFileCache.YtdDict when available.
+            def resolve_ytd_entry_by_base(base_name: str):
+                try:
+                    gfc = self.dll_manager.get_game_file_cache()
+                    if gfc is None or not getattr(gfc, "IsInited", False):
+                        return None
+                    from .hash import jenkins_hash
+                    h = int(jenkins_hash(str(base_name))) & 0xFFFFFFFF
+                    d = getattr(gfc, "YtdDict", None)
+                    if d is None:
+                        return None
+                    # Dictionary<uint, RpfFileEntry>: try direct indexer first.
+                    try:
+                        return d[h]
+                    except Exception:
+                        pass
+                    # Fallback: iterate KeyValuePairs.
+                    for kv in d:
+                        try:
+                            k = int(getattr(kv, "Key", None) or kv.Key) & 0xFFFFFFFF
+                            if k != h:
+                                continue
+                            return getattr(kv, "Value", None) or kv.Value
+                        except Exception:
+                            continue
+                    return None
+                except Exception:
+                    return None
+
             def find_ytd_paths_by_name(ytd_filename: str) -> List[str]:
+                # Back-compat fallback (scan-order dependent): keep only if we can’t use GameFileCache dicts.
                 matches: List[str] = []
                 all_rpfs = getattr(self.rpf_manager, "AllRpfs", None)
                 if not all_rpfs:
@@ -1218,13 +1251,32 @@ class TerrainSystem:
             texture_info: Dict[str, Any] = {}
 
             for base in wanted:
-                ytd_paths = find_ytd_paths_by_name(f"{base}.ytd")
-                if not ytd_paths:
-                    continue
+                ytd_entry = resolve_ytd_entry_by_base(base)
+                ytd_path = str(getattr(ytd_entry, "Path", "") or "") if ytd_entry is not None else ""
+                if not ytd_path:
+                    ytd_paths = find_ytd_paths_by_name(f"{base}.ytd")
+                    if not ytd_paths:
+                        continue
+                    ytd_path = ytd_paths[0]
 
-                ytd = self.rpf_reader.get_ytd(ytd_paths[0])
+                ytd = self.rpf_reader.get_ytd(ytd_path)
                 if not ytd:
                     continue
+
+                # Parity/provenance: hash the source YTD once per base texture (best effort).
+                try:
+                    from .provenance_tools import sha1_hex
+                    data = self.rpf_manager.GetFileData(ytd_path)
+                    b = bytes(data) if data else b""
+                    self.parity_texture_sources.append({
+                        "type": "ytd",
+                        "ytd_path": ytd_path,
+                        "base": base,
+                        "source_size": int(len(b)),
+                        "source_sha1": sha1_hex(b),
+                    })
+                except Exception:
+                    pass
 
                 ytd_textures = self.rpf_reader.get_ytd_textures(ytd)
                 if not ytd_textures:

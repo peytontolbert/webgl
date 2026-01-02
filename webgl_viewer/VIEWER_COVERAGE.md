@@ -28,8 +28,9 @@ Legend:
   - Viewer chooses per-archetype LOD using exported `lodDistances` when present
   - Missing the broader GTA LOD system: parent/child LOD links, HD↔LOD entity swaps, per-entity LOD overrides
 
-- **Missing**: Occlusion/portal systems
-  - No occlusion meshes, no portal/room culling, no interior visibility gating
+- **Partial**: Occlusion/portal systems
+  - Basic occlusion culling exists via a depth prepass for streamed instances
+  - Missing GTA-style occlusion meshes, portal/room culling, and interior visibility gating
 
 ### Asset metadata + formats
 
@@ -42,8 +43,8 @@ Legend:
 
 - **Partial**: Texture pipeline
   - `TextureStreamer` provides GPU memory caps + LRU eviction + quality downscale modes
-  - Only a **single optional diffuse** texture is used in instanced model shading today
-  - No normal/spec/roughness/metalness/tint palettes/multi-layer materials like GTA
+  - Instanced model shading supports **diffuse/diffuse2, normal, spec, detail, emissive, AO, alpha-mask**, UV-set selection, per-material UV0 scale/offset, and optional tint palettes (when exported in the manifest)
+  - Still missing full GTA material/shader parity: reflection probes/cubemaps, many shader families/variants, and timecycle-driven lighting integration
 
 ### Rendering (what you see)
 
@@ -58,20 +59,23 @@ Legend:
 
 - **Covered (basic)**: Instanced drawable rendering
   - `InstancedModelRenderer` draws per-archetype instances using per-instance matrices (GPU instancing)
-  - Uses normals if exported, and optional diffuse textures
+  - Uses exported normals/tangents/vertex colors/UV sets and binds multi-texture materials when present in the manifest
 
 - **Partial**: Culling
   - Chunk-level frustum culling is implemented (AABB vs frustum planes)
   - No per-instance frustum culling; no occlusion culling
 
-- **Missing**: Shadows
-  - Reference GLSL exists in `js/shaders/*`, but it’s **not wired** into the runtime pipeline
+- **Partial**: Shadows
+  - Terrain deferred path now renders a **single directional shadow map** (WebGL2) and applies it in `js/shaders/terrain.*` via `js/shaders/shadowmap.glsl`
+  - Instanced drawables/buildings do **not** yet cast/receive shadows (still a parity gap)
 
-- **Missing**: Atmosphere / fog / timecycle
-  - No sky/atmospheric scattering, no fog, no time-of-day grading, no weather
+- **Partial**: Atmosphere / fog / timecycle
+  - Sky gradient pass + depth fog are implemented, with a simple time-of-day driven sun direction
+  - Missing GTA-like timecycle/weather/clouds/volumetrics and proper exposure/tonemapping
 
-- **Missing**: Post-processing / deferred pipeline
-  - Viewer is forward-shaded; MRT/deferred path is not implemented (reference shaders exist)
+- **Partial**: Post-processing / deferred pipeline
+  - Terrain has an experimental **MRT G-buffer + composite** path (WebGL2) in `TerrainRenderer`
+  - The rest of the viewer is still predominantly forward-shaded (no full-scene deferred lighting yet)
 
 ### “Game” systems
 
@@ -87,6 +91,7 @@ Legend:
 - **Missing**: Interiors / MLOs
 
 - **Missing**: Lights (streetlights, emissives, light probes)
+  - Note: emissive textures render, but there are no real light sources/probes/coronas yet
 
 ### Performance + UX
 
@@ -155,15 +160,13 @@ There are two different notions of coverage:
 ## Prioritized backlog (highest ROI next steps)
 
 1. **Wire up a simple shadow pass** (single directional shadow map, no cascades initially).
-2. **Add fog + sky gradient** (cheap depth-based fog makes the world feel much more “real”).
-3. **Export and use richer material metadata**
-   - at minimum: diffuse + normal map + vertex color/tint flag + UV transforms.
+2. **Export + render GTA LOD hierarchy (ymap parent/child swaps)**
+   - this is the biggest “world correctness” gap vs CodeWalker/GTA
+3. **Improve atmosphere/timecycle fidelity**
+   - add weather presets + better fog curves + exposure/tonemapping
 4. **Move heavy chunk work off-thread**
    - Worker for JSONL parsing and/or ENT1 matrix build (and transfer `Float32Array` back).
-5. **Improve LOD logic**
-   - ensure all archetypes have usable `lodDistances`
-   - add a simple “keep lowest LOD beyond distance” rule everywhere (avoid popping back to high)
-6. **Per-instance culling for very dense archetypes**
+5. **Per-instance culling for very dense archetypes**
    - start CPU-side coarse culling (per-chunk/per-archetype AABBs), then consider GPU culling later.
 
 

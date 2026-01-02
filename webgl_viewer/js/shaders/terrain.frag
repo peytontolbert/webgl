@@ -1,5 +1,6 @@
 #version 300 es
 precision highp float;
+precision highp int;
 
 // Common includes
 #include "common.glsl"
@@ -83,13 +84,9 @@ uniform bool uEnableTexture3;
 uniform bool uEnableTexture4;
 uniform bool uEnableTextureMask;
 uniform bool uEnableNormalMap;
-uniform bool uEnableTint;
 uniform bool uEnableVertexColour;
 
 // Lighting uniforms
-uniform vec3 uLightDir;
-uniform vec3 uLightColor;
-uniform float uAmbientIntensity;
 uniform float uSpecularIntensity;
 uniform float uSpecularPower;
 
@@ -111,24 +108,32 @@ void main() {
     vec4 specular = vec4(0.0);
     vec4 irradiance = vec4(0.0);
     
-    // Sample base textures
-    vec4 tex0 = SampleTexture(uColorMap0, vTexcoord0, uEnableTexture0);
+    // Sample blend mask (match heightmap convention: v increases downward in vTexcoord0)
+    vec2 maskUv = vec2(vTexcoord0.x, 1.0 - vTexcoord0.y);
+    vec4 w = SampleTexture(uBlendMask, maskUv, uEnableTextureMask);
+    float sumW = w.r + w.g + w.b + w.a;
+    if (sumW <= 1e-5) {
+        w = vec4(1.0, 0.0, 0.0, 0.0);
+    } else {
+        w /= sumW;
+    }
+
+    // Sample and blend tiled layer textures (use vTexcoord1 for tiling)
+    vec4 tex0 = SampleTexture(uColorMap0, vTexcoord1, uEnableTexture0);
     vec4 tex1 = SampleTexture(uColorMap1, vTexcoord1, uEnableTexture1);
-    vec4 tex2 = SampleTexture(uColorMap2, vTexcoord2, uEnableTexture2);
+    vec4 tex2 = SampleTexture(uColorMap2, vTexcoord1, uEnableTexture2);
     vec4 tex3 = SampleTexture(uColorMap3, vTexcoord1, uEnableTexture3);
-    vec4 tex4 = SampleTexture(uColorMap4, vTexcoord2, uEnableTexture4);
-    
-    // Sample blend mask
-    vec4 blendMask = SampleTexture(uBlendMask, vTexcoord0, uEnableTextureMask);
-    
-    // Blend textures using vertex colors
-    diffuse = BlendTextures(tex0, tex1, vColor0.r);
-    diffuse = BlendTextures(diffuse, tex2, vColor0.g);
-    diffuse = BlendTextures(diffuse, tex3, vColor0.b);
-    diffuse = BlendTextures(diffuse, tex4, vColor0.a);
+    vec4 tex4 = SampleTexture(uColorMap4, vTexcoord1, uEnableTexture4);
+
+    // 4-layer blend using the mask weights. (If uColorMap4 is unused, keep uEnableTexture4=false.)
+    diffuse = (tex0 * w.r) + (tex1 * w.g) + (tex2 * w.b) + (tex3 * w.a);
+    // Optional extra contribution slot (disabled by default)
+    if (uEnableTexture4) {
+        diffuse = BlendTextures(diffuse, tex4, 0.0);
+    }
     
     // Apply tint if enabled
-    if (uEnableTint) {
+    if (uEnableTint != 0u) {
         vec4 tint = texture(uTintPalette, vec2(vTint.x, uTintYVal));
         diffuse *= tint;
     }
@@ -168,7 +173,8 @@ void main() {
     specular = vec4(uSpecularIntensity * specularTerm);
     
     // Calculate irradiance
-    irradiance = vec4(uLightColor * (NdotL + uAmbientIntensity));
+    // uLightColor is vec3; vec4(vec3) is not a valid constructor in GLSL ES 3.00.
+    irradiance = vec4(uLightColor * (NdotL + uAmbientIntensity), 1.0);
     
     // Apply shadows
     float shadow = vShadows.x;

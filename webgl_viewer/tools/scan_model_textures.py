@@ -7,7 +7,7 @@ Common failure modes in the WebGL viewer:
 - Truncated/corrupt PNGs (signature present but missing IHDR, etc.)
 
 This tool:
-- Scans assets/models/models_textures/* (default)
+- Scans assets/models_textures/* (default)
 - Optionally loads assets/models/manifest.json and validates referenced texture paths
 
 Usage (from repo root):
@@ -159,7 +159,7 @@ def load_manifest_texture_paths(manifest_path: Path) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="webgl/webgl_viewer", help="Viewer root containing assets/ (default: webgl/webgl_viewer)")
-    ap.add_argument("--dir", default="assets/models/models_textures", help="Relative directory to scan (default: assets/models/models_textures)")
+    ap.add_argument("--dir", default="assets/models_textures", help="Relative directory to scan (default: assets/models_textures)")
     ap.add_argument("--manifest", default="webgl/webgl_viewer/assets/models/manifest.json", help="Path to models manifest.json (optional)")
     ap.add_argument("--max-print", type=int, default=30, help="Max entries to print per problem type")
     args = ap.parse_args()

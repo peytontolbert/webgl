@@ -6,10 +6,8 @@ Manages CodeWalker DLL integration and shared resources.
 
 import os
 import logging
-import time
-import ctypes
 from pathlib import Path
-from typing import Optional, Tuple, Any, Dict, List, Union
+from typing import Optional, Any, Dict, List, Union
 
 # Initialize Python.NET (robust against the conflicting PyPI `clr` package)
 from .dotnet import clr
@@ -17,10 +15,7 @@ clr.AddReference("System")
 clr.AddReference("System.Core")
 clr.AddReference("System.Numerics")
 
-import System
 from System import Action
-from System.IO import Directory, SearchOption
-from System.Numerics import Vector2, Vector3, Vector4
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -83,6 +78,10 @@ class DllManager:
         # Optional: full world/collision space (heavy). Initialized on-demand.
         self.world_space = None
         self.world_space_inited = False
+
+        # Optional: water heightmap (waterheight.dat). Initialized on-demand.
+        self._watermap_file = None  # WatermapFile instance
+        self._watermap_inited = False
         
         self._initialized = True
         
@@ -221,6 +220,8 @@ class DllManager:
         load_vehicles: bool = False,
         load_peds: bool = False,
         load_audio: bool = False,
+        selected_dlc: Optional[str] = None,
+        enable_mods: Optional[bool] = None,
     ) -> bool:
         """
         Initialize CodeWalker's GameFileCache.
@@ -232,6 +233,24 @@ class DllManager:
             if not self.game_file_cache:
                 logger.error("GameFileCache not created")
                 return False
+
+            # Apply DLC/mod selection BEFORE Init() so CodeWalker builds ActiveMapRpfFiles correctly.
+            try:
+                if selected_dlc is not None:
+                    self.game_file_cache.SelectedDlc = str(selected_dlc)
+                    # CodeWalker sets EnableDlc based on SelectedDlc in the constructor, but if we mutate it
+                    # afterwards, update the flag too.
+                    try:
+                        self.game_file_cache.EnableDlc = bool(str(selected_dlc))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if enable_mods is not None:
+                    self.game_file_cache.EnableMods = bool(enable_mods)
+            except Exception:
+                pass
 
             # Configure for best archetype coverage
             try:
@@ -254,6 +273,18 @@ class DllManager:
             error_log_action = Action[str](error_log)
 
             self.game_file_cache.Init(update_status_action, error_log_action)
+
+            # IMPORTANT: after GameFileCache.Init, CodeWalker has built its own RpfManager (`GameFileCache.RpfMan`)
+            # with DLC overlay/patch logic and the dictionaries that `GameFileCache` depends on.
+            # Prefer that instance as the authoritative VFS so other modules don't accidentally use a
+            # different RpfManager with different override behavior / scan order.
+            try:
+                rpfman = getattr(self.game_file_cache, "RpfMan", None)
+                if rpfman is not None:
+                    self.rpf_manager = rpfman
+            except Exception:
+                # keep existing
+                pass
             return True
         except Exception as e:
             logger.error(f"Error initializing GameFileCache: {e}")
@@ -311,7 +342,6 @@ class DllManager:
                     return False
 
             # Create Space and initialize it.
-            from System import Action
 
             def update_status(msg: str):
                 logger.info(f"WorldSpace: {msg}")
@@ -328,6 +358,182 @@ class DllManager:
             self.world_space = None
             self.world_space_inited = False
             return False
+
+    def init_watermap(self) -> bool:
+        """
+        Initialize CodeWalker's water heightmap (waterheight.dat) via WatermapFile.
+
+        This is separate from collision:
+        - `Space.RayIntersect` does NOT intersect water surfaces.
+        - GTA gameplay treats water as a special surface (swim, boats, etc.).
+
+        We load the `WatermapFile` and use its decompressed `GridWatermapRefs` for sampling.
+        """
+        try:
+            if self._watermap_inited and self._watermap_file is not None:
+                return True
+            if not self.game_file_cache:
+                logger.error("GameFileCache not created")
+                return False
+
+            # Ensure caches are initialized so RpfMan is ready.
+            if not getattr(self.game_file_cache, "IsInited", False):
+                ok = self.init_game_file_cache()
+                if not ok:
+                    return False
+
+            # Load waterheight.dat (same path CodeWalker.World.Watermaps uses).
+            wmf = self.game_file_cache.RpfMan.GetFile[self.WatermapFile]("common.rpf\\data\\levels\\gta5\\waterheight.dat")
+            if wmf is None:
+                logger.error("Failed to load waterheight.dat (WatermapFile is None)")
+                return False
+
+            # Accessing GridWatermapRefs forces the decompressed grid to be available.
+            # (WatermapFile decompresses during Load; this should already be populated.)
+            self._watermap_file = wmf
+            self._watermap_inited = True
+            return True
+        except Exception as e:
+            logger.error(f"Failed to init watermap: {e}")
+            logger.debug("Stack trace:", exc_info=True)
+            self._watermap_file = None
+            self._watermap_inited = False
+            return False
+
+    def get_water_height_at(self, x: float, y: float) -> Optional[float]:
+        """
+        Sample water surface height Z at (x,y) in GTA/data space using waterheight.dat.
+
+        Returns:
+          - float Z if the cell contains water
+          - None if out of bounds or no water entry for that cell
+
+        Notes:
+          - This is a *surface* height, not collision.
+          - Watermap grid coordinates use a top-left origin (CornerX, CornerY) with +X right and +Y down.
+        """
+        try:
+            if not self._watermap_inited or self._watermap_file is None:
+                ok = self.init_watermap()
+                if not ok:
+                    return None
+
+            wmf = self._watermap_file
+            # WatermapFile metadata
+            cx = float(getattr(wmf, "CornerX", 0.0))
+            cy = float(getattr(wmf, "CornerY", 0.0))
+            tx = float(getattr(wmf, "TileX", 0.0))
+            ty = float(getattr(wmf, "TileY", 0.0))
+            w = int(getattr(wmf, "Width", 0))
+            h = int(getattr(wmf, "Height", 0))
+            if w <= 0 or h <= 0 or tx == 0.0 or ty == 0.0:
+                return None
+
+            # Convert world XY -> grid XY (top-left origin).
+            # In CodeWalker.World.Watermaps, they compute:
+            #   min = (CornerX, CornerY, 0)
+            #   step = (TileX, -TileY, 1)
+            # so increasing grid Y moves *down* in world Y (subtract TileY).
+            gx = int((float(x) - cx) / tx)
+            gy = int((cy - float(y)) / ty)
+            if gx < 0 or gx >= w or gy < 0 or gy >= h:
+                return None
+
+            o = gy * w + gx
+            refs = getattr(wmf, "GridWatermapRefs", None)
+            if refs is None:
+                return None
+            harr = refs[o] if o >= 0 and o < len(refs) else None
+            if harr is None or len(harr) == 0:
+                return None
+
+            h0 = harr[0]
+            # WaterItemRef has: Type, Vector, Item, etc.
+            wtype = getattr(h0, "Type", None)
+            vec = getattr(h0, "Vector", None)
+            item = getattr(h0, "Item", None)
+
+            # Match CodeWalker.World.Watermaps.getHeight(...)
+            # River: use ref vector Z; Lake/Pool: use item.Position.Z if available.
+            try:
+                # Enum values are in WatermapFile.WaterItemType; compare by name when possible.
+                tname = str(wtype)
+            except Exception:
+                tname = ""
+
+            if "River" in tname:
+                return float(getattr(vec, "Z", 0.0)) if vec is not None else None
+            if ("Lake" in tname) or ("Pool" in tname):
+                if item is not None:
+                    pos = getattr(item, "Position", None)
+                    if pos is not None:
+                        return float(getattr(pos, "Z", 0.0))
+                # fallback
+                return float(getattr(vec, "Z", 0.0)) if vec is not None else None
+
+            return float(getattr(vec, "Z", 0.0)) if vec is not None else None
+        except Exception as e:
+            logger.error(f"get_water_height_at failed at ({x},{y}): {e}")
+            return None
+
+    def sphere_intersect(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        radius: float,
+        layers: Optional[List[bool]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query CodeWalker's `Space.SphereIntersect` at a given sphere (data-space).
+
+        This is closer to GTA-style "ped capsule touches ground" than a pure raycast,
+        but note it's an *overlap* test, not a swept sphere/capsule cast.
+
+        Args:
+            x,y,z: sphere center
+            radius: sphere radius (data units)
+            layers: optional 3-bool layer filter for YBN bounds store items (default: [True, False, False])
+
+        Returns:
+            dict with keys: hit(bool), position(tuple|None), normal(tuple|None), test_complete(bool|None)
+        """
+        try:
+            if not self.world_space_inited or self.world_space is None:
+                ok = self.init_world_space()
+                if not ok:
+                    return None
+
+            import SharpDX  # type: ignore
+            import System  # type: ignore
+
+            sph = SharpDX.BoundingSphere(SharpDX.Vector3(float(x), float(y), float(z)), float(radius))
+
+            arr = None
+            if layers is not None:
+                # Space expects up to 3 bools (0..2)
+                l0 = bool(layers[0]) if len(layers) > 0 else True
+                l1 = bool(layers[1]) if len(layers) > 1 else False
+                l2 = bool(layers[2]) if len(layers) > 2 else False
+                arr = System.Array[System.Boolean]([l0, l1, l2])
+
+            res = self.world_space.SphereIntersect(sph, arr)
+            hit = bool(getattr(res, "Hit", False))
+            if not hit:
+                return {"hit": False}
+
+            pos = getattr(res, "Position", None)
+            nrm = getattr(res, "Normal", None)
+            tc = getattr(res, "TestComplete", None)
+            return {
+                "hit": True,
+                "position": (float(pos.X), float(pos.Y), float(pos.Z)) if pos is not None else None,
+                "normal": (float(nrm.X), float(nrm.Y), float(nrm.Z)) if nrm is not None else None,
+                "test_complete": bool(tc) if tc is not None else None,
+            }
+        except Exception as e:
+            logger.error(f"sphere_intersect failed at ({x},{y},{z}) r={radius}: {e}")
+            return None
 
     def raycast_down(
         self,
@@ -469,6 +675,16 @@ class DllManager:
         
     def get_rpf_manager(self) -> Any:
         """Get the RPF manager instance"""
+        # Prefer the GameFileCache's RpfMan when available: it is the one used to build
+        # DLC overlay dictionaries and should have the most correct override behavior.
+        try:
+            gfc = self.game_file_cache
+            if gfc is not None and getattr(gfc, "IsInited", False):
+                rpfman = getattr(gfc, "RpfMan", None)
+                if rpfman is not None:
+                    return rpfman
+        except Exception:
+            pass
         return self.rpf_manager
         
     def get_game_cache(self) -> Any:
@@ -488,7 +704,7 @@ class DllManager:
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 
-    def get_ymap_file(self, path_or_data: Union[str, bytes]) -> Optional[Any]:
+    def get_ymap_file(self, path_or_data: Union[str, bytes, Any]) -> Optional[Any]:
         """
         Create a YMAP file object from a path or data
         
@@ -502,18 +718,32 @@ class DllManager:
             if not self.YmapFile:
                 logger.error("YmapFile type not initialized")
                 return None
+
+            # Accept a CodeWalker RpfFileEntry directly (best for parity: caller can use GameFileCache dicts).
+            try:
+                if not isinstance(path_or_data, (str, bytes)) and hasattr(path_or_data, "FileOffset") and hasattr(path_or_data, "Path"):
+                    entry = path_or_data
+                    rpfman = self.get_rpf_manager()
+                    ymap_file = rpfman.GetFile[self.YmapFile](entry)
+                    return ymap_file
+            except Exception:
+                # fall through
+                pass
                 
             if isinstance(path_or_data, str):
+                # Normalize to CodeWalker-style paths (case-insensitive, backslashes).
+                p = str(path_or_data).replace("/", "\\")
                 # Get the file entry first
-                entry = self.rpf_manager.GetEntry(path_or_data)
+                rpfman = self.get_rpf_manager()
+                entry = rpfman.GetEntry(p)
                 if not entry:
-                    logger.error(f"Failed to get YMAP file entry: {path_or_data}")
+                    logger.error(f"Failed to get YMAP file entry: {p}")
                     return None
                     
                 # Load data into YMAP file using RpfManager's GetFile method
-                ymap_file = self.rpf_manager.GetFile[self.YmapFile](entry)
+                ymap_file = rpfman.GetFile[self.YmapFile](entry)
                 if not ymap_file:
-                    logger.error(f"Failed to load YMAP file data: {path_or_data}")
+                    logger.error(f"Failed to load YMAP file data: {p}")
                     return None
                     
                 return ymap_file

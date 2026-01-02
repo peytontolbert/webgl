@@ -125,7 +125,7 @@ function _sendProgress(job) {
   self.postMessage({ type: 'progress', reqId: job.reqId, newHashes: out });
 }
 
-function _accumEntity(job, archetypeId, pos, rotQuat, scale, tintIndex = 0) {
+function _accumEntity(job, archetypeId, pos, rotQuat, scale, tintIndex = 0, guid = 0, mloParentGuid = 0, mloEntitySetHash = 0, mloFlags = 0) {
   const hash = _normalizeId(archetypeId);
   if (!hash) {
     job.badArchetype++;
@@ -173,6 +173,11 @@ function _accumEntity(job, archetypeId, pos, rotQuat, scale, tintIndex = 0) {
   _fromRotationTranslationScale(m, qx, qy, qz, qw, px, py, pz, sx, sy, sz);
   for (let i = 0; i < 16; i++) mats.push(m[i]);
   mats.push(_safeTintIndex(tintIndex, 0));
+  // v3+ metadata (stored as floats so one packed Float32Array can hold everything)
+  mats.push((Number(guid) >>> 0));
+  mats.push((Number(mloParentGuid) >>> 0));
+  mats.push((Number(mloEntitySetHash) >>> 0));
+  mats.push((Number(mloFlags) >>> 0));
 }
 
 function _finalizeNdjsonJob(job) {
@@ -193,7 +198,24 @@ function _finalizeNdjsonJob(job) {
       job.parsed++;
       const a = obj?.archetype;
       if (a !== undefined && a !== null) {
-        _accumEntity(job, a, obj?.position, obj?.rotation_quat, obj?.scale, (obj?.tintIndex ?? obj?.tint));
+        const mloParentGuid = Number(obj?.mlo_parent_guid ?? 0) >>> 0;
+        const mloSetHash = Number(obj?.mlo_entity_set_hash ?? 0) >>> 0;
+        const flags =
+          ((obj?.is_mlo_instance ? 1 : 0) >>> 0) |
+          ((mloParentGuid ? 1 : 0) << 1) |
+          ((mloSetHash ? 1 : 0) << 2);
+        _accumEntity(
+          job,
+          a,
+          obj?.position,
+          obj?.rotation_quat,
+          obj?.scale,
+          (obj?.tintIndex ?? obj?.tint),
+          (obj?.guid ?? 0),
+          mloParentGuid,
+          mloSetHash,
+          flags
+        );
       }
     } catch {
       // ignore
@@ -241,12 +263,15 @@ function _parseEnt1(reqId, camData, buffer) {
 
   const count = dv.getUint32(4, true);
   // ENT1 v1: stride=44 (hash + pos + quat + scale)
-  // ENT1 v2 (best-effort): stride=48 adds a u32 tintIndex after scale.
+  // ENT1 v2: stride=48 adds a u32 tintIndex after scale.
+  // ENT1 v3: stride=64 adds u32 tintIndex + guid + mloParentGuid + mloEntitySetHash + flags
   let stride = 44;
   const start = 8;
   const need44 = start + count * 44;
   const need48 = start + count * 48;
-  if (need48 <= dv.byteLength) stride = 48;
+  const need64 = start + count * 64;
+  if (need64 <= dv.byteLength) stride = 64;
+  else if (need48 <= dv.byteLength) stride = 48;
   else if (need44 <= dv.byteLength) stride = 44;
   else throw new Error('ENT1 truncated');
 
@@ -273,6 +298,10 @@ function _parseEnt1(reqId, camData, buffer) {
     const sy = dv.getFloat32(off + 36, true);
     const sz = dv.getFloat32(off + 40, true);
     const tintIndex = (stride >= 48) ? (dv.getUint32(off + 44, true) >>> 0) : 0;
+    const guid = (stride >= 64) ? (dv.getUint32(off + 48, true) >>> 0) : 0;
+    const mloParentGuid = (stride >= 64) ? (dv.getUint32(off + 52, true) >>> 0) : 0;
+    const mloSetHash = (stride >= 64) ? (dv.getUint32(off + 56, true) >>> 0) : 0;
+    const flags = (stride >= 64) ? (dv.getUint32(off + 60, true) >>> 0) : 0;
 
     archetypeCounts.set(hash, (archetypeCounts.get(hash) ?? 0) + 1);
 
@@ -291,6 +320,10 @@ function _parseEnt1(reqId, camData, buffer) {
     _fromRotationTranslationScale(tmp, qx, qy, qz, qw, px, py, pz, sx, sy, sz);
     for (let k = 0; k < 16; k++) mats.push(tmp[k]);
     mats.push(_safeTintIndex(tintIndex, 0));
+    mats.push(Number(guid));
+    mats.push(Number(mloParentGuid));
+    mats.push(Number(mloSetHash));
+    mats.push(Number(flags));
   }
 
   const packed = _packResults({ matsByHash, minDistByHash, archetypeCounts });
@@ -379,7 +412,24 @@ self.onmessage = (e) => {
           job.parsed++;
           const a = obj?.archetype;
           if (a === undefined || a === null) continue;
-          _accumEntity(job, a, obj?.position, obj?.rotation_quat, obj?.scale, (obj?.tintIndex ?? obj?.tint));
+          const mloParentGuid = Number(obj?.mlo_parent_guid ?? 0) >>> 0;
+          const mloSetHash = Number(obj?.mlo_entity_set_hash ?? 0) >>> 0;
+          const flags =
+            ((obj?.is_mlo_instance ? 1 : 0) >>> 0) |
+            ((mloParentGuid ? 1 : 0) << 1) |
+            ((mloSetHash ? 1 : 0) << 2);
+          _accumEntity(
+            job,
+            a,
+            obj?.position,
+            obj?.rotation_quat,
+            obj?.scale,
+            (obj?.tintIndex ?? obj?.tint),
+            (obj?.guid ?? 0),
+            mloParentGuid,
+            mloSetHash,
+            flags
+          );
         } catch {
           // ignore bad line
         }

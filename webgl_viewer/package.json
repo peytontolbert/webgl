@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build && npm run sync:assets",
-    "build:code": "vite build --emptyOutDir=false",
+    "build:code": "vite build --emptyOutDir=false && npm run sync:assets",
     "sync:assets": "python sync_assets_to_dist.py",
     "preview": "vite preview"
   },
@@ -14,6 +14,7 @@
     "gl-matrix": "^3.4.3"
   },
   "devDependencies": {
+    "sirv": "^2.0.4",
     "vite": "^6.2.3"
   }
 }

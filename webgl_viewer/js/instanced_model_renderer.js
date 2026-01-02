@@ -8,6 +8,7 @@ layout(location=2) in vec2 aTexcoord;
 layout(location=3) in vec4 aTangent;
 layout(location=8) in vec4 aColor0;
 layout(location=9) in vec2 aTexcoord1;
+layout(location=10) in vec2 aTexcoord2;
 
 // mat4 takes 4 attribute slots; we bind at locations 4..7
 layout(location=4) in vec4 aI0;
@@ -29,6 +30,7 @@ out vec3 vN;
 out vec4 vT;
 out vec2 vUv;
 out vec2 vUv1;
+out vec2 vUv2;
 out vec4 vColor0;
 flat out float vTintIndex;
 
@@ -48,6 +50,7 @@ void main() {
     vec2 uvA = vec2(dot(uGlobalAnimUV0, uvw), dot(uGlobalAnimUV1, uvw));
     vUv = uvA * uUv0ScaleOffset.xy + uUv0ScaleOffset.zw;
     vUv1 = aTexcoord1;
+    vUv2 = aTexcoord2;
     vColor0 = aColor0;
     vTintIndex = aTintIndex;
     gl_Position = uViewProjectionMatrix * worldPos;
@@ -61,6 +64,7 @@ in vec3 vN;
 in vec4 vT;
 in vec2 vUv;
 in vec2 vUv1;
+in vec2 vUv2;
 in vec4 vColor0;
 flat in float vTintIndex;
 out vec4 fragColor;
@@ -77,23 +81,29 @@ uniform bool uDiffuse2UseUv1;
 uniform bool uHasNormal;
 uniform sampler2D uNormal;
 uniform float uNormalScale;
+// UV selectors: 0=UV0(vUv), 1=UV1(vUv1), 2=UV2(vUv2)
+uniform int uNormalUvSet;
 uniform bool uHasDetail;
 uniform sampler2D uDetail;
 uniform vec4 uDetailSettings; // x,y,z,w (BasicPS uses y as intensity, zw as UV scale)
+uniform int uDetailUvSet;
 
 uniform bool uHasSpec;
 uniform sampler2D uSpec;
 uniform float uSpecularIntensity;
 uniform float uSpecularPower;
 uniform vec3 uSpecMaskWeights; // dot(spec.rgb, weights)
+uniform int uSpecUvSet;
 
 uniform bool uHasEmissive;
 uniform sampler2D uEmissive;
 uniform float uEmissiveIntensity;
+uniform int uEmissiveUvSet;
 
 uniform bool uHasAO;
 uniform sampler2D uAO;
 uniform float uAOStrength;
+uniform int uAOUvSet;
 
 // Tiny tint palette (optional). Index 0 should be white/no-tint.
 uniform bool uEnableTintPalette;
@@ -102,7 +112,9 @@ uniform sampler2D uTintPalette;
 // Color pipeline:
 // - When textures are uploaded as sRGB (preferred), sampling returns linear and uDecodeSrgb should be false.
 // - When sRGB textures aren't supported, we upload as RGBA and must decode manually in shader.
-uniform bool uDecodeSrgb;
+uniform bool uDecodeDiffuseSrgb;
+uniform bool uDecodeDiffuse2Srgb;
+uniform bool uDecodeEmissiveSrgb;
 
 // Normal map decode:
 // uNormalEncoding: 0=RG (default), 1=AG (common for packed normals)
@@ -145,6 +157,12 @@ vec3 encodeSrgb(vec3 c) {
     return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
 }
 
+vec2 selectUv(int uvSet) {
+    if (uvSet == 2) return vUv2;
+    if (uvSet == 1) return vUv1;
+    return vUv;
+}
+
 void main() {
     vec3 N = normalize(vN);
     vec3 T = normalize(vT.xyz);
@@ -156,7 +174,7 @@ void main() {
         float outA = 1.0;
         if (uHasDiffuse) {
             vec4 d = texture(uDiffuse, vUv);
-            vec3 drgb = uDecodeSrgb ? decodeSrgb(d.rgb) : d.rgb;
+            vec3 drgb = uDecodeDiffuseSrgb ? decodeSrgb(d.rgb) : d.rgb;
             base *= drgb;
             outA = d.a;
         }
@@ -186,7 +204,7 @@ void main() {
         float outA = 0.25;
         if (uHasDiffuse) {
             vec4 d = texture(uDiffuse, vUv);
-            vec3 drgb = uDecodeSrgb ? decodeSrgb(d.rgb) : d.rgb;
+            vec3 drgb = uDecodeDiffuseSrgb ? decodeSrgb(d.rgb) : d.rgb;
             base *= drgb;
             outA = d.a;
         }
@@ -215,15 +233,19 @@ void main() {
     // - Uses XY only (reconstructs Z by default)
     // - Detail normal is sampled twice and blended in *before* (XY*2-1), weighted by specmap alpha (sv.w)
     if (uHasNormal) {
-        vec4 ntex = texture(uNormal, vUv);
+        vec2 uvN = selectUv(uNormalUvSet);
+        vec2 uvS = selectUv(uSpecUvSet);
+        vec2 uvD = selectUv(uDetailUvSet);
+
+        vec4 ntex = texture(uNormal, uvN);
         // Normal map stores XY in 0..1
         vec2 nmv = (uNormalEncoding == 1) ? ntex.ag : ntex.rg;
 
         // Specmap alpha is used as a weight for detail normal contribution in CodeWalker.
-        vec4 sv = uHasSpec ? texture(uSpec, vUv) : vec4(0.1);
+        vec4 sv = uHasSpec ? texture(uSpec, uvS) : vec4(0.1);
 
         if (uHasDetail) {
-            vec2 uv0 = vUv * max(vec2(0.0), uDetailSettings.zw);
+            vec2 uv0 = uvD * max(vec2(0.0), uDetailSettings.zw);
             vec2 uv1 = uv0 * 3.17;
             vec2 d0 = texture(uDetail, uv0).xy - vec2(0.5);
             vec2 d1 = texture(uDetail, uv1).xy - vec2(0.5);
@@ -251,7 +273,7 @@ void main() {
     float outA = 1.0;
     if (uHasDiffuse) {
         vec4 d = texture(uDiffuse, vUv);
-        vec3 drgb = uDecodeSrgb ? decodeSrgb(d.rgb) : d.rgb;
+        vec3 drgb = uDecodeDiffuseSrgb ? decodeSrgb(d.rgb) : d.rgb;
         base *= drgb;
         outA = clamp(d.a * max(0.0, uAlphaScale), 0.0, 1.0);
     }
@@ -259,7 +281,7 @@ void main() {
     if (uHasDiffuse2) {
         vec2 uvD2 = uDiffuse2UseUv1 ? vUv1 : vUv;
         vec4 d2 = texture(uDiffuse2, uvD2);
-        vec3 d2rgb = uDecodeSrgb ? decodeSrgb(d2.rgb) : d2.rgb;
+        vec3 d2rgb = uDecodeDiffuse2Srgb ? decodeSrgb(d2.rgb) : d2.rgb;
         float a2 = clamp(d2.a, 0.0, 1.0);
         vec3 d2col = uColor * d2rgb;
         base = mix(base, d2col, a2);
@@ -275,7 +297,8 @@ void main() {
 
     // AO (multiply base)
     if (uHasAO) {
-        float ao = texture(uAO, vUv).r;
+        vec2 uvAO = selectUv(uAOUvSet);
+        float ao = texture(uAO, uvAO).r;
         float k = clamp(uAOStrength, 0.0, 2.0);
         base *= mix(vec3(1.0), vec3(ao), k);
     }
@@ -301,7 +324,8 @@ void main() {
     // refl = reflect(incident, norm)
     // specp = max(exp(saturate(dot(refl, LightDir))*10)-1, 0)
     // spec += LightDirColour * 0.00006 * specp * sv.x * specularIntensityMult
-    vec4 sv = uHasSpec ? texture(uSpec, vUv) : vec4(0.1);
+    vec2 uvS2 = selectUv(uSpecUvSet);
+    vec4 sv = uHasSpec ? texture(uSpec, uvS2) : vec4(0.1);
     sv.rg *= sv.rg; // CodeWalker squares sv.xy before using sv.x
     vec3 incident = normalize(vWorldPos - uCameraPos);
     vec3 refl = normalize(reflect(incident, N));
@@ -312,8 +336,9 @@ void main() {
 
     // Emissive (additive)
     if (uHasEmissive) {
-        vec3 e0 = texture(uEmissive, vUv).rgb;
-        vec3 e = uDecodeSrgb ? decodeSrgb(e0) : e0;
+        vec2 uvE = selectUv(uEmissiveUvSet);
+        vec3 e0 = texture(uEmissive, uvE).rgb;
+        vec3 e = uDecodeEmissiveSrgb ? decodeSrgb(e0) : e0;
         c += e * max(0.0, uEmissiveIntensity);
     }
 
@@ -402,7 +427,7 @@ export class InstancedModelRenderer {
         try {
             const a = matricesFloat32;
             if (!a || a.length < 16) return null;
-            const stride = ((a.length % 17) === 0) ? 17 : 16;
+            const stride = ((a.length % 21) === 0) ? 21 : (((a.length % 17) === 0) ? 17 : 16);
             const minT = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
             const maxT = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY];
             let maxScale = 1.0;
@@ -500,28 +525,35 @@ export class InstancedModelRenderer {
             uHasNormal: this.gl.getUniformLocation(this.program.program, 'uHasNormal'),
             uNormal: this.gl.getUniformLocation(this.program.program, 'uNormal'),
             uNormalScale: this.gl.getUniformLocation(this.program.program, 'uNormalScale'),
+            uNormalUvSet: this.gl.getUniformLocation(this.program.program, 'uNormalUvSet'),
             uHasDetail: this.gl.getUniformLocation(this.program.program, 'uHasDetail'),
             uDetail: this.gl.getUniformLocation(this.program.program, 'uDetail'),
             uDetailSettings: this.gl.getUniformLocation(this.program.program, 'uDetailSettings'),
+            uDetailUvSet: this.gl.getUniformLocation(this.program.program, 'uDetailUvSet'),
 
             uHasSpec: this.gl.getUniformLocation(this.program.program, 'uHasSpec'),
             uSpec: this.gl.getUniformLocation(this.program.program, 'uSpec'),
             uSpecularIntensity: this.gl.getUniformLocation(this.program.program, 'uSpecularIntensity'),
             uSpecularPower: this.gl.getUniformLocation(this.program.program, 'uSpecularPower'),
             uSpecMaskWeights: this.gl.getUniformLocation(this.program.program, 'uSpecMaskWeights'),
+            uSpecUvSet: this.gl.getUniformLocation(this.program.program, 'uSpecUvSet'),
 
             uHasEmissive: this.gl.getUniformLocation(this.program.program, 'uHasEmissive'),
             uEmissive: this.gl.getUniformLocation(this.program.program, 'uEmissive'),
             uEmissiveIntensity: this.gl.getUniformLocation(this.program.program, 'uEmissiveIntensity'),
+            uEmissiveUvSet: this.gl.getUniformLocation(this.program.program, 'uEmissiveUvSet'),
 
             uHasAO: this.gl.getUniformLocation(this.program.program, 'uHasAO'),
             uAO: this.gl.getUniformLocation(this.program.program, 'uAO'),
             uAOStrength: this.gl.getUniformLocation(this.program.program, 'uAOStrength'),
+            uAOUvSet: this.gl.getUniformLocation(this.program.program, 'uAOUvSet'),
 
             uEnableTintPalette: this.gl.getUniformLocation(this.program.program, 'uEnableTintPalette'),
             uTintPalette: this.gl.getUniformLocation(this.program.program, 'uTintPalette'),
 
-            uDecodeSrgb: this.gl.getUniformLocation(this.program.program, 'uDecodeSrgb'),
+            uDecodeDiffuseSrgb: this.gl.getUniformLocation(this.program.program, 'uDecodeDiffuseSrgb'),
+            uDecodeDiffuse2Srgb: this.gl.getUniformLocation(this.program.program, 'uDecodeDiffuse2Srgb'),
+            uDecodeEmissiveSrgb: this.gl.getUniformLocation(this.program.program, 'uDecodeEmissiveSrgb'),
             uNormalEncoding: this.gl.getUniformLocation(this.program.program, 'uNormalEncoding'),
             uNormalReconstructZ: this.gl.getUniformLocation(this.program.program, 'uNormalReconstructZ'),
 
@@ -586,7 +618,7 @@ export class InstancedModelRenderer {
             if (Number.isFinite(d)) entry.minDist = d;
         }
 
-        const stride = ((matricesFloat32.length % 17) === 0) ? 17 : 16;
+        const stride = ((matricesFloat32.length % 21) === 0) ? 21 : (((matricesFloat32.length % 17) === 0) ? 17 : 16);
         // If stride changed (e.g. tint enabled/disabled), drop VAOs so they rebuild with correct attrib pointers.
         if (entry.instanceStrideFloats && entry.instanceStrideFloats !== stride) {
             try {
@@ -678,7 +710,7 @@ export class InstancedModelRenderer {
         }
 
         const gl = this.gl;
-        const stride = ((matricesFloat32.length % 17) === 0) ? 17 : 16;
+        const stride = ((matricesFloat32.length % 21) === 0) ? 21 : (((matricesFloat32.length % 17) === 0) ? 17 : 16);
         if (entry.instanceStrideFloats && entry.instanceStrideFloats !== stride) {
             // Force VAO rebuilds (stride affects instanced attrib layout).
             try {
@@ -754,7 +786,7 @@ export class InstancedModelRenderer {
             if (Number.isFinite(d)) entry.minDist = d;
         }
 
-        const stride = ((matricesFloat32.length % 17) === 0) ? 17 : 16;
+        const stride = ((matricesFloat32.length % 21) === 0) ? 21 : (((matricesFloat32.length % 17) === 0) ? 17 : 16);
         if (entry.instanceStrideFloats && entry.instanceStrideFloats !== stride) {
             try { if (entry.vao) gl.deleteVertexArray(entry.vao); } catch { /* ignore */ }
             entry.vao = null;
@@ -866,6 +898,21 @@ export class InstancedModelRenderer {
                                     gl.vertexAttrib2f(9, 0.0, 0.0);
                                 } catch { /* ignore */ }
                             }
+                            // aTexcoord2: location 10 (fallback to uv0 if uv2 absent)
+                            if (mesh.uv2Buffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.uv2Buffer);
+                                gl.enableVertexAttribArray(10);
+                                gl.vertexAttribPointer(10, 2, gl.FLOAT, false, 0, 0);
+                            } else if (mesh.uvBuffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.uvBuffer);
+                                gl.enableVertexAttribArray(10);
+                                gl.vertexAttribPointer(10, 2, gl.FLOAT, false, 0, 0);
+                            } else {
+                                try {
+                                    gl.disableVertexAttribArray(10);
+                                    gl.vertexAttrib2f(10, 0.0, 0.0);
+                                } catch { /* ignore */ }
+                            }
 
                             if (mesh.tanBuffer) {
                                 gl.bindBuffer(gl.ARRAY_BUFFER, mesh.tanBuffer);
@@ -948,6 +995,21 @@ export class InstancedModelRenderer {
                                 try {
                                     gl.disableVertexAttribArray(9);
                                     gl.vertexAttrib2f(9, 0.0, 0.0);
+                                } catch { /* ignore */ }
+                            }
+                            // aTexcoord2: location 10 (fallback to uv0 if uv2 absent)
+                            if (mesh.uv2Buffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.uv2Buffer);
+                                gl.enableVertexAttribArray(10);
+                                gl.vertexAttribPointer(10, 2, gl.FLOAT, false, 0, 0);
+                            } else if (mesh.uvBuffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.uvBuffer);
+                                gl.enableVertexAttribArray(10);
+                                gl.vertexAttribPointer(10, 2, gl.FLOAT, false, 0, 0);
+                            } else {
+                                try {
+                                    gl.disableVertexAttribArray(10);
+                                    gl.vertexAttrib2f(10, 0.0, 0.0);
                                 } catch { /* ignore */ }
                             }
 
@@ -1132,12 +1194,15 @@ export class InstancedModelRenderer {
         // Defaults for optional maps.
         gl.uniform1i(this.uniforms.uHasNormal, 0);
         gl.uniform1f(this.uniforms.uNormalScale, 1.0);
+        gl.uniform1i(this.uniforms.uNormalUvSet, 0);
         gl.uniform1i(this.uniforms.uHasSpec, 0);
         gl.uniform1f(this.uniforms.uSpecularIntensity, 0.25);
         gl.uniform1f(this.uniforms.uSpecularPower, 24.0);
         gl.uniform3fv(this.uniforms.uSpecMaskWeights, [1.0, 0.0, 0.0]);
+        gl.uniform1i(this.uniforms.uSpecUvSet, 0);
         gl.uniform1i(this.uniforms.uHasEmissive, 0);
         gl.uniform1f(this.uniforms.uEmissiveIntensity, 1.0);
+        gl.uniform1i(this.uniforms.uEmissiveUvSet, 0);
         gl.uniform1i(this.uniforms.uAlphaMode, 0);
         gl.uniform1f(this.uniforms.uAlphaCutoff, 0.33);
         gl.uniform1f(this.uniforms.uAlphaScale, 1.0);
@@ -1145,10 +1210,14 @@ export class InstancedModelRenderer {
         gl.uniform1i(this.uniforms.uHasDiffuse2, 0);
         gl.uniform1i(this.uniforms.uHasDetail, 0);
         gl.uniform4fv(this.uniforms.uDetailSettings, [0.0, 0.0, 1.0, 1.0]);
+        gl.uniform1i(this.uniforms.uDetailUvSet, 0);
         gl.uniform1i(this.uniforms.uHasAO, 0);
         gl.uniform1f(this.uniforms.uAOStrength, 1.0);
+        gl.uniform1i(this.uniforms.uAOUvSet, 0);
         // Defaults; updated per-frame/per-draw as needed.
-        gl.uniform1i(this.uniforms.uDecodeSrgb, 0);
+        gl.uniform1i(this.uniforms.uDecodeDiffuseSrgb, 0);
+        gl.uniform1i(this.uniforms.uDecodeDiffuse2Srgb, 0);
+        gl.uniform1i(this.uniforms.uDecodeEmissiveSrgb, 0);
         gl.uniform1i(this.uniforms.uNormalEncoding, 0);
         gl.uniform1i(this.uniforms.uNormalReconstructZ, 1);
         gl.uniform1i(this.uniforms.uShaderFamily, 0);
@@ -1223,6 +1292,23 @@ export class InstancedModelRenderer {
             return [1.0, 1.0, 0.0, 0.0];
         };
 
+        // UV selector parser:
+        // - Accepts: 0/1/2, "uv0"/"uv1"/"uv2", "0"/"1"/"2", null/undefined -> defaultSet
+        // - Returns: 0/1/2
+        const parseUvSet = (v, defaultSet = 0) => {
+            const def = (defaultSet === 1) ? 1 : ((defaultSet === 2) ? 2 : 0);
+            if (v === null || v === undefined) return def;
+            if (typeof v === 'number' && Number.isFinite(v)) {
+                const n = Math.floor(v);
+                return (n === 1) ? 1 : ((n === 2) ? 2 : 0);
+            }
+            const s = String(v).trim().toLowerCase();
+            if (s === '2' || s === 'uv2') return 2;
+            if (s === '1' || s === 'uv1') return 1;
+            if (s === '0' || s === 'uv0') return 0;
+            return def;
+        };
+
         const materialSigFor = (entryMat, subMat) => {
             try {
                 if (this.modelManager?.getEffectiveMaterialAndSignature) {
@@ -1231,7 +1317,20 @@ export class InstancedModelRenderer {
             } catch { /* ignore */ }
             // Fallback: best-effort stable-ish key.
             const eff = { ...(entryMat || {}), ...(subMat || {}) };
-            return JSON.stringify({ diffuse: eff.diffuse ?? null, normal: eff.normal ?? null, spec: eff.spec ?? null, uv0ScaleOffset: eff.uv0ScaleOffset ?? null, bumpiness: eff.bumpiness ?? null, specularIntensity: eff.specularIntensity ?? null, specularPower: eff.specularPower ?? null });
+            return JSON.stringify({
+                diffuse: eff.diffuse ?? null,
+                normal: eff.normal ?? null,
+                spec: eff.spec ?? null,
+                uv0ScaleOffset: eff.uv0ScaleOffset ?? null,
+                bumpiness: eff.bumpiness ?? null,
+                specularIntensity: eff.specularIntensity ?? null,
+                specularPower: eff.specularPower ?? null,
+                normalUvSet: eff.normalUvSet ?? eff.normalUv ?? null,
+                specUvSet: eff.specUvSet ?? eff.specUv ?? null,
+                detailUvSet: eff.detailUvSet ?? eff.detailUv ?? null,
+                aoUvSet: eff.aoUvSet ?? eff.aoUv ?? null,
+                emissiveUvSet: eff.emissiveUvSet ?? eff.emissiveUv ?? null,
+            });
         };
 
         // Prefer KTX2 variants when present; fall back to PNG paths.
@@ -1302,6 +1401,11 @@ export class InstancedModelRenderer {
                 specRel: pickTex(mat, 'spec'),
                 emissiveRel: pickTex(mat, 'emissive'),
                 aoRel: pickTex(mat, 'ao'),
+                normalUvSet: parseUvSet(mat?.normalUvSet ?? mat?.normalUv ?? null, 0),
+                specUvSet: parseUvSet(mat?.specUvSet ?? mat?.specUv ?? null, 0),
+                detailUvSet: parseUvSet(mat?.detailUvSet ?? mat?.detailUv ?? null, 0),
+                aoUvSet: parseUvSet(mat?.aoUvSet ?? mat?.aoUv ?? null, 0),
+                emissiveUvSet: parseUvSet(mat?.emissiveUvSet ?? mat?.emissiveUv ?? null, 0),
                 aoStrength: Number(mat?.aoStrength ?? 1.0),
                 alphaMaskRel: pickTex(mat, 'alphaMask'),
                 decalDepthBias: Number(mat?.decalDepthBias ?? 1.0),
@@ -1395,6 +1499,11 @@ export class InstancedModelRenderer {
                     specRel: pickTex(eff, 'spec'),
                     emissiveRel: pickTex(eff, 'emissive'),
                     aoRel: pickTex(eff, 'ao'),
+                    normalUvSet: parseUvSet(eff?.normalUvSet ?? eff?.normalUv ?? null, 0),
+                    specUvSet: parseUvSet(eff?.specUvSet ?? eff?.specUv ?? null, 0),
+                    detailUvSet: parseUvSet(eff?.detailUvSet ?? eff?.detailUv ?? null, 0),
+                    aoUvSet: parseUvSet(eff?.aoUvSet ?? eff?.aoUv ?? null, 0),
+                    emissiveUvSet: parseUvSet(eff?.emissiveUvSet ?? eff?.emissiveUv ?? null, 0),
                     aoStrength: Number(eff?.aoStrength ?? 1.0),
                     alphaMaskRel: pickTex(eff, 'alphaMask'),
                     decalDepthBias: Number(eff?.decalDepthBias ?? 1.0),
@@ -1455,6 +1564,11 @@ export class InstancedModelRenderer {
             hasDetail: null,
             hasSpec: null,
             hasEmissive: null,
+            normalUvSet: null,
+            specUvSet: null,
+            detailUvSet: null,
+            aoUvSet: null,
+            emissiveUvSet: null,
             shaderFamily: null,
             hasAlphaMask: null,
             alphaMode: null,
@@ -1463,7 +1577,9 @@ export class InstancedModelRenderer {
             hardAlphaBlend: null,
             blendEnabled: null,
             depthMask: null,
-            decodeSrgb: null,
+            decodeDiffuseSrgb: null,
+            decodeDiffuse2Srgb: null,
+            decodeEmissiveSrgb: null,
             normalEncoding: null,
             normalReconstructZ: null,
             specMaskWeights: null,
@@ -1557,11 +1673,15 @@ export class InstancedModelRenderer {
             }
         };
 
-        const setDecodeSrgbCached = (decodeSrgb) => {
+        const setDecodeSrgbCached = (which, decodeSrgb) => {
             const v = !!decodeSrgb;
-            if (state.decodeSrgb === v) return;
-            gl.uniform1i(this.uniforms.uDecodeSrgb, v ? 1 : 0);
-            state.decodeSrgb = v;
+            if (state[which] === v) return;
+            const loc =
+                (which === 'decodeDiffuseSrgb') ? this.uniforms.uDecodeDiffuseSrgb
+                    : (which === 'decodeDiffuse2Srgb') ? this.uniforms.uDecodeDiffuse2Srgb
+                        : this.uniforms.uDecodeEmissiveSrgb;
+            gl.uniform1i(loc, v ? 1 : 0);
+            state[which] = v;
         };
 
         const setNormalDecodeCached = (encodingInt, reconstructZ) => {
@@ -1626,7 +1746,9 @@ export class InstancedModelRenderer {
         gl.uniform1i(this.uniforms.uAO, 6);
         gl.uniform1i(this.uniforms.uAlphaMask, 7);
         gl.uniform1i(this.uniforms.uTintPalette, 8);
-        gl.uniform1i(this.uniforms.uDecodeSrgb, 0);
+        gl.uniform1i(this.uniforms.uDecodeDiffuseSrgb, 0);
+        gl.uniform1i(this.uniforms.uDecodeDiffuse2Srgb, 0);
+        gl.uniform1i(this.uniforms.uDecodeEmissiveSrgb, 0);
         gl.uniform1i(this.uniforms.uNormalEncoding, 0);
         gl.uniform1i(this.uniforms.uNormalReconstructZ, 1);
 
@@ -1654,9 +1776,11 @@ export class InstancedModelRenderer {
             setUvsoCached(it.uvso);
             setUvAnimCached(it.globalAnimUV0, it.globalAnimUV1);
 
-            // Color pipeline: if the streamer can't upload sRGB textures, decode in shader.
-            const needDecode = !(this.textureStreamer?.supportsSrgbTextures?.() === true);
-            setDecodeSrgbCached(needDecode);
+            // Color pipeline: decide per-texture whether we need shader-side sRGB decode.
+            // (sRGB support may exist, but a given texture might still be uploaded as RGBA.)
+            let decodeDiffuseSrgb = false;
+            let decodeDiffuse2Srgb = false;
+            let decodeEmissiveSrgb = false;
 
             // Normal decode defaults to reconstruct Z; override via material if present.
             setNormalDecodeCached(it.normalEncoding ?? 0, it.normalReconstructZ ?? 1);
@@ -1721,7 +1845,9 @@ export class InstancedModelRenderer {
             if (it.diffuseRel && this.textureStreamer) {
                 const url = toAssetUrl(it.diffuseRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'diffuse' });
-                const tex = url ? this.textureStreamer.get(url, { distance: it.dist, kind: 'diffuse' }) : this.textureStreamer.placeholder;
+                const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'diffuse' }) : { tex: this.textureStreamer.placeholder, isPlaceholder: true, uploadedAsSrgb: false };
+                const tex = info.tex;
+                decodeDiffuseSrgb = (!info.isPlaceholder) && (!info.uploadedAsSrgb);
                 bindTexCached(0, tex, 'tex0');
                 set1iCached(this.uniforms.uHasDiffuse, 1, 'hasDiffuse');
                 this._renderStats.diffuseWanted++;
@@ -1746,7 +1872,9 @@ export class InstancedModelRenderer {
             if (it.diffuse2Rel && this.textureStreamer) {
                 const url = toAssetUrl(it.diffuse2Rel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'diffuse2' });
-                const tex = url ? this.textureStreamer.get(url, { distance: it.dist, kind: 'diffuse2' }) : this.textureStreamer.placeholder;
+                const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'diffuse2' }) : { tex: this.textureStreamer.placeholder, isPlaceholder: true, uploadedAsSrgb: false };
+                const tex = info.tex;
+                decodeDiffuse2Srgb = (!info.isPlaceholder) && (!info.uploadedAsSrgb);
                 bindTexCached(4, tex, 'tex0b');
                 set1iCached(this.uniforms.uHasDiffuse2, 1, 'hasDiffuse2');
                 // Default to UV1 unless explicitly requested otherwise.
@@ -1765,6 +1893,13 @@ export class InstancedModelRenderer {
 
             // Normal/spec require tangents on the mesh to shade correctly.
             const hasTangents = !!it.meshHasTangents;
+
+            // Per-map UV selectors (0=UV0, 1=UV1, 2=UV2). Defaults are UV0 for all maps.
+            set1iCached(this.uniforms.uNormalUvSet, (it.normalUvSet | 0), 'normalUvSet');
+            set1iCached(this.uniforms.uSpecUvSet, (it.specUvSet | 0), 'specUvSet');
+            set1iCached(this.uniforms.uDetailUvSet, (it.detailUvSet | 0), 'detailUvSet');
+            set1iCached(this.uniforms.uAOUvSet, (it.aoUvSet | 0), 'aoUvSet');
+            set1iCached(this.uniforms.uEmissiveUvSet, (it.emissiveUvSet | 0), 'emissiveUvSet');
 
             if (hasTangents && it.normalRel && this.textureStreamer) {
                 const url = toAssetUrl(it.normalRel);
@@ -1824,7 +1959,9 @@ export class InstancedModelRenderer {
             if (it.emissiveRel && this.textureStreamer) {
                 const url = toAssetUrl(it.emissiveRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'emissive' });
-                const tex = url ? this.textureStreamer.get(url, { distance: it.dist, kind: 'emissive' }) : this.textureStreamer.placeholder;
+                const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'emissive' }) : { tex: this.textureStreamer.placeholder, isPlaceholder: true, uploadedAsSrgb: false };
+                const tex = info.tex;
+                decodeEmissiveSrgb = (!info.isPlaceholder) && (!info.uploadedAsSrgb);
                 bindTexCached(3, tex, 'tex3');
                 set1iCached(this.uniforms.uHasEmissive, 1, 'hasEmissive');
                 set1fCached(this.uniforms.uEmissiveIntensity, it.emissiveIntensity, 'emissiveIntensity', 1.0);
@@ -1832,6 +1969,11 @@ export class InstancedModelRenderer {
                 set1iCached(this.uniforms.uHasEmissive, 0, 'hasEmissive');
                 set1fCached(this.uniforms.uEmissiveIntensity, 1.0, 'emissiveIntensity', 1.0);
             }
+
+            // Apply per-sampler decode toggles (must happen after we know whether we bound placeholders).
+            setDecodeSrgbCached('decodeDiffuseSrgb', decodeDiffuseSrgb);
+            setDecodeSrgbCached('decodeDiffuse2Srgb', decodeDiffuse2Srgb);
+            setDecodeSrgbCached('decodeEmissiveSrgb', decodeEmissiveSrgb);
 
             // AO / occlusion
             if (it.aoRel && this.textureStreamer) {

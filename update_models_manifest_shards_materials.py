@@ -186,6 +186,7 @@ def main() -> None:
                     textures=textures,
                     td_hash=td_hash,
                     tex_dir=tex_dir,
+                    dll_manager=dm,
                 )
                 or 0
             )

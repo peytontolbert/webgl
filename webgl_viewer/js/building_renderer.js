@@ -34,6 +34,7 @@ out vec4 fragColor;
 uniform vec3 uLightDir;
 uniform vec3 uColor;
 uniform float uAmbient;
+uniform float uTime;
 
 // Two-pass render:
 // - uWaterPass = 0: render non-water (opaque), discard water fragments
@@ -70,15 +71,44 @@ void main() {
 
     // Water pass
     if (!isWater) discard;
-    // Simple blue tint + lighting (kept subtle so it doesn't dominate the scene).
-    vec3 waterBase = vec3(0.12, 0.28, 0.42);
-    vec3 c = waterBase * (uAmbient + diff * (1.0 - uAmbient));
+    // Animated "cheap water" (still heuristic geometry, but much nicer shading):
+    // - procedural wave normal
+    // - fresnel + sun spec highlight
+    // - uses fog color as a simple sky/env reflection tint
+    vec3 V = normalize(uCameraPos - vWorldPos);
+    vec3 L = normalize(uLightDir);
+
+    // Waves in world space (scale is tuned for our data->view units).
+    float t = uTime;
+    vec2 p = vWorldPos.xy * 0.0025;
+    float w0 = sin(p.x * 2.7 + t * 0.9) + cos(p.y * 2.1 + t * 1.1);
+    float w1 = sin((p.x + p.y) * 3.3 + t * 1.6);
+    float h = (w0 * 0.5 + w1 * 0.5);
+    // Approximate normal from height gradients.
+    float hx = cos(p.x * 2.7 + t * 0.9) * 2.7 + cos((p.x + p.y) * 3.3 + t * 1.6) * 3.3;
+    float hy = -sin(p.y * 2.1 + t * 1.1) * 2.1 + cos((p.x + p.y) * 3.3 + t * 1.6) * 3.3;
+    vec3 waveN = normalize(vec3(-hx, -hy, 1.0));
+    // Mix with mesh normal (keeps stability when the grid isn't perfectly flat).
+    n = normalize(mix(n, waveN, 0.65));
+
+    float ndl = max(dot(n, L), 0.0);
+    float fres = pow(1.0 - max(dot(n, V), 0.0), 5.0);
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(n, H), 0.0), 120.0);
+
+    vec3 waterBase = vec3(0.06, 0.20, 0.32);
+    vec3 env = mix(vec3(0.08, 0.18, 0.28), uFogColor, 0.65);
+    vec3 c = waterBase * (uAmbient + ndl * (1.0 - uAmbient));
+    c = mix(c, env, clamp(fres * 0.85, 0.0, 1.0));
+    c += vec3(1.0) * spec * 0.75;
+    c += vec3(0.02, 0.04, 0.06) * h; // subtle animated tint
     if (uFogEnabled) {
         float dist = length(vWorldPos - uCameraPos);
         float fogF = smoothstep(uFogStart, uFogEnd, dist);
         c = mix(c, uFogColor, fogF);
     }
-    fragColor = vec4(c, clamp(uWaterAlpha, 0.0, 1.0));
+    float a = clamp(uWaterAlpha + fres * 0.18, 0.0, 0.95);
+    fragColor = vec4(c, a);
 }
 `;
 
@@ -123,6 +153,7 @@ export class BuildingRenderer {
             uLightDir: this.gl.getUniformLocation(this.program.program, 'uLightDir'),
             uColor: this.gl.getUniformLocation(this.program.program, 'uColor'),
             uAmbient: this.gl.getUniformLocation(this.program.program, 'uAmbient'),
+            uTime: this.gl.getUniformLocation(this.program.program, 'uTime'),
             uWaterPass: this.gl.getUniformLocation(this.program.program, 'uWaterPass'),
             uWaterAlpha: this.gl.getUniformLocation(this.program.program, 'uWaterAlpha'),
             uWaterEps: this.gl.getUniformLocation(this.program.program, 'uWaterEps'),
@@ -329,6 +360,7 @@ export class BuildingRenderer {
         gl.uniform3fv(this.uniforms.uLightDir, [0.4, 0.8, 0.2]);
         gl.uniform3fv(this.uniforms.uColor, [0.72, 0.72, 0.75]);
         gl.uniform1f(this.uniforms.uAmbient, 0.65);
+        if (this.uniforms.uTime) gl.uniform1f(this.uniforms.uTime, (performance.now() * 0.001) || 0.0);
         gl.uniform1f(this.uniforms.uWaterAlpha, waterAlpha);
         gl.uniform1f(this.uniforms.uWaterEps, waterEps);
 
