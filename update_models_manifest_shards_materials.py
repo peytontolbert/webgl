@@ -22,16 +22,16 @@ from pathlib import Path
 
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.rpf_reader import RpfReader
+from gta5_modules.script_paths import auto_assets_dir
+from gta5_modules.hash_utils import as_u32_int as _as_u32_int
+from gta5_modules.codewalker_archetypes import get_archetype_best_effort
+from gta5_modules.cw_loaders import try_get_drawable as _try_get_drawable
+from gta5_modules.cw_loaders import try_get_ytd as _try_get_ytd
 
 
 def _as_u32(s: str):
-    try:
-        ss = str(s).strip()
-        if not ss or not ss.lstrip("-").isdigit():
-            return None
-        return int(ss, 10) & 0xFFFFFFFF
-    except Exception:
-        return None
+    # Wrapper kept for backwards-compat within this script.
+    return _as_u32_int(s)
 
 
 def main() -> None:
@@ -40,6 +40,12 @@ def main() -> None:
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
     ap.add_argument("--max-meshes", type=int, default=0, help="Limit number of meshes processed (0 = all)")
     ap.add_argument("--only-missing", action="store_true", help="Only write textures/material fields when material.diffuse is missing")
+    ap.add_argument(
+        "--only-empty-materials",
+        action="store_true",
+        help="Only process entries that have at least one EMPTY submesh material dict (lods[].submeshes[].material == {}). "
+             "This is a fast repair mode for 'untextured' props caused by missing material metadata.",
+    )
     ap.add_argument("--write-monolithic", action="store_true", help="Also update assets/models/manifest.json (slow/huge)")
     args = ap.parse_args()
 
@@ -47,14 +53,7 @@ def main() -> None:
     if not game_path:
         raise SystemExit("Missing --game-path (or gta_location env var)")
 
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
 
     models_dir = assets_dir / "models"
     index_path = models_dir / "manifest_index.json"
@@ -93,6 +92,48 @@ def main() -> None:
     processed = 0
     wrote_textures = 0
     updated_entries = 0
+    def _entry_has_any_empty_submesh_material(entry: dict) -> bool:
+        try:
+            lods = entry.get("lods") if isinstance(entry, dict) else None
+            if not isinstance(lods, dict):
+                return False
+            for lod_meta in lods.values():
+                if not isinstance(lod_meta, dict):
+                    continue
+                subs = lod_meta.get("submeshes")
+                if not isinstance(subs, list):
+                    continue
+                for sm in subs:
+                    if not isinstance(sm, dict):
+                        continue
+                    m = sm.get("material")
+                    if isinstance(m, dict) and (len(m) == 0):
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def _count_empty_submesh_materials(entry: dict) -> int:
+        try:
+            c = 0
+            lods = entry.get("lods") if isinstance(entry, dict) else None
+            if not isinstance(lods, dict):
+                return 0
+            for lod_meta in lods.values():
+                if not isinstance(lod_meta, dict):
+                    continue
+                subs = lod_meta.get("submeshes")
+                if not isinstance(subs, list):
+                    continue
+                for sm in subs:
+                    if not isinstance(sm, dict):
+                        continue
+                    m = sm.get("material")
+                    if isinstance(m, dict) and (len(m) == 0):
+                        c += 1
+            return int(c)
+        except Exception:
+            return 0
 
     for si, sf in enumerate(shard_files):
         payload = json.loads(sf.read_text(encoding="utf-8", errors="ignore"))
@@ -110,42 +151,51 @@ def main() -> None:
                 processed += 1
                 continue
 
+            # Fast repair mode: only touch meshes whose submesh materials are literally empty.
+            if bool(args.only_empty_materials) and (not _entry_has_any_empty_submesh_material(entry)):
+                processed += 1
+                continue
+
             # Optional "only-missing" quick gate.
             if args.only_missing:
                 try:
-                    # If ANY submesh already has diffuse, skip.
+                    # Old behavior skipped the whole mesh if ANY submesh had diffuse, which prevented
+                    # repairing partially-missing materials and stale shaderParams. Instead, skip only
+                    # when ALL submeshes already have diffuse (ie nothing to repair).
                     lods = (entry.get("lods") or {})
-                    has_any = False
+                    any_missing = False
+                    any_seen = False
                     if isinstance(lods, dict):
                         for lod_meta in lods.values():
                             subs = (lod_meta or {}).get("submeshes") if isinstance(lod_meta, dict) else None
-                            if isinstance(subs, list):
-                                for sm in subs:
-                                    if isinstance(sm, dict):
-                                        mat = sm.get("material")
-                                        if isinstance(mat, dict) and mat.get("diffuse"):
-                                            has_any = True
-                                            break
-                            if has_any:
+                            if not isinstance(subs, list):
+                                continue
+                            for sm in subs:
+                                if not isinstance(sm, dict):
+                                    continue
+                                mat = sm.get("material")
+                                if not isinstance(mat, dict):
+                                    continue
+                                any_seen = True
+                                if not mat.get("diffuse"):
+                                    any_missing = True
+                                    break
+                            if any_missing:
                                 break
-                    if has_any:
+                    # If we saw submeshes and none are missing diffuse, skip.
+                    if any_seen and (not any_missing):
                         processed += 1
                         continue
                 except Exception:
                     pass
 
-            arch = gfc.GetArchetype(h)
+            arch = get_archetype_best_effort(gfc, int(h) & 0xFFFFFFFF, dll_manager=dm)
             if arch is None:
                 processed += 1
                 continue
 
             # Load drawable and pump loader briefly.
-            drawable = gfc.TryGetDrawable(arch)
-            spins = 0
-            while drawable is None and spins < 400:
-                gfc.ContentThreadProc()
-                drawable = gfc.TryGetDrawable(arch)
-                spins += 1
+            drawable = _try_get_drawable(gfc, arch, spins=400)
             if drawable is None:
                 processed += 1
                 continue
@@ -161,11 +211,7 @@ def main() -> None:
                 td_hash = None
             try:
                 if td_hash and td_hash != 0:
-                    ytd = gfc.GetYtd(td_hash)
-                    spins = 0
-                    while (ytd is not None) and (not getattr(ytd, "Loaded", True)) and spins < 400:
-                        gfc.ContentThreadProc()
-                        spins += 1
+                    ytd = _try_get_ytd(gfc, int(td_hash) & 0xFFFFFFFF, spins=400)
                     if ytd is not None and getattr(ytd, "Loaded", True):
                         textures = rpf_reader.get_ytd_textures(ytd)
             except Exception:
@@ -179,6 +225,7 @@ def main() -> None:
             _ = _extract_drawable_lod_submeshes(drawable, "High")
 
             before_wrote = wrote_textures
+            before_empty = _count_empty_submesh_materials(entry) if bool(args.only_empty_materials) else 0
             wrote_textures += int(
                 _update_existing_manifest_materials_for_drawable(
                     entry=entry,
@@ -190,7 +237,9 @@ def main() -> None:
                 )
                 or 0
             )
-            if wrote_textures != before_wrote:
+            after_empty = _count_empty_submesh_materials(entry) if bool(args.only_empty_materials) else before_empty
+            # Treat either newly written textures OR newly filled material metadata as a change.
+            if (wrote_textures != before_wrote) or (after_empty < before_empty):
                 changed = True
                 updated_entries += 1
 

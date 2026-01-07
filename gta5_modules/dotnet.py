@@ -78,23 +78,39 @@ def _try_import_pythonnet_clr() -> ModuleType:
     except Exception:
         pass
 
+    # 3) If `import clr` still yields the wrong module, force-load pythonnet's extension module.
+    #
+    # On Windows this is typically `clr.pyd`.
+    # On Linux/macOS this is typically `clr<suffix>.so` (e.g. clr.cpython-311-x86_64-linux-gnu.so).
+    #
+    # Use Python's extension suffixes so we don't hard-code platform naming.
+    suffixes = list(getattr(importlib.machinery, "EXTENSION_SUFFIXES", []) or [])
+    # Keep common fallback names even if EXTENSION_SUFFIXES is missing/mangled.
+    for sfx in [".pyd", ".so", ".dylib"]:
+        if sfx not in suffixes:
+            suffixes.append(sfx)
+
     candidates: list[str] = []
+
+    def _add_candidates_from_dir(base: str) -> None:
+        if not base:
+            return
+        for sfx in suffixes:
+            candidates.append(os.path.join(base, "clr" + sfx))
+
     # Prefer pythonnet installation location if available.
     try:
         import pythonnet  # type: ignore
 
         pythonnet_dir = os.path.dirname(getattr(pythonnet, "__file__", "") or "")
         for base in [pythonnet_dir, os.path.dirname(pythonnet_dir)]:
-            if base:
-                candidates.append(os.path.join(base, "clr.pyd"))
+            _add_candidates_from_dir(base)
     except Exception:
         pass
 
     # Fall back to searching sys.path (site-packages).
     for p in sys.path:
-        if not p:
-            continue
-        candidates.append(os.path.join(p, "clr.pyd"))
+        _add_candidates_from_dir(p)
 
     for clr_path in candidates:
         if os.path.isfile(clr_path):
@@ -106,15 +122,30 @@ def _try_import_pythonnet_clr() -> ModuleType:
     # If we did manage to import some `clr`, include where it came from for debugging.
     imported_where = getattr(clr_mod, "__file__", None) if clr_mod is not None else None
     where_msg = f"\nDetected `clr` module at: {imported_where}" if imported_where else ""
-    raise RuntimeError(
-        "Failed to load Python.NET's `clr` module.\n"
-        "This project requires `pythonnet` so that `clr.AddReference(...)` works.\n"
-        "Common cause: the PyPI package named `clr` is installed and shadows pythonnet.\n"
-        f"{where_msg}\n\n"
-        "Fix (Windows):\n"
-        "  pip uninstall -y clr\n"
-        "  pip install -U pythonnet\n"
-    )
+    fix_lines = [
+        "Failed to load Python.NET's `clr` module.",
+        "This project requires `pythonnet` so that `clr.AddReference(...)` works.",
+        "Common cause: the PyPI package named `clr` is installed and shadows pythonnet.",
+    ]
+    if where_msg:
+        fix_lines.append(where_msg.strip("\n"))
+    fix_lines += [
+        "",
+        "Fix:",
+        "  python -m pip uninstall -y clr",
+        "  python -m pip install -U pythonnet",
+        "",
+    ]
+    if os.name != "nt":
+        fix_lines += [
+            "Linux note:",
+            "  CodeWalker (and SharpDX) are commonly run under Mono on Linux.",
+            "  Try one of these before running again:",
+            "    export PYTHONNET_RUNTIME=mono",
+            "    unset PYTHONNET_RUNTIME",
+            "",
+        ]
+    raise RuntimeError("\n".join(fix_lines))
 
 
 # Public, canonical `clr` handle for the rest of the codebase.

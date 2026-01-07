@@ -1,76 +1,67 @@
-#!/bin/bash
-# GTA 5 Terrain Extractor Shell Script
-# This shell script runs the terrain extractor with CodeWalker integration
+#!/usr/bin/env bash
+# Linux-friendly runner for the extractor.
+#
+# - Loads `env.local` if present (preferred)
+# - Defaults GTA path to /data/webglgta/gta5 if nothing is set
+# - Creates a local venv and installs requirements (non-interactive)
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_DIR"
 
 echo "GTA 5 Terrain Extractor"
 echo "----------------------"
 
-# Check if Python is installed
-if ! command -v python3 &> /dev/null; then
-    echo "Python is not installed or not in PATH."
-    echo "Please install Python 3.7 or higher."
-    exit 1
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 not found in PATH (need Python 3.8+)." >&2
+  exit 1
 fi
 
-# Check Python version
-PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-if [[ $(echo "$PYTHON_VERSION < 3.7" | bc) -eq 1 ]]; then
-    echo "Python 3.7 or higher is required."
-    echo "Current version: $PYTHON_VERSION"
-    exit 1
-fi
+python3 - <<'PY'
+import sys
+maj, min = sys.version_info[:2]
+if (maj, min) < (3, 8):
+    raise SystemExit(f"ERROR: Python 3.8+ required, found {maj}.{min}")
+print(f"Python OK: {maj}.{min}")
+PY
 
-# Check if .env file exists
-if [ ! -f .env ]; then
-    echo "Creating .env file..."
-    echo "Please enter the path to your GTA 5 installation:"
-    read GTA_PATH
-    echo "gta_location=\"$GTA_PATH\"" > .env
-    
-    echo "Please enter the path to your CodeWalker source code:"
-    read CODEWALKER_PATH
-    echo "codewalker_map=\"$CODEWALKER_PATH\"" >> .env
+# Load env.local/.env if present (Bash-friendly KEY="VALUE" format).
+set -a
+if [ -f "env.local" ]; then
+  # shellcheck disable=SC1091
+  . "./env.local"
+elif [ -f ".env" ]; then
+  # shellcheck disable=SC1091
+  . "./.env"
 fi
+set +a
 
-# Check if requirements are installed
-echo "Checking requirements..."
-if ! python3 -c "import numpy, matplotlib, dotenv" &> /dev/null; then
-    echo "Installing required packages..."
-    pip3 install -r requirements.txt
-    if [ $? -ne 0 ]; then
-        echo "Failed to install required packages."
-        exit 1
-    fi
+export gta_location="${gta_location:-/data/webglgta/gta5}"
+export gta5_path="${gta5_path:-$gta_location}"
+
+# IMPORTANT (Linux):
+# CodeWalker.Core.dll + SharpDX are generally more compatible with Mono on Linux than CoreCLR.
+# So we do NOT force PYTHONNET_RUNTIME here. Override explicitly if needed.
+
+echo "Using GTA path:"
+echo "  gta_location=$gta_location"
+echo "  gta5_path=$gta5_path"
+
+# Local venv
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
 fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
 
-# Create output directory if it doesn't exist
+python -m pip install -U pip setuptools wheel >/dev/null
+python -m pip install -r requirements.txt
+
 mkdir -p output
 
-# Run the terrain extractor
 echo "Running terrain extractor..."
-python3 extract_gta_terrain.py
-
-if [ $? -ne 0 ]; then
-    echo "Terrain extraction failed."
-    exit 1
-fi
+python extract_gta_terrain.py
 
 echo "Terrain extraction completed successfully."
-echo "Output files are in the output directory."
-
-# Open the output directory
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS
-    open output
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    # Linux
-    if command -v xdg-open &> /dev/null; then
-        xdg-open output
-    elif command -v nautilus &> /dev/null; then
-        nautilus output
-    elif command -v dolphin &> /dev/null; then
-        dolphin output
-    fi
-fi
-
-exit 0 
+echo "Output files are in the output directory: ${REPO_DIR}/output"

@@ -20,6 +20,11 @@ import glob
 
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.rpf_reader import RpfReader
+from gta5_modules.script_paths import auto_assets_dir
+from gta5_modules.manifest_utils import load_or_init_models_manifest
+from gta5_modules.codewalker_archetypes import get_archetype_best_effort
+from gta5_modules.cw_loaders import try_get_drawable as _try_get_drawable
+from gta5_modules.cw_loaders import try_get_ytd as _try_get_ytd
 
 
 def _load_hashes_from_input(p: Path) -> list[int]:
@@ -113,28 +118,10 @@ def main():
         _write_mesh_bin,
     )
 
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
 
     models_dir = assets_dir / "models"
-    manifest_path = models_dir / "manifest.json"
-    # Version 4: supports per-LOD submeshes with per-submesh material.
-    manifest = {"version": 4, "meshes": {}}
-    if manifest_path.exists():
-        try:
-            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict) and isinstance(existing.get("meshes"), dict):
-                manifest = existing
-                if "version" not in manifest:
-                    manifest["version"] = 4
-        except Exception:
-            pass
+    manifest_path, manifest = load_or_init_models_manifest(models_dir, min_version=4)
     already = set((manifest.get("meshes") or {}).keys())
 
     hashes = _load_hashes_from_input(Path(args.input))
@@ -199,19 +186,14 @@ def main():
         except Exception:
             continue
 
-        arch = gfc.GetArchetype(hu)
+        arch = get_archetype_best_effort(gfc, int(hu) & 0xFFFFFFFF, dll_manager=dm)
         if arch is None:
             no_archetype += 1
             if len(failures_sample) < 200:
                 failures_sample.append({"hash": hs, "reason": "no_archetype"})
             continue
 
-        drawable = gfc.TryGetDrawable(arch)
-        spins = 0
-        while drawable is None and spins < 400:
-            gfc.ContentThreadProc()
-            drawable = gfc.TryGetDrawable(arch)
-            spins += 1
+        drawable = _try_get_drawable(gfc, arch, spins=400)
         if drawable is None:
             no_drawable += 1
             if len(failures_sample) < 200:
@@ -235,11 +217,7 @@ def main():
                 td_hash = None
             try:
                 if td_hash and td_hash != 0:
-                    ytd = gfc.GetYtd(td_hash)
-                    spins = 0
-                    while (ytd is not None) and (not getattr(ytd, "Loaded", True)) and spins < 400:
-                        gfc.ContentThreadProc()
-                        spins += 1
+                    ytd = _try_get_ytd(gfc, int(td_hash) & 0xFFFFFFFF, spins=400)
                     if ytd is not None and getattr(ytd, "Loaded", True):
                         textures = rpf_reader.get_ytd_textures(ytd)
             except Exception:

@@ -7,12 +7,12 @@ export class Camera {
         this.aspectRatio = 1.0;
         // NOTE: For "character-level" close-up inspection we need a small near plane.
         // Depth precision isn't perfect at world scale, but this makes close viewing possible.
-        this.nearPlane = 1.0;
+        this.nearPlane = 0.1;
         this.farPlane = 100000.0; // Increased to see the whole map
         this.orthographicSize = 1000.0;
         
         // Zoom limits (allow close-up inspection + wide map viewing)
-        this.minZoom = 10.0;
+        this.minZoom = 1.0;
         this.maxZoom = 80000.0;
         
         // Camera state
@@ -22,9 +22,18 @@ export class Camera {
         this.direction = glMatrix.vec3.create();
         
         // Movement and rotation
-        this.moveSpeed = 500.0; // Reduced for more stable movement
-        this.rotationSpeed = 0.0005; // Reduced for smoother rotation
-        this.zoomSpeed = 0.05; // Reduced for smoother zooming
+        // moveSpeed is in world units / second (scaled a bit by distance to target so map-scale navigation stays usable)
+        this.moveSpeed = 500.0;
+        // rotationSpeed is radians / pixel
+        this.rotationSpeed = 0.002;
+        // zoomSpeed is the wheel normalization factor used by exponential zoom.
+        // This matches `_applyGameplayCameraZoomDelta` in main.js.
+        this.zoomSpeed = 0.0012;
+
+        // Stable look state (prevents gimbal/flip from incremental matrix rotations)
+        this.yaw = 0.0;   // radians
+        this.pitch = 0.0; // radians
+        this._lookDistance = 1000.0;
         
         // Matrices
         this.viewMatrix = glMatrix.mat4.create();
@@ -99,7 +108,16 @@ export class Camera {
         
         // Calculate direction vector (from position to target)
         glMatrix.vec3.subtract(this.direction, this.target, this.position);
-        glMatrix.vec3.normalize(this.direction, this.direction);
+        const dist = glMatrix.vec3.length(this.direction) || 1.0;
+        glMatrix.vec3.scale(this.direction, this.direction, 1.0 / dist);
+
+        // Keep stable yaw/pitch in sync with the current pose so external changes (lookAtPoint, follow mode, etc.)
+        // don't cause the next rotate() to "jump".
+        this._lookDistance = dist;
+        this.yaw = Math.atan2(this.direction[0], this.direction[2]);
+        // Clamp asin input to avoid NaNs from precision drift.
+        const y = Math.max(-1.0, Math.min(1.0, this.direction[1]));
+        this.pitch = Math.asin(y);
         
         // Update combined matrix
         glMatrix.mat4.multiply(
@@ -127,60 +145,81 @@ export class Camera {
         );
     }
 
-    move(direction) {
-        // Scale movement by distance from target, but less aggressively
-        const distance = glMatrix.vec3.distance(this.position, this.target);
-        const scale = distance * 0.005; // Reduced from 0.01 to 0.005
-        
-        // Apply movement in camera space
-        glMatrix.vec3.scaleAndAdd(this.position, this.position, this.direction, direction[2] * scale);
-        
-        // Calculate right vector
+    move(direction, dt = 1 / 60, opts = undefined) {
+        // direction is expected to be normalized-ish (caller does this); dt is seconds.
+        const keepTarget = !!(opts && opts.keepTarget);
+        const flattenForward = !!(opts && opts.flattenForward);
+        const t = Number(dt);
+        const safeDt = Number.isFinite(t) ? Math.max(0.0, Math.min(0.1, t)) : (1 / 60);
+
+        // Scale movement with distance so you can traverse the full map without huge speed toggles.
+        const distance = this.getDistance();
+        // Keep a small-but-nonzero minimum so close-up inspection can be fine-grained.
+        const distanceScale = Math.max(0.02, Math.min(100.0, distance * 0.002));
+        const step = this.moveSpeed * safeDt * distanceScale;
+
+        // Camera basis (forward = look direction)
+        let forward = this.direction;
+        // Common "editor" behavior: keep WASD on the ground plane so forward/back doesn't bob when pitched.
+        if (flattenForward) {
+            const f = glMatrix.vec3.fromValues(forward[0], 0.0, forward[2]);
+            if (glMatrix.vec3.length(f) > 1e-6) {
+                glMatrix.vec3.normalize(f, f);
+                forward = f;
+            }
+        }
         const right = glMatrix.vec3.create();
-        glMatrix.vec3.cross(right, this.direction, this.up);
+        glMatrix.vec3.cross(right, forward, this.up);
         glMatrix.vec3.normalize(right, right);
-        
-        // Apply horizontal movement
-        glMatrix.vec3.scaleAndAdd(this.position, this.position, right, direction[0] * scale);
-        
-        // Apply vertical movement
-        glMatrix.vec3.scaleAndAdd(this.position, this.position, this.up, direction[1] * scale);
-        
-        // Update matrices
+
+        const delta = glMatrix.vec3.create();
+        glMatrix.vec3.scaleAndAdd(delta, delta, right, direction[0] * step);
+        glMatrix.vec3.scaleAndAdd(delta, delta, this.up, direction[1] * step);
+        glMatrix.vec3.scaleAndAdd(delta, delta, forward, direction[2] * step);
+
+        glMatrix.vec3.add(this.position, this.position, delta);
+        if (!keepTarget) glMatrix.vec3.add(this.target, this.target, delta);
+
         this.updateViewMatrix();
     }
 
     rotate(deltaX, deltaY) {
-        // Convert mouse movement to rotation angles with reduced sensitivity
-        const sensitivity = 0.005; // Reduced from 0.01 to 0.005
-        const pitch = -deltaY * sensitivity; // Invert pitch to match GTA5's coordinate system
-        const yaw = deltaX * sensitivity;
-        
-        // Calculate rotation matrix
-        const rotationMatrix = glMatrix.mat4.create();
-        glMatrix.mat4.rotateY(rotationMatrix, rotationMatrix, yaw);
-        glMatrix.mat4.rotateX(rotationMatrix, rotationMatrix, pitch);
-        
-        // Apply rotation to direction vector
-        const rotatedDirection = glMatrix.vec3.create();
-        glMatrix.vec3.transformMat4(rotatedDirection, this.direction, rotationMatrix);
-        
-        // Update target position
-        glMatrix.vec3.scaleAndAdd(
-            this.target,
-            this.position,
-            rotatedDirection,
-            glMatrix.vec3.distance(this.position, this.target)
-        );
-        
-        // Update matrices
+        const dx = Number(deltaX);
+        const dy = Number(deltaY);
+        if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+
+        this.yaw += dx * this.rotationSpeed;
+        this.pitch += -dy * this.rotationSpeed;
+
+        // Clamp pitch to avoid flips.
+        const maxPitch = glMatrix.glMatrix.toRadian(89.0);
+        this.pitch = Math.max(-maxPitch, Math.min(maxPitch, this.pitch));
+
+        const cp = Math.cos(this.pitch);
+        const sp = Math.sin(this.pitch);
+        const cy = Math.cos(this.yaw);
+        const sy = Math.sin(this.yaw);
+
+        // Forward direction derived from yaw/pitch (Y-up).
+        const forward = glMatrix.vec3.fromValues(sy * cp, sp, cy * cp);
+        glMatrix.vec3.normalize(forward, forward);
+
+        // Preserve current look distance (what "zoom" sets).
+        const d = this.getDistance();
+        this._lookDistance = Number.isFinite(d) && d > 1e-6 ? d : (this._lookDistance || 1.0);
+
+        glMatrix.vec3.scaleAndAdd(this.target, this.position, forward, this._lookDistance);
         this.updateViewMatrix();
     }
 
     zoom(delta) {
-        // Calculate new distance with reduced zoom speed
         const currentDistance = glMatrix.vec3.distance(this.position, this.target);
-        const newDistance = currentDistance * (1.0 - delta * 0.5); // Reduced from 1.0 to 0.5
+        // Exponential zoom feels consistent across wheel types (mouse wheel vs trackpad).
+        // Clamp exponent to avoid huge jumps from high-resolution trackpads.
+        const d = Number(delta) || 0.0; // raw wheel deltaY
+        const exp = Math.max(-0.25, Math.min(0.25, d * this.zoomSpeed));
+        const s = Math.exp(exp);
+        const newDistance = currentDistance * s;
         
         // Clamp distance
         const clampedDistance = Math.max(this.minZoom, Math.min(this.maxZoom, newDistance));

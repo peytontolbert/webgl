@@ -1,8 +1,11 @@
-import { fetchBlob } from './asset_fetcher.js';
+import { fetchBlob, deleteAssetCacheEntry } from './asset_fetcher.js';
+import { uploadDdsToTexture } from './dds_loader.js';
 
 export class TextureStreamer {
     constructor(gl, { maxTextures = 256, maxBytes = 256 * 1024 * 1024 } = {}) {
         this.gl = gl;
+        // Cache caps (user-controlled). IMPORTANT: these are NOT tied to the "quality" setting.
+        // Quality affects decode/upload behavior, not how much we keep resident.
         this.maxTextures = maxTextures;
         this.maxBytes = maxBytes;
 
@@ -30,15 +33,33 @@ export class TextureStreamer {
         this._lastFrameRequestCount = 0;
         this._lastFrameTouchedCount = 0;
 
+        // Streaming scheduler:
+        // - We record desired textures via touch()
+        // - We start a bounded number of new loads in endFrame()
+        //
+        // This prevents a single frame from spawning thousands of fetches (which causes stalls and thrash).
+        this._maxLoadsInFlight = 32;
+        this._loadsInFlight = 0;
+        this._maxNewLoadsPerFrame = 64;
+
         // Eviction/debug stats.
         this._evictionCount = 0;
         this._lastEvictedUrl = null;
         this._lastEvictedTier = null;
         this._lastErrorUrl = null;
         this._lastErrorMsg = null;
+        // Recent error ring buffer (even if console warnings are suppressed).
+        this._recentErrors = [];
+        this._recentErrorsMax = 120;
 
         // Try to avoid evicting textures that were used very recently (reduces visible churn).
         this.minResidentMs = 1250;
+
+        // Negative cache for missing texture URLs (prevents repeated 404 spam and enables
+        // "try alternate candidate" logic in renderers).
+        // url -> { untilMs: number, count: number }
+        this._missing404 = new Map();
+        this._missing404TtlMs = 10 * 60 * 1000; // 10 minutes
 
         // Distance -> tier thresholds (viewer-space units; tune as needed).
         // dist <= highDist => high, dist <= mediumDist => medium, else low.
@@ -51,12 +72,46 @@ export class TextureStreamer {
             logEvictions: false,
         };
 
-        // 1x1 placeholder (gray)
-        this.placeholder = this._createSolidTexture([160, 160, 160, 255]);
+        // Debug placeholders:
+        // Historically we used loud checkerboard placeholders (yellow=loading, magenta=missing).
+        // For debugging missing exports, placeholders are confusing: they'd look like "a texture exists".
+        // So we expose *no placeholder textures* and represent missing/loading as `null`.
+        /** @type {WebGLTexture|null} */
+        this.placeholderLoading = null;
+        /** @type {WebGLTexture|null} */
+        this.placeholderMissing = null;
+        /** @type {WebGLTexture|null} */
+        this.placeholder = null;
 
         // Color pipeline: prefer uploading color textures as sRGB so sampling returns linear.
         // (WebGL2 supports SRGB8_ALPHA8; WebGL1 may support EXT_sRGB / WEBGL_sRGB.)
         this._srgbSupport = null; // { ok: boolean, internalFormat: number, format: number } | null
+    }
+
+    _nowMs() {
+        try { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); } catch { return Date.now(); }
+    }
+
+    isMissing(url) {
+        const u = String(url || '');
+        if (!u) return false;
+        const info = this._missing404.get(u);
+        if (!info) return false;
+        const now = this._nowMs();
+        if (now >= (info.untilMs || 0)) {
+            try { this._missing404.delete(u); } catch { /* ignore */ }
+            return false;
+        }
+        return true;
+    }
+
+    _markMissing404(url) {
+        const u = String(url || '');
+        if (!u) return;
+        const now = this._nowMs();
+        const prev = this._missing404.get(u);
+        const count = (prev?.count || 0) + 1;
+        this._missing404.set(u, { untilMs: now + this._missing404TtlMs, count });
     }
 
     setQuality(q) {
@@ -64,20 +119,19 @@ export class TextureStreamer {
         if (next !== 'high' && next !== 'medium' && next !== 'low') return;
         this.quality = next;
 
-        // Adjust cache caps based on quality (rough defaults).
-        if (next === 'high') {
-            this.maxTextures = 512;
-            this.maxBytes = 512 * 1024 * 1024;
-        } else if (next === 'medium') {
-            this.maxTextures = 384;
-            this.maxBytes = 320 * 1024 * 1024;
-        } else {
-            this.maxTextures = 256;
-            this.maxBytes = 192 * 1024 * 1024;
-        }
-
         // When lowering quality, aggressively drop disallowed higher-tier textures first.
         this._evictDisallowedTiers();
+        this._evictIfNeeded();
+    }
+
+    setCacheCaps({ maxTextures, maxBytes } = {}) {
+        const mt = Number(maxTextures);
+        const mb = Number(maxBytes);
+        // maxTextures:
+        // - 0 => unlimited (still bounded by maxBytes)
+        // - N > 0 => cap loaded textures at N
+        if (Number.isFinite(mt)) this.maxTextures = Math.max(0, Math.floor(mt));
+        if (Number.isFinite(mb)) this.maxBytes = Math.max(32 * 1024 * 1024, Math.floor(mb));
         this._evictIfNeeded();
     }
 
@@ -95,6 +149,13 @@ export class TextureStreamer {
         if (logEvictions !== undefined) this.debug.logEvictions = !!logEvictions;
     }
 
+    setStreamingConfig({ maxLoadsInFlight, maxNewLoadsPerFrame } = {}) {
+        const mi = Number(maxLoadsInFlight);
+        const mpf = Number(maxNewLoadsPerFrame);
+        if (Number.isFinite(mi)) this._maxLoadsInFlight = Math.max(1, Math.min(512, Math.floor(mi)));
+        if (Number.isFinite(mpf)) this._maxNewLoadsPerFrame = Math.max(1, Math.min(2048, Math.floor(mpf)));
+    }
+
     beginFrame(frameId = null) {
         if (frameId === null || frameId === undefined) this._frameId++;
         else this._frameId = (frameId | 0);
@@ -104,6 +165,44 @@ export class TextureStreamer {
 
     endFrame() {
         this._lastFrameRequestCount = this._frameRequests.size;
+        // Start a bounded number of new loads from this frame's request set.
+        // Prefer: high priority, then nearest distance, then stable URL order.
+        try {
+            const want = Array.from(this._frameRequests.entries())
+                .map(([key, r]) => ({ key, ...r }))
+                .sort((a, b) => {
+                    const ap = (a.priority === 'high') ? 0 : 1;
+                    const bp = (b.priority === 'high') ? 0 : 1;
+                    if (ap !== bp) return ap - bp;
+                    const ad = Number(a.distance ?? 0);
+                    const bd = Number(b.distance ?? 0);
+                    if (ad !== bd) return ad - bd;
+                    return String(a.baseUrl || '').localeCompare(String(b.baseUrl || ''));
+                });
+
+            let started = 0;
+            for (const r of want) {
+                if (started >= this._maxNewLoadsPerFrame) break;
+                if (this._loadsInFlight >= this._maxLoadsInFlight) break;
+                const baseUrl = String(r.baseUrl || '');
+                if (!baseUrl) continue;
+                if (this.isMissing(baseUrl)) continue;
+
+                const kind = r.kind || 'diffuse';
+                const tier = r.tier || 'high';
+                const k = this._cacheKey(baseUrl, tier, kind);
+                const e = this.cache.get(k);
+                if (e?.tex || e?.loading) continue;
+                started++;
+                this._loadsInFlight++;
+                void this.ensure(baseUrl, { tier, priority: r.priority || 'low', kind })
+                    .catch(() => { /* errors are handled inside ensure */ })
+                    .finally(() => {
+                        try { this._loadsInFlight = Math.max(0, (this._loadsInFlight | 0) - 1); } catch { /* ignore */ }
+                    });
+            }
+        } catch { /* ignore */ }
+
         this._evictIfNeeded();
     }
 
@@ -117,6 +216,36 @@ export class TextureStreamer {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(rgba255));
+        return tex;
+    }
+
+    _createCheckerTexture({ a, b, size = 16, cell = 2 } = {}) {
+        // Creates a small RGBA checkerboard texture (NPOT-safe defaults).
+        // a/b: RGBA[4] bytes.
+        const gl = this.gl;
+        const s = Math.max(2, Math.min(256, (Number(size) | 0) || 16));
+        const c = Math.max(1, Math.min(s, (Number(cell) | 0) || 2));
+        const ca = Array.isArray(a) && a.length >= 4 ? a : [255, 0, 255, 255];
+        const cb = Array.isArray(b) && b.length >= 4 ? b : [0, 0, 0, 255];
+        const data = new Uint8Array(s * s * 4);
+        for (let y = 0; y < s; y++) {
+            for (let x = 0; x < s; x++) {
+                const useA = (((x / c) | 0) + ((y / c) | 0)) % 2 === 0;
+                const src = useA ? ca : cb;
+                const i = (y * s + x) * 4;
+                data[i + 0] = src[0] & 255;
+                data[i + 1] = src[1] & 255;
+                data[i + 2] = src[2] & 255;
+                data[i + 3] = src[3] & 255;
+            }
+        }
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, s, s, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
         return tex;
     }
 
@@ -161,7 +290,20 @@ export class TextureStreamer {
         // Color textures should be sRGB decoded for correct lighting.
         // Data textures must remain linear.
         const k = String(kind || 'diffuse').toLowerCase();
-        if (k === 'diffuse' || k === 'diffuse2' || k === 'emissive') return 'srgb';
+        // NOTE:
+        // CodeWalker generally relies on *sRGB texture views* so shader `Sample()` returns linear.
+        // In the viewer we emulate that by uploading these kinds as sRGB when supported.
+        //
+        // - diffuse/diffuse2/emissive are color
+        // - env maps are also color (lat-long reflections, and sometimes repurposed as color layers)
+        // - tint palettes are color lookup textures
+        if (
+            k === 'diffuse' ||
+            k === 'diffuse2' ||
+            k === 'emissive' ||
+            k === 'env' ||
+            k === 'tintpalette'
+        ) return 'srgb';
         return 'linear';
     }
 
@@ -190,6 +332,22 @@ export class TextureStreamer {
 
         this._srgbSupport = { ok: false, internalFormat: gl.RGBA, format: gl.RGBA };
         return this._srgbSupport;
+    }
+
+    _drainGlErrors(gl, max = 8) {
+        // WebGL error flags are sticky until read. If some *other* subsystem (terrain MSAA resolve,
+        // feedback loop, etc.) triggers an error, it can cause our texture upload sanity-check to
+        // incorrectly fail and downgrade real textures to placeholders.
+        //
+        // Drain a few pending errors so our checks only reflect errors from this code path.
+        try {
+            let n = 0;
+            while (n < (max | 0)) {
+                const e = gl.getError();
+                if (!e || e === gl.NO_ERROR) break;
+                n++;
+            }
+        } catch { /* ignore */ }
     }
 
     supportsSrgbTextures() {
@@ -383,7 +541,25 @@ export class TextureStreamer {
 
     _evictIfNeeded() {
         // Simple LRU eviction.
-        if (this.cache.size <= this.maxTextures && this.totalBytes <= this.maxBytes) return;
+        //
+        // IMPORTANT:
+        // `this.cache` also includes *loading* entries (tex=null, loading=true).
+        // Those should NOT count toward the eviction threshold, otherwise a large burst of
+        // in-flight requests can cause us to evict already-loaded textures unnecessarily,
+        // leading to severe placeholder "thrash".
+        const loadedCount = (() => {
+            try {
+                let n = 0;
+                for (const v of this.cache.values()) {
+                    if (v && v.tex && !v.loading) n++;
+                }
+                return n;
+            } catch {
+                return 0;
+            }
+        })();
+        const maxTex = (Number.isFinite(this.maxTextures) && this.maxTextures > 0) ? this.maxTextures : Infinity;
+        if (loadedCount <= maxTex && this.totalBytes <= this.maxBytes) return;
 
         const now = performance.now();
         const all = Array.from(this.cache.entries())
@@ -394,8 +570,9 @@ export class TextureStreamer {
         const entries = (oldEnough.length > 0 ? oldEnough : all)
             .sort((a, b) => (a[1].lastUse ?? 0) - (b[1].lastUse ?? 0));
 
+        let loadedRemaining = loadedCount;
         for (const [url, v] of entries) {
-            if (this.cache.size <= this.maxTextures && this.totalBytes <= this.maxBytes) break;
+            if (loadedRemaining <= maxTex && this.totalBytes <= this.maxBytes) break;
             try {
                 this.gl.deleteTexture(v.tex);
             } catch {
@@ -403,6 +580,7 @@ export class TextureStreamer {
             }
             this.totalBytes -= v.bytes || 0;
             this.cache.delete(url);
+            loadedRemaining = Math.max(0, loadedRemaining - 1);
             this._evictionCount++;
             this._lastEvictedUrl = v?.baseUrl ?? null;
             this._lastEvictedTier = v?.tier ?? null;
@@ -416,7 +594,8 @@ export class TextureStreamer {
 
     get(url, { distance = 0, kind = 'diffuse', tier = null } = {}) {
         const baseUrl = String(url || '');
-        if (!baseUrl) return this.placeholder;
+        if (!baseUrl) return null;
+        if (this.isMissing(baseUrl)) return null;
 
         const desired = this._clampTierToAllowed(tier ?? this._tierForDistance(distance, kind));
 
@@ -434,17 +613,22 @@ export class TextureStreamer {
                 e.lastUse = performance.now();
                 return e.tex;
             }
+            if (e?.loading) {
+                // Loading: return null so renderers can disable sampling cleanly.
+                return null;
+            }
         }
-        return this.placeholder;
+        return null;
     }
 
     /**
      * Return texture + metadata so renderers can decide whether shader-side sRGB decode is needed.
-     * @returns {{ tex: WebGLTexture, isPlaceholder: boolean, uploadedAsSrgb: boolean }}
+     * @returns {{ tex: WebGLTexture, isPlaceholder: boolean, uploadedAsSrgb: boolean, needsUvFlipY: boolean }}
      */
     getWithInfo(url, { distance = 0, kind = 'diffuse', tier = null } = {}) {
         const baseUrl = String(url || '');
-        if (!baseUrl) return { tex: this.placeholder, isPlaceholder: true, uploadedAsSrgb: false };
+        if (!baseUrl) return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
+        if (this.isMissing(baseUrl)) return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
         const desired = this._clampTierToAllowed(tier ?? this._tierForDistance(distance, kind));
         const wantOrder = (desired === 'high')
             ? ['high', 'medium', 'low']
@@ -456,10 +640,13 @@ export class TextureStreamer {
             const e = this.cache.get(k);
             if (e?.tex) {
                 e.lastUse = performance.now();
-                return { tex: e.tex, isPlaceholder: false, uploadedAsSrgb: !!e.uploadedAsSrgb };
+                return { tex: e.tex, isPlaceholder: false, uploadedAsSrgb: !!e.uploadedAsSrgb, needsUvFlipY: !!e.needsUvFlipY };
+            }
+            if (e?.loading) {
+                return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
             }
         }
-        return { tex: this.placeholder, isPlaceholder: true, uploadedAsSrgb: false };
+        return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
     }
 
     prefetch(url) {
@@ -472,6 +659,9 @@ export class TextureStreamer {
     touch(url, { distance = 0, kind = 'diffuse', priority = null, tier = null } = {}) {
         const baseUrl = String(url || '');
         if (!baseUrl) return;
+
+        // If we know this URL 404s, don't keep retrying every frame.
+        if (this.isMissing(baseUrl)) return;
 
         const desiredTier = this._clampTierToAllowed(tier ?? this._tierForDistance(distance, kind));
         const k = this._cacheKey(baseUrl, desiredTier, kind);
@@ -494,18 +684,16 @@ export class TextureStreamer {
         } catch { /* ignore */ }
 
         // Start load if needed (fire-and-forget; de-duped by cache entry + asset_fetcher inflight).
-        const e = this.cache.get(k);
-        if (e?.tex || e?.loading) {
-            this._lastFrameTouchedCount++;
-            return;
-        }
+        // NOTE: actual load scheduling happens in endFrame() so we can bound concurrency
+        // and prioritize by distance/priority. Here we only record intent.
         this._lastFrameTouchedCount++;
-        void this.ensure(baseUrl, { tier: desiredTier, priority: pri, kind });
     }
 
     async ensure(url, { tier = null, priority = 'low', kind = 'diffuse' } = {}) {
         const baseUrl = String(url || '');
-        if (!baseUrl) return this.placeholder;
+        if (!baseUrl) return null;
+
+        if (this.isMissing(baseUrl)) return null;
 
         const t = this._clampTierToAllowed(tier ?? this.quality);
         const key = this._cacheKey(baseUrl, t, kind);
@@ -515,21 +703,34 @@ export class TextureStreamer {
             existing.lastUse = performance.now();
             return existing.tex;
         }
-        if (existing?.loading) return this.placeholder;
+        if (existing?.loading) return null;
 
-        this.cache.set(key, { baseUrl, tier: t, tex: null, bytes: 0, lastUse: performance.now(), loading: true, uploadedAsSrgb: false });
+        this.cache.set(key, { baseUrl, tier: t, tex: null, bytes: 0, lastUse: performance.now(), loading: true, uploadedAsSrgb: false, needsUvFlipY: false });
 
         try {
             // LOW priority: textures are important for quality, but should not starve chunk/mesh/meta loads.
             const pr = (priority === 'high') ? 'high' : 'low';
-            const blob = await fetchBlob(baseUrl, { priority: pr });
+            let blob = null;
+            try {
+                blob = await fetchBlob(baseUrl, { priority: pr, usePersistentCache: true });
+            } catch (e0) {
+                // Some browsers surface ERR_CONTENT_LENGTH_MISMATCH / truncated cache entries
+                // as a generic TypeError("Failed to fetch") even though the file exists.
+                // Best-effort recovery:
+                // - evict this URL from Cache Storage
+                // - retry once without persistent cache
+                try { await deleteAssetCacheEntry(baseUrl); } catch { /* ignore */ }
+                blob = await fetchBlob(baseUrl, { priority: pr, usePersistentCache: false });
+            }
 
             const gl = this.gl;
+            this._drainGlErrors(gl, 16);
 
             // Quick sanity check: if the server returned HTML (SPA fallback) or some other non-image,
             // createImageBitmap will throw a vague "invalid format" / decode error.
             // Sniff the first few bytes to provide a clearer error message.
             let sniffIsKtx2 = false;
+            let sniffIsDds = false;
             try {
                 const head = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
                 const isPng = head.length >= 8
@@ -553,8 +754,10 @@ export class TextureStreamer {
                 const looksLikeHtml = head.length >= 1 && (head[0] === 0x3C /* '<' */);
 
                 sniffIsKtx2 = !!isKtx2;
+                sniffIsDds = !!isDds;
                 // KTX2 is supported via a separate upload path (when uncompressed RGBA8).
-                if (!(isPng || isJpeg || isGif || isBmp || isWebp || isKtx2) || looksLikeHtml) {
+                // DDS is supported via a separate upload path (compressed formats via WebGL extensions).
+                if (!(isPng || isJpeg || isGif || isBmp || isWebp || isKtx2 || isDds) || looksLikeHtml) {
                     const hex = Array.from(head).map((b) => b.toString(16).padStart(2, '0')).join(' ');
                     const kind = looksLikeHtml
                         ? 'html'
@@ -562,10 +765,15 @@ export class TextureStreamer {
                     const hint = (kind === 'html')
                         ? 'Your server is likely returning index.html (SPA fallback) for a missing /assets/... texture URL.'
                         : (kind === 'dds')
-                            ? 'This looks like a DDS file. CodeWalker commonly exports DDS; convert to PNG/JPEG/WebP for the browser, or fix your manifest/path so it references an actual PNG.'
+                            ? 'This looks like a DDS file. The viewer can upload some DDS-compressed formats (BC1/3/4/5/6H/7) via WebGL extensions, but not all DDS variants.'
                             : (kind === 'ktx2')
                                 ? 'This looks like a KTX2 texture container. If it is not uncompressed RGBA8 KTX2, the viewer will need a transcoder to support it.'
                                 : 'The bytes are not a known browser image format; the file may be corrupted or mislabeled.';
+                    // If we accidentally cached HTML under this URL, evict it so a later fix to hosting
+                    // (or a newly-added file) will be picked up without requiring a full cache clear.
+                    if (kind === 'html') {
+                        try { await deleteAssetCacheEntry(baseUrl); } catch { /* ignore */ }
+                    }
                     throw new Error(
                         `Texture blob is not a supported image (or is HTML). ` +
                         `url=${baseUrl} size=${blob.size} kind=${kind} head=[${hex}]. ` +
@@ -584,7 +792,20 @@ export class TextureStreamer {
                 const ab = await blob.arrayBuffer();
                 const out = this._uploadKtx2(ab, { kind, tier: t });
                 this.totalBytes += out.bytes;
-                this.cache.set(key, { baseUrl, tier: t, tex: out.tex, bytes: out.bytes, lastUse: performance.now(), loading: false, uploadedAsSrgb: !!out.uploadedAsSrgb });
+                // KTX2 path applies UNPACK_FLIP_Y_WEBGL during upload (like PNG).
+                this.cache.set(key, { baseUrl, tier: t, tex: out.tex, bytes: out.bytes, lastUse: performance.now(), loading: false, uploadedAsSrgb: !!out.uploadedAsSrgb, needsUvFlipY: false });
+                this._evictIfNeeded();
+                return out.tex;
+            }
+
+            // DDS path: upload compressed data without ImageBitmap.
+            if (sniffIsDds) {
+                const ab = await blob.arrayBuffer();
+                const out = uploadDdsToTexture(gl, ab, { kind, tier: t });
+                this.totalBytes += out.bytes;
+                // IMPORTANT: UNPACK_FLIP_Y_WEBGL is not reliably honored for compressedTexImage2D.
+                // To match the PNG/KTX2 upload path (which flips on upload), renderers must flip UV.y in shader for DDS.
+                this.cache.set(key, { baseUrl, tier: t, tex: out.tex, bytes: out.bytes, lastUse: performance.now(), loading: false, uploadedAsSrgb: !!out.uploadedAsSrgb, needsUvFlipY: true });
                 this._evictIfNeeded();
                 return out.tex;
             }
@@ -598,7 +819,15 @@ export class TextureStreamer {
             const canCIB = (typeof createImageBitmap === 'function');
             if (canCIB) {
                 // Always decode once so we can clamp to GPU MAX_TEXTURE_SIZE (prevents silent black textures).
-                full = await createImageBitmap(blob);
+                // Important for color correctness:
+                // - Request no implicit color space conversion
+                // - Request no alpha premultiplication
+                // (Browsers vary in support; fall back if options aren't accepted.)
+                try {
+                    full = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+                } catch {
+                    full = await createImageBitmap(blob);
+                }
 
                 // Choose target dimensions based on quality tier AND GPU max texture size.
                 const maxSize = (() => {
@@ -623,11 +852,21 @@ export class TextureStreamer {
                 }
 
                 if (targetW !== full.width || targetH !== full.height) {
-                    img = await createImageBitmap(full, {
-                        resizeWidth: targetW,
-                        resizeHeight: targetH,
-                        resizeQuality: (t === 'high') ? 'high' : (t === 'medium' ? 'medium' : 'low'),
-                    });
+                    try {
+                        img = await createImageBitmap(full, {
+                            resizeWidth: targetW,
+                            resizeHeight: targetH,
+                            resizeQuality: (t === 'high') ? 'high' : (t === 'medium' ? 'medium' : 'low'),
+                            colorSpaceConversion: 'none',
+                            premultiplyAlpha: 'none',
+                        });
+                    } catch {
+                        img = await createImageBitmap(full, {
+                            resizeWidth: targetW,
+                            resizeHeight: targetH,
+                            resizeQuality: (t === 'high') ? 'high' : (t === 'medium' ? 'medium' : 'low'),
+                        });
+                    }
                 } else {
                     img = full;
                     full = null;
@@ -659,6 +898,9 @@ export class TextureStreamer {
             // Flip Y on upload so UVs from CodeWalker line up in WebGL without shader hacks.
             // (This streamer is used for model textures, not for the terrain heightmap path.)
             const prevFlip = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
+            const prevPma = (() => {
+                try { return gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL); } catch { return null; }
+            })();
             const prevCsc = (() => {
                 try {
                     return gl.getParameter(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL);
@@ -671,6 +913,12 @@ export class TextureStreamer {
             } catch {
                 // ignore
             }
+            // GTA textures are authored as straight alpha; avoid browser-side premultiply on upload.
+            try {
+                if (prevPma !== null && typeof gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL !== 'undefined') {
+                    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+                }
+            } catch { /* ignore */ }
             try {
                 if (prevCsc !== null && typeof gl.UNPACK_COLORSPACE_CONVERSION_WEBGL !== 'undefined') {
                     gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
@@ -708,6 +956,11 @@ export class TextureStreamer {
                 // ignore
             }
             try {
+                if (prevPma !== null && typeof gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL !== 'undefined') {
+                    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, prevPma);
+                }
+            } catch { /* ignore */ }
+            try {
                 if (prevCsc !== null && typeof gl.UNPACK_COLORSPACE_CONVERSION_WEBGL !== 'undefined') {
                     gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, prevCsc);
                 }
@@ -732,6 +985,8 @@ export class TextureStreamer {
             }
             // If upload failed, don't leave an incomplete texture bound (can sample black).
             try {
+                // Drain again so we don't attribute earlier unrelated errors to this upload.
+                this._drainGlErrors(gl, 16);
                 const e0 = gl.getError();
                 if (e0 && e0 !== gl.NO_ERROR) throw new Error(`gl error ${e0} after tex upload`);
             } catch (e) {
@@ -752,14 +1007,55 @@ export class TextureStreamer {
             // Browser-image uploads can request sRGB internalFormat when supported (see internalFormat selection above).
             // Record whether this entry was uploaded as sRGB so shaders can decide whether to decode.
             const uploadedAsSrgb = (cs === 'srgb' && srgb.ok);
-            this.cache.set(key, { baseUrl, tier: t, tex, bytes, lastUse: performance.now(), loading: false, uploadedAsSrgb });
+            // Browser-image path flips on upload via UNPACK_FLIP_Y_WEBGL.
+            this.cache.set(key, { baseUrl, tier: t, tex, bytes, lastUse: performance.now(), loading: false, uploadedAsSrgb, needsUvFlipY: false });
             this._evictIfNeeded();
             return tex;
         } catch (e) {
-            // Log once per URL to make missing/cors/NPOT issues visible while keeping noise low.
+            // If this is a 404, mark it missing so we can stop spamming and allow renderers
+            // to try alternate candidate URLs (hash-only vs hash+slug, etc).
+            let status = null;
+            try {
+                const msg = String(e?.message || e || '');
+                const m = msg.match(/status=(\d+)/i);
+                status = m ? Number(m[1]) : null;
+                if (status === 404) this._markMissing404(baseUrl);
+            } catch { /* ignore */ }
+
+            // Always record for debugging, even if we suppress console warnings.
+            try {
+                const now = this._nowMs();
+                const entry = {
+                    t: now,
+                    subsystem: 'TextureStreamer',
+                    url: baseUrl,
+                    status: status,
+                    message: String(e?.message || e || 'unknown'),
+                };
+                this._recentErrors.push(entry);
+                if (this._recentErrors.length > this._recentErrorsMax) {
+                    this._recentErrors.splice(0, this._recentErrors.length - this._recentErrorsMax);
+                }
+                try {
+                    globalThis.__viewerReportError?.({
+                        subsystem: 'texture',
+                        level: (status === 404) ? 'warn' : 'error',
+                        message: entry.message,
+                        url: baseUrl,
+                        detail: { status },
+                        stack: e?.stack,
+                        name: e?.name,
+                    });
+                } catch { /* ignore */ }
+            } catch { /* ignore */ }
+
+            // Log once per URL to make real issues visible while keeping noise low.
+            // IMPORTANT: 404s are often expected because we probe alternate candidate URLs
+            // (e.g. hash-only vs hash+slug). Avoid confusing "fail" spam when the fallback succeeds.
             try {
                 if (!this._warned) this._warned = new Set();
-                if (!this._warned.has(baseUrl)) {
+                const shouldWarn = (status !== 404) || !!this.debug?.enabled;
+                if (shouldWarn && !this._warned.has(baseUrl)) {
                     this._warned.add(baseUrl);
                     console.warn('TextureStreamer: failed to load texture', baseUrl, e);
                 }
@@ -769,18 +1065,35 @@ export class TextureStreamer {
                 this._lastErrorMsg = String(e?.message || e || 'unknown');
             } catch { /* ignore */ }
             this.cache.delete(key);
-            return this.placeholder;
+            return null;
         }
     }
 
     getStats() {
         let loading = 0;
+        let loaded = 0;
         for (const v of this.cache.values()) {
             if (v?.loading) loading++;
+            if (v?.tex && !v?.loading) loaded++;
         }
+        // Count currently-active missing URLs (TTL not expired).
+        let missing404 = 0;
+        try {
+            const now = this._nowMs();
+            for (const info of this._missing404.values()) {
+                if (info && now < (info.untilMs || 0)) missing404++;
+            }
+        } catch { /* ignore */ }
         return {
-            textures: this.cache.size,
+            // `textures` is how many GPU textures are actually resident (loaded).
+            // Keep `cacheEntries` as a separate field so we can see if we’re accumulating too many
+            // in-flight placeholder entries.
+            textures: loaded,
+            cacheEntries: this.cache.size,
             loading,
+            loadsInFlight: this._loadsInFlight,
+            maxLoadsInFlight: this._maxLoadsInFlight,
+            maxNewLoadsPerFrame: this._maxNewLoadsPerFrame,
             bytes: this.totalBytes,
             maxTextures: this.maxTextures,
             maxBytes: this.maxBytes,
@@ -793,7 +1106,117 @@ export class TextureStreamer {
             lastFrameTouches: this._lastFrameTouchedCount,
             qualityCap: this._allowedTierMax(),
             tierConfig: { highDist: this.highDist, mediumDist: this.mediumDist, minResidentMs: this.minResidentMs },
+            missing404,
+            recentErrors: (() => {
+                try { return (this._recentErrors || []).slice(Math.max(0, (this._recentErrors || []).length - 10)); } catch { return []; }
+            })(),
         };
+    }
+
+    getRecentErrors(n = 25) {
+        const nn = Number.isFinite(Number(n)) ? Math.max(0, Math.min(500, Math.floor(Number(n)))) : 25;
+        return (this._recentErrors || []).slice(Math.max(0, (this._recentErrors || []).length - nn));
+    }
+
+    /**
+     * Debug helper: return a summary of URLs in the "missing 404" negative cache.
+     * This is useful for sharing a concrete "what textures are missing right now" dump.
+     */
+    getMissing404Summary(limit = 50) {
+        const lim = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(500, Math.floor(Number(limit)))) : 50;
+        try {
+            const now = this._nowMs();
+            /** @type {Array<{ url: string, count: number, ttlMs: number }>} */
+            const rows = [];
+            for (const [url, info] of (this._missing404 || new Map()).entries()) {
+                const untilMs = Number(info?.untilMs || 0);
+                const ttlMs = Math.max(0, Math.floor(untilMs - now));
+                const count = Number(info?.count || 0) | 0;
+                rows.push({ url: String(url || ''), count, ttlMs });
+            }
+            rows.sort((a, b) => (b.count - a.count) || (a.ttlMs - b.ttlMs) || a.url.localeCompare(b.url));
+            return rows.slice(0, lim);
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Build a JSON-serializable debug dump for missing/loading texture diagnosis.
+     * This is intentionally lightweight and stable so we can persist it to disk.
+     */
+    buildDebugDump({ reason = 'manual', limitMissing = 200, limitErrors = 50 } = {}) {
+        const now = (() => {
+            try { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); } catch { return Date.now(); }
+        })();
+        const iso = (() => {
+            try { return new Date().toISOString(); } catch { return null; }
+        })();
+        const stats = (() => {
+            try { return this.getStats(); } catch { return null; }
+        })();
+        const missing = (() => {
+            try { return this.getMissing404Summary(limitMissing); } catch { return []; }
+        })();
+        const errors = (() => {
+            try { return this.getRecentErrors(limitErrors); } catch { return []; }
+        })();
+        return {
+            kind: 'textures',
+            reason,
+            timeIso: iso,
+            timeMs: now,
+            page: (() => { try { return globalThis.location?.href || null; } catch { return null; } })(),
+            userAgent: (() => { try { return globalThis.navigator?.userAgent || null; } catch { return null; } })(),
+            stats,
+            missing404: missing,
+            recentErrors: errors,
+        };
+    }
+
+    /**
+     * Download a debug dump as a JSON file (browser-only).
+     */
+    downloadDebugDump(dumpObj, { filename = null } = {}) {
+        try {
+            const obj = dumpObj || this.buildDebugDump({ reason: 'download' });
+            const txt = JSON.stringify(obj, null, 2);
+            const blob = new Blob([txt], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const ts = (() => {
+                try { return new Date().toISOString().replace(/[:.]/g, '-'); } catch { return 'dump'; }
+            })();
+            a.href = url;
+            a.download = filename || `viewer_textures_${ts}.json`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } }, 2500);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * POST a debug dump to a local dump server that writes it to disk.
+     * Defaults to the companion server started by `webgl_viewer/run.py`.
+     */
+    async postDebugDump(dumpObj, { endpoint = '/__viewer_dump' } = {}) {
+        const obj = dumpObj || this.buildDebugDump({ reason: 'post' });
+        const ep = String(endpoint || '').trim();
+        if (!ep) throw new Error('postDebugDump: empty endpoint');
+        const res = await fetch(ep, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(obj),
+        });
+        if (!res.ok) {
+            const t = await res.text().catch(() => '');
+            throw new Error(`postDebugDump: HTTP ${res.status} ${t}`.slice(0, 500));
+        }
+        return await res.json().catch(() => ({}));
     }
 }
 

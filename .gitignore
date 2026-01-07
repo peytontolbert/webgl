@@ -8,3 +8,10 @@ webgl_viewer/dist/
 wrappers/
 webgl_viewer/node_modules/
 CodeWalker/
+.venv/
+*json
+*jsonl
+webgl_viewer/data/
+repos/
+output-olf/
+webgl_viewer_old/

@@ -1,6 +1,7 @@
 import { glMatrix } from './glmatrix.js';
 import { extractFrustumPlanes, aabbIntersectsFrustum } from './frustum_culling.js';
 import { fetchArrayBufferWithPriority, fetchJSON, fetchNDJSON } from './asset_fetcher.js';
+import { joaat } from './joaat.js';
 
 export class EntityStreamer {
     constructor({ modelMatrix }) {
@@ -31,6 +32,97 @@ export class EntityStreamer {
         // Whether to use CacheStorage for streamed chunk files (JSONL / optional bins).
         // Default false because chunks can be very large; controlled by the UI.
         this.usePersistentCacheForChunks = false;
+
+        // Stale-request cancellation/dropping for chunk loads.
+        /** @type {Map<string, { controller: AbortController, token: number }>} */
+        this._chunkLoadReqs = new Map();
+        this._chunkLoadNextToken = 1;
+
+        // Time/weather ymap gating (optional; driven by assets/ymap_gates.json).
+        this.enableTimeWeatherYmapGating = true;
+        /** @type {null | { byYmapHash?: Record<string, { hoursOnOff?: number, weatherTypes?: Array<string|number> }> }} */
+        this._ymapGates = null;
+        this._ymapGateHour = 13;
+        this._ymapGateWeatherHash = 0;
+
+        // Lightweight diagnostics (surfaced in perf HUD / console).
+        this.stats = {
+            started: 0,
+            loaded: 0,
+            aborted: 0,
+            failed: 0,
+            lastError: '',
+        };
+    }
+
+    setTimeWeather({ hour = null, weather = null } = {}) {
+        const h0 = Number(hour);
+        const nextHour = Number.isFinite(h0) ? Math.max(0, Math.min(23, Math.floor(h0 % 24))) : this._ymapGateHour;
+
+        let nextWeather = this._ymapGateWeatherHash;
+        if (weather !== null && weather !== undefined) {
+            if (typeof weather === 'number') nextWeather = Number.isFinite(weather) ? (weather >>> 0) : 0;
+            else {
+                const s = String(weather || '').trim();
+                nextWeather = s ? (joaat(s.toLowerCase()) >>> 0) : 0;
+            }
+        }
+
+        const changed = (nextHour !== this._ymapGateHour) || (nextWeather !== this._ymapGateWeatherHash);
+        this._ymapGateHour = nextHour;
+        this._ymapGateWeatherHash = nextWeather;
+        // Entity dots can be rebuilt by reloading chunks; we fail-open if gates not present.
+        // To keep this lightweight, we do not force reload on every change here.
+        return changed;
+    }
+
+    _ymapHashFromPath(p) {
+        const s0 = String(p || '').trim();
+        if (!s0) return 0;
+        const s = s0.replace(/\\/g, '/');
+        const parts = s.split('/');
+        const last = parts.length ? parts[parts.length - 1] : s;
+        const base = last.replace(/\.ymap$/i, '').trim().toLowerCase();
+        if (!base) return 0;
+        try { return (joaat(base) >>> 0); } catch { return 0; }
+    }
+
+    _isYmapAvailableHash(ymapHashU32) {
+        if (!this.enableTimeWeatherYmapGating) return true;
+        if (!this._ymapGates || typeof this._ymapGates !== 'object') return true;
+        const by = this._ymapGates.byYmapHash;
+        if (!by || typeof by !== 'object') return true;
+        const h = (Number(ymapHashU32) >>> 0);
+        if (!h) return true; // unknown => fail open
+        const gate = by[String(h)];
+        if (!gate || typeof gate !== 'object') return true;
+
+        const mask = Number(gate.hoursOnOff ?? gate.hours_onoff ?? 0);
+        const hour = (Number(this._ymapGateHour) | 0);
+        if (Number.isFinite(mask) && mask !== 0 && hour >= 0 && hour <= 23) {
+            const bit = (1 << hour) >>> 0;
+            if (((mask >>> 0) & bit) === 0) return false;
+        }
+
+        const w = (Number(this._ymapGateWeatherHash) >>> 0);
+        const weathers = gate.weatherTypes ?? gate.weather_types ?? null;
+        if (w !== 0 && Array.isArray(weathers) && weathers.length > 0) {
+            for (const vv of weathers) {
+                const n = Number(vv);
+                if (Number.isFinite(n) && (n >>> 0) === w) return true;
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    _isYmapAvailableObj(obj) {
+        if (!this.enableTimeWeatherYmapGating || !this._ymapGates) return true;
+        const ymapHash =
+            (Number(obj?.ymap_hash ?? obj?.ymapHash ?? obj?.ymap_hash32 ?? 0) >>> 0) ||
+            this._ymapHashFromPath(obj?.ymap);
+        return this._isYmapAvailableHash(ymapHash);
     }
 
     async init() {
@@ -40,7 +132,29 @@ export class EntityStreamer {
             console.warn('No entities_index.json found; entity streaming disabled.');
             return;
         }
+        try {
+            const gates = await fetchJSON('assets/ymap_gates.json', { priority: 'low', usePersistentCache: true });
+            if (gates && typeof gates === 'object') {
+                this._ymapGates = gates;
+                const by = gates.byYmapHash;
+                const hasAny = !!(by && typeof by === 'object' && Object.keys(by).length > 0);
+                if (hasAny && this.enableTimeWeatherYmapGating) this.preferBinary = false; // ENT0 has no ymap identity
+            }
+        } catch {
+            this._ymapGates = null;
+        }
         this.ready = true;
+    }
+
+    _cancelChunkLoad(key, reason = 'cancelled') {
+        const k = String(key || '');
+        if (!k) return;
+        const req = this._chunkLoadReqs.get(k);
+        if (!req) return;
+        try { req.controller.abort(); } catch { /* ignore */ }
+        this._chunkLoadReqs.delete(k);
+        try { this.loading.delete(k); } catch { /* ignore */ }
+        try { this.stats.aborted++; } catch { /* ignore */ }
     }
 
     _cameraToDataSpace(cameraPosVec3) {
@@ -164,6 +278,11 @@ export class EntityStreamer {
 
         if (this.loaded.has(key) || this.loading.has(key)) return;
         this.loading.add(key);
+        const controller = new AbortController();
+        const token = (this._chunkLoadNextToken++ >>> 0);
+        this._chunkLoadReqs.set(key, { controller, token });
+        const signal = controller.signal;
+        try { this.stats.started++; } catch { /* ignore */ }
 
         try {
             const jsonlPath = `assets/${this.index.chunks_dir}/${meta.file}`;
@@ -175,7 +294,7 @@ export class EntityStreamer {
                 try {
                     const binFile = String(meta.file || '').replace(/\.jsonl$/i, '.bin');
                     const binPath = `assets/entities_chunks_bin/${binFile}`;
-                    const buf = await fetchArrayBufferWithPriority(binPath, { priority, usePersistentCache: this.usePersistentCacheForChunks });
+                    const buf = await fetchArrayBufferWithPriority(binPath, { priority, usePersistentCache: this.usePersistentCacheForChunks, signal });
                     const dv = new DataView(buf);
                     if (dv.byteLength >= 8) {
                         const magic =
@@ -222,7 +341,9 @@ export class EntityStreamer {
                 await fetchNDJSON(jsonlPath, {
                     usePersistentCache: this.usePersistentCacheForChunks,
                     priority,
+                    signal,
                     onObject: (obj) => {
+                        if (!this._isYmapAvailableObj(obj)) return;
                         const pos = obj?.position;
                         if (!pos || pos.length < 3) return;
                         const x = Number(pos[0]);
@@ -235,15 +356,27 @@ export class EntityStreamer {
                 positions = out.subarray(0, n);
             }
 
+            // Drop stale/aborted loads before mutating any renderer state.
+            const live = this._chunkLoadReqs.get(key);
+            if (!live || live.token !== token || signal.aborted) return;
+
             if (positions && positions.length > 0) {
                 entityRenderer.setChunk(key, positions);
             }
 
             this.loaded.add(key);
+            try { this.stats.loaded++; } catch { /* ignore */ }
         } catch (e) {
-            console.warn(`Chunk load failed ${key}:`, e);
+            const isAbort = (String(e?.name || '') === 'AbortError');
+            if (!isAbort) {
+                try { this.stats.failed++; } catch { /* ignore */ }
+                try { this.stats.lastError = String(e?.message || e || ''); } catch { /* ignore */ }
+                console.warn(`Chunk load failed ${key}:`, e);
+            }
         } finally {
             this.loading.delete(key);
+            const live = this._chunkLoadReqs.get(key);
+            if (live && live.token === token) this._chunkLoadReqs.delete(key);
         }
     }
 
@@ -254,6 +387,10 @@ export class EntityStreamer {
                 entityRenderer.deleteChunk(key);
                 this.loaded.delete(key);
             }
+        }
+        // Cancel any in-flight loads that are no longer wanted.
+        for (const k of Array.from(this.loading)) {
+            if (!wantedSet.has(k)) this._cancelChunkLoad(k, 'stale_inflight_not_wanted');
         }
 
         // Hard cap, if needed

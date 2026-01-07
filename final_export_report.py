@@ -16,6 +16,7 @@ import json
 import struct
 from pathlib import Path
 
+from gta5_modules.script_paths import auto_assets_dir
 
 FLAG_HAS_TANGENTS = 4
 
@@ -31,14 +32,7 @@ def main() -> None:
     ap.add_argument("--max-missing", type=int, default=50, help="Max missing texture paths to print")
     args = ap.parse_args()
 
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
 
     models_dir = assets_dir / "models"
     shard_dir = models_dir / "manifest_shards"

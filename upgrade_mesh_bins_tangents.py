@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
+from gta5_modules.script_paths import auto_assets_dir
 
 MESH_MAGIC = b"MSH0"
 FLAG_HAS_NORMALS = 1
@@ -171,14 +172,7 @@ def main() -> None:
     ap.add_argument("--max", type=int, default=0, help="Limit number of bins processed (0 = all)")
     args = ap.parse_args()
 
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
 
     models_dir = assets_dir / "models"
     if not models_dir.exists():

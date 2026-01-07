@@ -15,6 +15,7 @@ import { clearAssetCacheStorage, clearAssetMemoryCaches, fetchJSON, setAssetFetc
 import { OcclusionCuller } from './occlusion.js';
 import { FileBlobReader } from './vfs/readers.js';
 import { RpfArchive } from './rpf/rpf_archive.js';
+import { PostFxRenderer } from './postfx_renderer.js';
 
 const _LS_SETTINGS_KEY = 'webglgta.viewer.settings.v1';
 const _LS_VIEW_KEY = 'webglgta.viewer.view.v1';
@@ -102,6 +103,77 @@ export class App {
     constructor(canvas) {
         this.canvas = canvas;
 
+        // Centralized error reporting (keeps "silent failures" debuggable without console spam).
+        // Other modules can call: globalThis.__viewerReportError({ subsystem, message, ... }).
+        this._errorRing = [];
+        this._errorRingMax = 250;
+        this._warnedOnce = new Set();
+        const pushErr = (info) => {
+            try {
+                const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                const entry = {
+                    t: now,
+                    subsystem: String(info?.subsystem || 'app'),
+                    level: String(info?.level || 'error'),
+                    message: String(info?.message || 'unknown error'),
+                    name: info?.name ? String(info.name) : undefined,
+                    url: info?.url ? String(info.url) : undefined,
+                    detail: info?.detail ?? undefined,
+                    stack: info?.stack ? String(info.stack) : undefined,
+                };
+                this._errorRing.push(entry);
+                if (this._errorRing.length > this._errorRingMax) this._errorRing.splice(0, this._errorRing.length - this._errorRingMax);
+            } catch {
+                // ignore
+            }
+        };
+        const warnOnce = (key, ...args) => {
+            const k = String(key || '');
+            if (!k) return;
+            if (this._warnedOnce.has(k)) return;
+            this._warnedOnce.add(k);
+            try { console.warn(...args); } catch { /* ignore */ }
+        };
+        try {
+            globalThis.__viewerReportError = (info) => pushErr(info);
+            globalThis.__viewerGetErrors = (n = 100) => {
+                const nn = Number.isFinite(Number(n)) ? Math.max(0, Math.min(1000, Math.floor(Number(n)))) : 100;
+                return this._errorRing.slice(Math.max(0, this._errorRing.length - nn));
+            };
+            globalThis.__viewerClearErrors = () => { try { this._errorRing.length = 0; } catch { /* ignore */ } };
+            globalThis.__viewerWarnOnce = warnOnce;
+        } catch {
+            // ignore
+        }
+
+        // Capture global errors/rejections that otherwise show up as confusing "nothing happened".
+        try {
+            window.addEventListener('error', (e) => {
+                pushErr({
+                    subsystem: 'window',
+                    level: 'error',
+                    message: e?.message || 'window error',
+                    url: e?.filename,
+                    detail: { lineno: e?.lineno, colno: e?.colno },
+                    stack: e?.error?.stack,
+                    name: e?.error?.name,
+                });
+            });
+            window.addEventListener('unhandledrejection', (e) => {
+                const r = e?.reason;
+                pushErr({
+                    subsystem: 'promise',
+                    level: 'error',
+                    message: (r && (r.message || String(r))) || 'unhandled rejection',
+                    detail: { reason: r },
+                    stack: r?.stack,
+                    name: r?.name,
+                });
+            });
+        } catch {
+            // ignore
+        }
+
         // Let index.html's inline boot UI know the module actually started.
         try {
             window.__viewerSetBootStatus?.('main.js loaded; creating app…');
@@ -125,6 +197,35 @@ export class App {
             }
         }
         console.log('WebGL context created successfully');
+
+        // Post FX (CodeWalker-like tone mapping/bloom). WebGL2 only.
+        this.postFx = null;
+        this.enablePostFx = false;
+        this.postFxExposure = 1.0;
+        this.postFxLum = 1.0;
+        this.enableAutoExposure = false;
+        this.autoExposureSpeed = 1.5;
+        this.enableBloom = false;
+        this.bloomStrength = 0.6;
+        // CodeWalker BRIGHT_THRESHOLD is 50.0 in PPBloomFilterBPHCS.hlsl.
+        this.bloomThreshold = 50.0;
+        this.bloomRadius = 2.0;
+        try {
+            const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (this.gl instanceof WebGL2RenderingContext);
+            if (isWebGL2) {
+                this.postFx = new PostFxRenderer(this.gl);
+                this.postFx.init().then((ok) => {
+                    if (!ok) console.warn('PostFxRenderer: init failed (post FX disabled).');
+                });
+            }
+        } catch {
+            this.postFx = null;
+        }
+
+        // Shadows (directional shadow map). Optional and OFF by default.
+        // UI can enable it later; renderer treats falsy as disabled.
+        this.enableShadows = false;
+        this.shadowMapSize = 2048;
 
         // Streaming can trigger hundreds of loads; keep fetch concurrency bounded to avoid resource exhaustion.
         // (Cache hits bypass the limiter.)
@@ -154,6 +255,13 @@ export class App {
         // Initialize camera first
         this.camera = new Camera();
         console.log('Camera initialized');
+
+        // Map-view snapshot so "character/ped view" can be toggled off and restore the prior free camera pose.
+        this._mapViewSnapshot = null; // { position:[x,y,z], target:[x,y,z], fov, minZoom, maxZoom, near, far }
+        this._spawnCharacterBtn = null;
+
+        // Camera speed UI (multiplies Camera.moveSpeed)
+        this._baseCameraMoveSpeed = Number(this.camera.moveSpeed) || 500.0;
         
         // Initialize terrain renderer
         this.terrainRenderer = new TerrainRenderer(this.gl);
@@ -178,11 +286,62 @@ export class App {
         this.entityDotsOverlay = false;
 
         // Real GTA drawables (exported offline into assets/models/*)
+        // Cache sizing heuristic:
+        // - Browsers vary wildly in how much GPU memory they can actually allocate for WebGL buffers/textures.
+        // - `navigator.deviceMemory` (GB) is a coarse signal, but good enough to avoid picking absurd defaults
+        //   for low-memory devices while still allowing large GTA-scale caches on desktops.
+        const devMemGb = (() => {
+            try {
+                const v = Number((typeof navigator !== 'undefined') ? navigator.deviceMemory : NaN);
+                return Number.isFinite(v) ? v : null;
+            } catch { return null; }
+        })();
+        const cacheCaps = (() => {
+            // Defaults assume desktop-class hardware.
+            let meshGb = 4;
+            let texGb = 1.5;
+            let maxTextures = 4096;
+            if (devMemGb !== null) {
+                if (devMemGb <= 4) {
+                    meshGb = 1;
+                    texGb = 0.5;
+                    maxTextures = 1024;
+                } else if (devMemGb <= 8) {
+                    meshGb = 2;
+                    texGb = 1.0;
+                    maxTextures = 2048;
+                } else if (devMemGb >= 16) {
+                    meshGb = 6;      // big desktop/workstation
+                    texGb = 2.0;
+                    maxTextures = 8192;
+                }
+            }
+            return {
+                deviceMemoryGb: devMemGb,
+                meshMaxBytes: Math.floor(meshGb * 1024 * 1024 * 1024),
+                texMaxBytes: Math.floor(texGb * 1024 * 1024 * 1024),
+                texMaxTextures: maxTextures,
+            };
+        })();
+
         this.modelManager = new ModelManager(this.gl);
         // Default: strict mode (missing exports simply don't appear).
         // You can toggle placeholders on in the UI to visualize missing exports.
         this.modelManager.enablePlaceholderMeshes = false;
-        this.textureStreamer = new TextureStreamer(this.gl, { maxTextures: 512, maxBytes: 512 * 1024 * 1024 });
+        // Mesh cache caps (GPU buffer residency).
+        // The base game has a huge number of unique mesh bins; low budgets churn constantly when streaming.
+        // If your GPU/driver can't handle this much residency, lower it via DevTools:
+        //   __viewerApp.modelManager.setMeshCacheCaps({ maxBytes: ... })
+        try { this.modelManager.setMeshCacheCaps?.({ maxBytes: cacheCaps.meshMaxBytes }); } catch { /* ignore */ }
+        // Default texture cache caps:
+        // We keep these reasonably high to avoid visible texture eviction/thrash when many unique
+        // materials are in view (city blocks, highways, vegetation).
+        //
+        // NOTE: eviction is now based on *loaded* textures, not in-flight entries, so larger scenes
+        // won't immediately churn even when many loads are pending.
+        this.textureStreamer = new TextureStreamer(this.gl, { maxTextures: cacheCaps.texMaxTextures, maxBytes: cacheCaps.texMaxBytes });
+        // Limit how many new texture loads we start each frame (prevents huge stalls/thrash in dense scenes).
+        try { this.textureStreamer.setStreamingConfig({ maxLoadsInFlight: 32, maxNewLoadsPerFrame: 64 }); } catch { /* ignore */ }
         this.instancedModelRenderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
         this.drawableStreamer = new DrawableStreamer({
             modelMatrix: this.entityRenderer.modelMatrix,
@@ -225,7 +384,8 @@ export class App {
 
         // Persistence + cache
         this.restoreOnRefresh = true;
-        this.cacheStreamedChunks = false;
+        // Default ON when CacheStorage is available; can be toggled in UI and persists via localStorage.
+        this.cacheStreamedChunks = supportsAssetCacheStorage();
         this._settingsSaveTimer = null;
         this._lastViewSaveMs = 0;
         this._restoredViewApplied = false;
@@ -235,6 +395,11 @@ export class App {
         this.ped = null; // { posData: [x,y,z], posView: [x,y,z], camOffset: [x,y,z] }
         this.followPed = true;
         this.controlPed = false;
+
+        // Follow-ped vertical smoothing (terrain height changes can cause unpleasant camera bob).
+        // We smooth only Y so horizontal tracking stays responsive.
+        this._followPedYSmoothed = null;  // viewer-space Y
+        this._followPedYSharpness = 18.0; // higher = snappier (less smoothing)
 
         // Convention: `ped.posData` is the *eye/aim point* in data-space (not the feet).
         // We keep the ped on terrain by setting Z = groundZ + this offset.
@@ -262,6 +427,10 @@ export class App {
         // Atmosphere (sky + fog)
         this.atmosphereEnabled = true;
         this.timeOfDayHours = 13.0; // 0..24
+        // Optional "game-like" weather selection (used for ymap time/weather gating if ymap_gates.json is present).
+        // Leave empty to ignore weather-based gating.
+        // You can set this from DevTools: __viewerApp.weatherType = 'CLEAR';
+        this.weatherType = '';
         this.fogEnabled = true;
         this.fogStart = 1200.0;
         this.fogEnd = 9000.0;
@@ -472,6 +641,19 @@ export class App {
         try { data = JSON.parse(raw); } catch { data = null; }
         if (!data || typeof data !== 'object') return;
 
+        // Backward-compat: older builds stored camera speed as a multiplier slider (id `cameraSpeed`, range 0.1..10).
+        // New builds store it as 1..100 (id `cameraSpeedPct`) where pct=10 => 1.0x.
+        try {
+            if (data.cameraSpeedPct === undefined && data.cameraSpeed !== undefined) {
+                const oldMul = Number(data.cameraSpeed);
+                if (Number.isFinite(oldMul) && oldMul > 0) {
+                    data.cameraSpeedPct = String(Math.round(oldMul * 10));
+                }
+            }
+        } catch {
+            // ignore
+        }
+
         const setVal = (id) => {
             const el = document.getElementById(id);
             if (!el) return;
@@ -487,12 +669,15 @@ export class App {
             'showModels', 'crossArchetypeInstancing', 'showPlaceholders',
             'followPed', 'controlPed', 'groundPedToTerrain',
             'enableAtmosphere', 'enableFog',
+            'enablePostFx', 'postFxExposure', 'postFxLum', 'enableAutoExposure', 'autoExposureSpeed', 'enableBloom', 'bloomStrength', 'bloomThreshold', 'bloomRadius',
             'frustumCulling', 'streamFromCamera',
             'enableOcclusionCulling',
+            'enableShadows', 'shadowMapSize',
             'enablePerfHud',
             'restoreOnRefresh', 'cacheStreamedChunks',
             'streamRadius', 'maxLoadedChunks', 'maxArchetypes', 'maxModelDistance', 'maxMeshLoadsInFlight',
             'textureQuality', 'lodLevel',
+            'cameraSpeedPct',
             'timeOfDay', 'fogStart', 'fogEnd',
             'groundPedMaxDelta',
             'pedCoords', 'camCoords',
@@ -513,12 +698,15 @@ export class App {
             'showModels', 'crossArchetypeInstancing', 'showPlaceholders',
             'followPed', 'controlPed', 'groundPedToTerrain',
             'enableAtmosphere', 'enableFog',
+            'enablePostFx', 'postFxExposure', 'postFxLum', 'enableAutoExposure', 'autoExposureSpeed', 'enableBloom', 'bloomStrength', 'bloomThreshold', 'bloomRadius',
             'frustumCulling', 'streamFromCamera',
             'enableOcclusionCulling',
+            'enableShadows', 'shadowMapSize',
             'enablePerfHud',
             'restoreOnRefresh', 'cacheStreamedChunks',
             'streamRadius', 'maxLoadedChunks', 'maxArchetypes', 'maxModelDistance', 'maxMeshLoadsInFlight',
             'textureQuality', 'lodLevel',
+            'cameraSpeedPct',
             'timeOfDay', 'fogStart', 'fogEnd',
             'groundPedMaxDelta',
             'pedCoords', 'camCoords',
@@ -631,7 +819,8 @@ export class App {
 
         const radius = Number.isFinite(r) ? Math.max(1, Math.min(24, Math.floor(r))) : 2;
         const maxLoaded = Number.isFinite(m) ? Math.max(9, Math.min(4000, Math.floor(m))) : 25;
-        const maxArch = Number.isFinite(a) ? Math.max(0, Math.min(20000, Math.floor(a))) : 250;
+        // 0 means "no cap" (distance cutoff still applies).
+        const maxArch = Number.isFinite(a) ? Math.max(0, Math.floor(a)) : 250;
         const maxDist = Number.isFinite(md) ? Math.max(0, Math.min(100000, md)) : 350;
         const maxLoads = Number.isFinite(ml) ? Math.max(1, Math.min(64, Math.floor(ml))) : 6;
         return { radius, maxLoaded, maxArch, maxDist, maxLoads, fc };
@@ -792,6 +981,8 @@ export class App {
 
         // Kick streaming once to populate wanted keys and begin async loads.
         if (this.entityReady) this.entityStreamer.update(this.camera, this.entityRenderer, center);
+        try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
+        try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
         if (this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
 
         // Wait briefly for initial chunk bubble to load (bounded; don't hang forever).
@@ -811,6 +1002,8 @@ export class App {
 
             // Keep requesting wanted chunks (async loads are fire-and-forget).
             if (this.entityReady) this.entityStreamer.update(this.camera, this.entityRenderer, center);
+            try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
+            try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             if (this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
 
             // Drive mesh queue without drawing.
@@ -980,9 +1173,10 @@ export class App {
         const off = glMatrix.vec3.fromValues(this.ped.camOffset[0], this.ped.camOffset[1], this.ped.camOffset[2]);
         const dist = glMatrix.vec3.length(off) || 10.0;
 
-        // Match Camera.zoom behavior: pass delta in same scale as current code (wheelDeltaY * 0.001).
-        const delta = wheelDeltaY * 0.001;
-        const newDist = dist * (1.0 - delta * 0.5);
+        // Match Camera.zoom / gameplay camera behavior: exponential zoom with clamping.
+        const k = 0.0012;
+        const exp = Math.max(-0.25, Math.min(0.25, (Number(wheelDeltaY) || 0.0) * k));
+        const newDist = dist * Math.exp(exp);
         const clamped = Math.max(this.camera.minZoom, Math.min(this.camera.maxZoom, newDist));
 
         glMatrix.vec3.normalize(off, off);
@@ -1011,6 +1205,159 @@ export class App {
         const nums = parts.slice(0, 4).map(v => Number(v));
         while (nums.length < 4) nums.push(0);
         return nums;
+    }
+
+    _parseVec3Any(text) {
+        // Accept common debug formats:
+        // - vec3(x, y, z)
+        // - vector3(x, y, z)
+        // - vector4(x, y, z, w)  (we take xyz)
+        // - "x y z" / "x,y,z"
+        // - pasted blocks like "viewer: vec3(...)\n data: vec3(...)" (we take the first vec3/vector4)
+        if (!text) return null;
+        const s = String(text);
+
+        // Prefer explicit vec3/vector3/vector4 groups if present.
+        const m3 = s.match(/vec3\s*\(\s*([^\)]+)\s*\)/i) || s.match(/vector3\s*\(\s*([^\)]+)\s*\)/i);
+        if (m3) {
+            const parts = String(m3[1]).split(',').map(p => p.trim()).filter(Boolean);
+            if (parts.length >= 3) {
+                const v = [Number(parts[0]), Number(parts[1]), Number(parts[2])];
+                if (this._isFiniteVec3(v)) return v;
+            }
+        }
+        const m4 = s.match(/vector4\s*\(\s*([^\)]+)\s*\)/i);
+        if (m4) {
+            const parts = String(m4[1]).split(',').map(p => p.trim()).filter(Boolean);
+            if (parts.length >= 3) {
+                const v = [Number(parts[0]), Number(parts[1]), Number(parts[2])];
+                if (this._isFiniteVec3(v)) return v;
+            }
+        }
+
+        // Fallback: extract first 3 numbers from the string.
+        const nums = (s.match(/-?\d+(?:\.\d+)?/g) || []).slice(0, 3).map(Number);
+        if (nums.length >= 3) {
+            const v = [nums[0], nums[1], nums[2]];
+            if (this._isFiniteVec3(v)) return v;
+        }
+        return null;
+    }
+
+    teleportCameraToViewer(posViewVec3) {
+        if (!this._isFiniteVec3(posViewVec3)) return false;
+
+        // If we are in character view, exit first so follow/gameplay camera doesn't instantly override.
+        try {
+            if (this.player?.enabled) this.exitCharacterView();
+        } catch { /* ignore */ }
+
+        // Ensure we are not in ped-follow mode (otherwise update() will immediately lock to ped).
+        this.followPed = false;
+        this.controlPed = false;
+        this._followPedYSmoothed = null;
+        try {
+            const follow = document.getElementById('followPed');
+            if (follow) follow.checked = false;
+            const control = document.getElementById('controlPed');
+            if (control) control.checked = false;
+        } catch { /* ignore */ }
+
+        // Preserve current orientation: keep direction + distance and just move the camera rig.
+        const dist = Number(this.camera?.getDistance?.()) || 1000.0;
+        const dir = this.camera?.direction ? [this.camera.direction[0], this.camera.direction[1], this.camera.direction[2]] : [0, 0, -1];
+        const dl = Math.hypot(dir[0], dir[1], dir[2]) || 1.0;
+        dir[0] /= dl; dir[1] /= dl; dir[2] /= dl;
+
+        this.camera.position[0] = posViewVec3[0];
+        this.camera.position[1] = posViewVec3[1];
+        this.camera.position[2] = posViewVec3[2];
+        this.camera.target[0] = posViewVec3[0] + dir[0] * dist;
+        this.camera.target[1] = posViewVec3[1] + dir[1] * dist;
+        this.camera.target[2] = posViewVec3[2] + dir[2] * dist;
+        this.camera.updateViewMatrix();
+        return true;
+    }
+
+    _snapshotMapViewPose() {
+        // Capture the current free camera pose + key camera params so we can restore after toggling ped/character view.
+        this._mapViewSnapshot = {
+            position: [this.camera.position[0], this.camera.position[1], this.camera.position[2]],
+            target: [this.camera.target[0], this.camera.target[1], this.camera.target[2]],
+            fov: this.camera.fieldOfView,
+            minZoom: this.camera.minZoom,
+            maxZoom: this.camera.maxZoom,
+            near: this.camera.nearPlane,
+            far: this.camera.farPlane,
+        };
+    }
+
+    _restoreMapViewPoseIfAny() {
+        const s = this._mapViewSnapshot;
+        if (!s) return;
+        try {
+            this.camera.position[0] = s.position[0];
+            this.camera.position[1] = s.position[1];
+            this.camera.position[2] = s.position[2];
+            this.camera.target[0] = s.target[0];
+            this.camera.target[1] = s.target[1];
+            this.camera.target[2] = s.target[2];
+            this.camera.setFovDegrees?.(s.fov);
+            this.camera.setZoomLimits?.(s.minZoom, s.maxZoom);
+            this.camera.setClipPlanes?.(s.near, s.far);
+            this.camera.updateViewMatrix();
+        } catch {
+            // ignore
+        }
+        this._mapViewSnapshot = null;
+    }
+
+    _setSpawnCharacterButtonLabel() {
+        const btn = this._spawnCharacterBtn;
+        if (!btn) return;
+        const inChar = !!(this.player && this.player.enabled);
+        btn.textContent = inChar ? 'Exit character view (back to map)' : 'Spawn character (GTA camera)';
+    }
+
+    exitCharacterView() {
+        // Disable player mesh instance (and clear its instance buffer so it doesn't linger).
+        const h = this.player?.hash;
+        const lod = this.player?.lod || 'high';
+        if (this.player) {
+            this.player.enabled = false;
+            this.player.hash = null;
+        }
+        try {
+            if (h && this.instancedModelRenderer?.ready && this.instancedModelRenderer.setInstancesForArchetype) {
+                // Empty instance list.
+                void this.instancedModelRenderer.setInstancesForArchetype(String(h), String(lod), new Float32Array(0), 0.0);
+            }
+        } catch {
+            // ignore
+        }
+
+        // Clear ped state + marker.
+        this.ped = null;
+        try { this.pedRenderer?.setPositions?.([]); } catch { /* ignore */ }
+
+        // Exit follow/control mode back to map view defaults.
+        this.followPed = false;
+        this.controlPed = false;
+        this._followPedYSmoothed = null;
+
+        // Best-effort UI sync.
+        try {
+            const follow = document.getElementById('followPed');
+            if (follow) follow.checked = false;
+            const control = document.getElementById('controlPed');
+            if (control) control.checked = false;
+        } catch {
+            // ignore
+        }
+
+        // Restore prior map-view camera pose if we captured it.
+        this._restoreMapViewPoseIfAny();
+        this._setSpawnCharacterButtonLabel();
     }
 
     _isFiniteVec3(v) {
@@ -1164,17 +1511,52 @@ export class App {
 
         let baseZ = desiredZ;
         let usedGround = false;
-        if (this.groundPedToTerrain && Number.isFinite(groundZ)) {
+        let usedInterior = false;
+        let interior = null;
+
+        // If the point is in/near a known MLO room, prefer its floor and/or avoid terrain-snapping.
+        // This prevents spawns from ending up *under* interior floors when terrain is close.
+        try {
+            const zHint = Number.isFinite(desiredZ)
+                ? desiredZ
+                : (Number.isFinite(groundZ) ? groundZ : 0.0);
+            interior = this.drawableStreamer?.getInteriorFloorAtDataPos?.([x, y, zHint], {
+                zPadBelow: 14.0,
+                zPadAbove: 8.0,
+                maxRaise: this.groundPedMaxDelta,
+            }) || null;
+        } catch {
+            interior = null;
+        }
+
+        const blockTerrainSnap = !!(interior && interior.inRoom);
+        if (!blockTerrainSnap && this.groundPedToTerrain && Number.isFinite(groundZ)) {
             if (!Number.isFinite(baseZ) || Math.abs(baseZ - groundZ) <= this.groundPedMaxDelta) {
                 baseZ = groundZ;
                 usedGround = true;
+            }
+        }
+
+        // If interior floor is known and would raise us, snap up (prefer smallest raise).
+        if (interior && Number.isFinite(interior.floorZ)) {
+            if (!Number.isFinite(baseZ) || interior.floorZ > baseZ) {
+                baseZ = interior.floorZ;
+                usedInterior = true;
+                usedGround = false;
             }
         }
         if (!Number.isFinite(baseZ)) baseZ = Number.isFinite(groundZ) ? groundZ : 0.0;
 
         const z = baseZ + this.pedEyeHeightData; // eye-height-ish offset
         this.spawnPedAt([x, y, z]);
-        this._pedGroundingDebug = { desiredZ, groundZ: Number.isFinite(groundZ) ? groundZ : null, finalZ: z, usedGround };
+        this._pedGroundingDebug = {
+            desiredZ,
+            groundZ: Number.isFinite(groundZ) ? groundZ : null,
+            interiorFloorZ: (interior && Number.isFinite(interior.floorZ)) ? interior.floorZ : null,
+            usedGround,
+            usedInterior,
+            finalZ: z,
+        };
 
         // Place camera at CamCoords and look at ped.
         const camData = [camV4[0], camV4[1], camV4[2]];
@@ -1233,6 +1615,15 @@ export class App {
      * with a GTA-ish 3rd-person camera rig.
      */
     async spawnCharacter() {
+        // Toggle: if already spawned, clicking again exits back to map view.
+        if (this.player?.enabled) {
+            this.exitCharacterView();
+            return;
+        }
+
+        // Snapshot the current map-view pose so we can toggle back later.
+        this._snapshotMapViewPose();
+
         // Ensure a ped exists first (and it already applies a 3rd-person-ish camera rig).
         this.spawnPedAtCity();
 
@@ -1284,6 +1675,7 @@ export class App {
 
         // Seed the player mesh instance once (updates after that use the fast path).
         try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+        this._setSpawnCharacterButtonLabel();
     }
 
     _initGameplayCameraFromCurrentPose() {
@@ -1319,6 +1711,14 @@ export class App {
     _updateGameplayCamera(dt) {
         if (!this.ped) return;
         const pedView = this._dataToViewer(this.ped.posData);
+
+        // Smooth vertical component to reduce bobbing when the ped is grounded to noisy terrain.
+        // (This keeps GTA-like responsiveness in X/Z while filtering Y.)
+        if (!Number.isFinite(this._followPedYSmoothed)) this._followPedYSmoothed = pedView[1];
+        const ySharp = Number.isFinite(Number(this._followPedYSharpness)) ? Number(this._followPedYSharpness) : 18.0;
+        const ay = 1.0 - Math.exp(-Math.max(1.0, ySharp) * Math.max(0.001, dt));
+        this._followPedYSmoothed = this._followPedYSmoothed * (1 - ay) + pedView[1] * ay;
+        pedView[1] = this._followPedYSmoothed;
 
         // Desired camera position in viewer-space from yaw/pitch/dist.
         const cy = Math.cos(this._gpPitch);
@@ -1456,8 +1856,28 @@ export class App {
                 for (let i = 0; i < Math.min(4, info.texture_info.layers.length); i++) {
                     const layer = info.texture_info.layers[i];
                     await this.terrainRenderer.loadTexture(`layer${i + 1}`, `assets/textures/${layer.name}_diffuse.png`);
+                    // Normal-map naming in extracted assets isn't perfectly consistent (some are *_normal.png,
+                    // others come through as *_nm_diffuse.png). Try both.
+                    const tryNormal = async (key, baseName, { preferAltFirst = false } = {}) => {
+                        const canonical = `assets/textures/${baseName}_normal.png`;
+                        const alt = `assets/textures/${baseName}_nm_diffuse.png`;
+
+                        // Prefer canonical naming for "has_normal" layers, but avoid 404 spam for layers that
+                        // claim they don't have normals (some still ship as *_nm_diffuse.png, e.g. da_dirttrack2).
+                        const first = preferAltFirst ? alt : canonical;
+                        const second = preferAltFirst ? canonical : alt;
+
+                        const ok1 = await this.terrainRenderer.loadTexture(key, first);
+                        if (ok1) return true;
+                        return await this.terrainRenderer.loadTexture(key, second);
+                    };
+
                     if (layer.has_normal) {
-                        await this.terrainRenderer.loadTexture(`normal${i + 1}`, `assets/textures/${layer.name}_normal.png`);
+                        await tryNormal(`normal${i + 1}`, layer.name, { preferAltFirst: false });
+                    } else {
+                        // If metadata says "no normal" but we actually have an nm texture, use it anyway.
+                        // (loadTexture returns false if missing; that's fine.)
+                        await tryNormal(`normal${i + 1}`, layer.name, { preferAltFirst: true });
                     }
                 }
             }
@@ -1480,26 +1900,33 @@ export class App {
     setupEventListeners() {
         // Apply persisted UI state first so all the "read initial values" logic below picks it up.
         this._restoreUiFromStorage();
+        const hasSavedSettings = !!this._safeLocalStorageGet(_LS_SETTINGS_KEY);
 
         // Window resize
         window.addEventListener('resize', () => {
             this.resize();
         });
         
-        // Mouse movement
-        let isDragging = false;
+        // Mouse / pointer movement (use pointer capture so dragging doesn't "drop" when leaving the canvas).
+        let activePointerId = null;
         let lastX = 0;
         let lastY = 0;
-        
-        this.canvas.addEventListener('mousedown', (e) => {
-            isDragging = true;
+
+        // Prevent context menu from stealing focus while looking around.
+        this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        this.canvas.addEventListener('pointerdown', (e) => {
+            // Left button only for now; prevents accidental camera motion while interacting with the page.
+            if (e.button !== 0) return;
+            activePointerId = e.pointerId;
             lastX = e.clientX;
             lastY = e.clientY;
+            try { this.canvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
         });
-        
-        this.canvas.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            
+
+        this.canvas.addEventListener('pointermove', (e) => {
+            if (activePointerId === null || e.pointerId !== activePointerId) return;
+
             const deltaX = e.clientX - lastX;
             const deltaY = e.clientY - lastY;
 
@@ -1510,14 +1937,19 @@ export class App {
             } else {
                 this.camera.rotate(deltaX, deltaY);
             }
-            
+
             lastX = e.clientX;
             lastY = e.clientY;
         });
-        
-        this.canvas.addEventListener('mouseup', () => {
-            isDragging = false;
-        });
+
+        const stopDrag = (e) => {
+            if (activePointerId === null) return;
+            try { this.canvas.releasePointerCapture(activePointerId); } catch { /* ignore */ }
+            activePointerId = null;
+        };
+        this.canvas.addEventListener('pointerup', stopDrag);
+        this.canvas.addEventListener('pointercancel', stopDrag);
+        window.addEventListener('blur', stopDrag);
         
         // Mouse wheel
         this.canvas.addEventListener('wheel', (e) => {
@@ -1526,7 +1958,8 @@ export class App {
                 if (this.gameplayCamEnabled) this._applyGameplayCameraZoomDelta(e.deltaY);
                 else this._zoomFollowPed(e.deltaY);
             } else {
-                this.camera.zoom(e.deltaY * 0.001);
+                // Pass raw wheel delta; Camera.zoom handles normalization/clamping.
+                this.camera.zoom(e.deltaY);
             }
         });
         
@@ -1596,6 +2029,9 @@ export class App {
         }
         const spawnCharBtn = document.getElementById('spawnCharacter');
         if (spawnCharBtn) {
+            this._spawnCharacterBtn = spawnCharBtn;
+            // Ensure label matches current state (e.g. restored sessions).
+            this._setSpawnCharacterButtonLabel();
             spawnCharBtn.addEventListener('click', () => { void this.spawnCharacter(); });
         }
 
@@ -1624,6 +2060,8 @@ export class App {
             this.followPed = !!follow.checked;
             follow.addEventListener('change', (e) => {
                 this.followPed = !!e.target.checked;
+                // Reset smoothing state when switching modes so we don't "snap" from stale values.
+                this._followPedYSmoothed = null;
                 if (this.followPed && this.ped) {
                     // Recompute offset based on current camera state
                     const camOffset = glMatrix.vec3.create();
@@ -1925,7 +2363,7 @@ export class App {
             const radius = Number.isFinite(r) ? Math.max(1, Math.min(24, Math.floor(r))) : 2;
             const maxLoaded = Number.isFinite(m) ? Math.max(9, Math.min(4000, Math.floor(m))) : 25;
             // 0 means "no cap" (distance cutoff still applies).
-            const maxArch = Number.isFinite(a) ? Math.max(0, Math.min(20000, Math.floor(a))) : 250;
+            const maxArch = Number.isFinite(a) ? Math.max(0, Math.floor(a)) : 250;
             const maxDist = Number.isFinite(md) ? Math.max(0, Math.min(100000, md)) : 350;
             const maxLoads = Number.isFinite(ml) ? Math.max(1, Math.min(64, Math.floor(ml))) : 6;
 
@@ -1997,6 +2435,30 @@ export class App {
             });
         }
 
+        // Directional shadow map (sun shadows) toggle + size.
+        const sh = document.getElementById('enableShadows');
+        if (sh) {
+            this.enableShadows = !!sh.checked;
+            sh.addEventListener('change', (e) => {
+                this.enableShadows = !!e.target.checked;
+                this._scheduleSaveSettings();
+            });
+        } else {
+            this.enableShadows = false;
+        }
+        const shSize = document.getElementById('shadowMapSize');
+        if (shSize) {
+            const parse = () => {
+                const v = Number(shSize.value);
+                this.shadowMapSize = Number.isFinite(v) ? Math.max(256, Math.min(8192, Math.floor(v))) : 2048;
+                this._scheduleSaveSettings();
+            };
+            parse();
+            shSize.addEventListener('change', parse);
+        } else {
+            this.shadowMapSize = 2048;
+        }
+
         const perfHud = document.getElementById('enablePerfHud');
         if (perfHud) {
             this.enablePerfHud = !!perfHud.checked;
@@ -2030,6 +2492,11 @@ export class App {
 
         const cacheChunksEl = document.getElementById('cacheStreamedChunks');
         if (cacheChunksEl) {
+            // If the user hasn't saved settings yet, default to enabling persistent chunk cache
+            // when CacheStorage is available (feels much more game-like on revisits).
+            if (!hasSavedSettings) {
+                try { cacheChunksEl.checked = supportsAssetCacheStorage(); } catch { /* ignore */ }
+            }
             this.cacheStreamedChunks = !!cacheChunksEl.checked;
             if (this.entityStreamer) this.entityStreamer.usePersistentCacheForChunks = this.cacheStreamedChunks;
             if (this.drawableStreamer) this.drawableStreamer.usePersistentCacheForChunks = this.cacheStreamedChunks;
@@ -2054,16 +2521,22 @@ export class App {
                 // Clear in-memory caches immediately (these survive until reload otherwise).
                 try { clearAssetMemoryCaches(); } catch { /* ignore */ }
                 const ok = await clearAssetCacheStorage();
+                // Also clear persisted viewer UI/view state so a "clear cache" feels like a clean slate.
+                try { window.localStorage.removeItem(_LS_SETTINGS_KEY); } catch { /* ignore */ }
+                try { window.localStorage.removeItem(_LS_VIEW_KEY); } catch { /* ignore */ }
                 try {
                     clearCacheBtn.textContent = ok ? 'Cache cleared' : 'Cache not available';
                     setTimeout(() => { clearCacheBtn.textContent = 'Clear cache'; }, 1200);
                 } catch {
                     // ignore
                 }
-                // Best-effort: force a reload so stale module/asset caches don't linger.
-                // (The "Clear cache" button is about runtime assets + viewer state; the browser HTTP cache
-                // for JS modules is outside CacheStorage. Reloading is the most reliable UX.)
-                try { window.location.reload(); } catch { /* ignore */ }
+                // Only reload when CacheStorage exists (otherwise it feels like the button "does nothing"
+                // other than refreshing the page).
+                if (ok) {
+                    // Best-effort: force a reload so stale module/asset caches don't linger.
+                    // (The browser HTTP cache for JS modules is outside CacheStorage.)
+                    try { window.location.reload(); } catch { /* ignore */ }
+                }
             });
         }
 
@@ -2238,6 +2711,93 @@ export class App {
             fogEnd.addEventListener('change', apply);
             apply();
         }
+
+        // Post FX controls (tone mapping / bloom)
+        const postFx = document.getElementById('enablePostFx');
+        if (postFx) {
+            this.enablePostFx = !!postFx.checked;
+            postFx.addEventListener('change', (e) => {
+                this.enablePostFx = !!e.target.checked;
+                this._scheduleSaveSettings();
+            });
+        }
+        const postFxExposure = document.getElementById('postFxExposure');
+        if (postFxExposure) {
+            const apply = () => {
+                const v = Number(postFxExposure.value);
+                if (Number.isFinite(v)) this.postFxExposure = Math.max(0.0, Math.min(10.0, v));
+            };
+            postFxExposure.addEventListener('input', apply);
+            postFxExposure.addEventListener('change', () => { apply(); this._scheduleSaveSettings(); });
+            apply();
+        }
+        const postFxLum = document.getElementById('postFxLum');
+        if (postFxLum) {
+            const apply = () => {
+                const v = Number(postFxLum.value);
+                if (Number.isFinite(v)) this.postFxLum = Math.max(0.0, Math.min(10.0, v));
+            };
+            postFxLum.addEventListener('input', apply);
+            postFxLum.addEventListener('change', () => { apply(); this._scheduleSaveSettings(); });
+            apply();
+        }
+
+        const autoExp = document.getElementById('enableAutoExposure');
+        if (autoExp) {
+            this.enableAutoExposure = !!autoExp.checked;
+            autoExp.addEventListener('change', (e) => {
+                this.enableAutoExposure = !!e.target.checked;
+                this._scheduleSaveSettings();
+            });
+        }
+        const autoExpSpeed = document.getElementById('autoExposureSpeed');
+        if (autoExpSpeed) {
+            const apply = () => {
+                const v = Number(autoExpSpeed.value);
+                if (Number.isFinite(v)) this.autoExposureSpeed = Math.max(0.0, Math.min(10.0, v));
+            };
+            autoExpSpeed.addEventListener('input', apply);
+            autoExpSpeed.addEventListener('change', () => { apply(); this._scheduleSaveSettings(); });
+            apply();
+        }
+        const bloom = document.getElementById('enableBloom');
+        if (bloom) {
+            this.enableBloom = !!bloom.checked;
+            bloom.addEventListener('change', (e) => {
+                this.enableBloom = !!e.target.checked;
+                this._scheduleSaveSettings();
+            });
+        }
+        const bloomStrength = document.getElementById('bloomStrength');
+        if (bloomStrength) {
+            const apply = () => {
+                const v = Number(bloomStrength.value);
+                if (Number.isFinite(v)) this.bloomStrength = Math.max(0.0, Math.min(4.0, v));
+            };
+            bloomStrength.addEventListener('input', apply);
+            bloomStrength.addEventListener('change', () => { apply(); this._scheduleSaveSettings(); });
+            apply();
+        }
+        const bloomThreshold = document.getElementById('bloomThreshold');
+        if (bloomThreshold) {
+            const apply = () => {
+                const v = Number(bloomThreshold.value);
+                if (Number.isFinite(v)) this.bloomThreshold = Math.max(0.0, Math.min(1000.0, v));
+            };
+            bloomThreshold.addEventListener('input', apply);
+            bloomThreshold.addEventListener('change', () => { apply(); this._scheduleSaveSettings(); });
+            apply();
+        }
+        const bloomRadius = document.getElementById('bloomRadius');
+        if (bloomRadius) {
+            const apply = () => {
+                const v = Number(bloomRadius.value);
+                if (Number.isFinite(v)) this.bloomRadius = Math.max(0.0, Math.min(8.0, v));
+            };
+            bloomRadius.addEventListener('input', apply);
+            bloomRadius.addEventListener('change', () => { apply(); this._scheduleSaveSettings(); });
+            apply();
+        }
         const tod = document.getElementById('timeOfDay');
         if (tod) {
             const apply = () => {
@@ -2248,6 +2808,196 @@ export class App {
             tod.addEventListener('change', apply);
             apply();
         }
+
+        // Camera speed slider (~0.1..200 where 10 => 1.0x multiplier on Camera.moveSpeed)
+        const camSpeed = document.getElementById('cameraSpeedPct');
+        const camSpeedValue = document.getElementById('cameraSpeedValue');
+        if (camSpeed) {
+            const apply = () => {
+                const v = Number(camSpeed.value);
+                const vv = Number.isFinite(v) ? Math.max(0.1, Math.min(200.0, v)) : 10.0;
+                const m = vv / 10.0; // 10 => 1.0x, 200 => 20x
+                this.camera.moveSpeed = this._baseCameraMoveSpeed * m;
+                if (camSpeedValue) {
+                    const vvText = vv.toFixed(1).replace(/\.0$/, '');
+                    const mText = (m < 1.0 ? m.toFixed(2) : m.toFixed(1)).replace(/\.0$/, '');
+                    camSpeedValue.textContent = `${vvText} (${mText}×)`;
+                }
+            };
+            camSpeed.addEventListener('input', apply);
+            camSpeed.addEventListener('change', apply);
+            apply();
+        }
+
+        // Reset camera (full map framing)
+        const resetCam = document.getElementById('resetCamera');
+        if (resetCam) {
+            resetCam.addEventListener('click', () => {
+                try { this.resetCameraToFullMap(); } catch { /* ignore */ }
+            });
+        }
+
+        // Teleport camera (viewer-space coords)
+        const tpInput = document.getElementById('teleportCoords');
+        const tpBtn = document.getElementById('teleportCamera');
+        const doTeleport = () => {
+            const v = this._parseVec3Any(tpInput?.value);
+            if (!v) {
+                console.warn('Teleport: could not parse coords. Expected vec3(x,y,z) or x y z.');
+                return;
+            }
+            const ok = this.teleportCameraToViewer(v);
+            if (!ok) console.warn('Teleport: invalid coords.');
+        };
+        if (tpBtn) tpBtn.addEventListener('click', () => { try { doTeleport(); } catch { /* ignore */ } });
+        if (tpInput) {
+            tpInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    try { doTeleport(); } catch { /* ignore */ }
+                }
+            });
+        }
+    }
+
+    _getSceneBoundsViewForMap() {
+        // Prefer terrain AABB (most reliable), then building mesh bounds.
+        const tb = this.terrainRenderer?.sceneBoundsView;
+        if (tb && tb.min && tb.max) return tb;
+        const bb = this.buildingRenderer?.boundsView;
+        if (bb && bb.min && bb.max) return bb;
+        return null;
+    }
+
+    resetCameraToFullMap() {
+        // If we are in character view, exit first so follow/gameplay camera doesn't instantly override.
+        try {
+            if (this.player?.enabled) this.exitCharacterView();
+        } catch { /* ignore */ }
+
+        // Ensure we are not in ped-follow mode (otherwise update() will immediately lock to ped).
+        this.followPed = false;
+        this.controlPed = false;
+        this._followPedYSmoothed = null;
+        try {
+            const follow = document.getElementById('followPed');
+            if (follow) follow.checked = false;
+            const control = document.getElementById('controlPed');
+            if (control) control.checked = false;
+        } catch { /* ignore */ }
+
+        const b = this._getSceneBoundsViewForMap();
+        if (b) {
+            this.camera.frameAABB(b.min, b.max);
+            // Reset map-ish defaults.
+            this.camera.setFovDegrees?.(45.0);
+            this.camera.setZoomLimits?.(1.0, 80000.0);
+            return;
+        }
+
+        // Fallback to the camera constructor defaults.
+        this.camera.position[0] = 10000;
+        this.camera.position[1] = 8000;
+        this.camera.position[2] = 10000;
+        this.camera.target[0] = 0;
+        this.camera.target[1] = 0;
+        this.camera.target[2] = 0;
+        this.camera.setFovDegrees?.(45.0);
+        this.camera.setZoomLimits?.(1.0, 80000.0);
+        this.camera.updateViewMatrix();
+    }
+
+    _clampMapViewCameraToBounds() {
+        // Only clamp in map view (not in ped follow); follow mode intentionally overrides the camera pose.
+        if (this.followPed && this.ped) return;
+
+        const b = this._getSceneBoundsViewForMap();
+        if (!b || !b.min || !b.max) return;
+        const mn = b.min;
+        const mx = b.max;
+        if (!(mn.length >= 3 && mx.length >= 3)) return;
+
+        // Horizontal bounds (viewer XZ plane). Keep a small margin so clamping doesn't feel sticky at edges.
+        const sx = Math.max(1.0, (mx[0] - mn[0]));
+        const sz = Math.max(1.0, (mx[2] - mn[2]));
+        const marginX = Math.max(250.0, sx * 0.05);
+        const marginZ = Math.max(250.0, sz * 0.05);
+        const minX = mn[0] - marginX;
+        const maxX = mx[0] + marginX;
+        const minZ = mn[2] - marginZ;
+        const maxZ = mx[2] + marginZ;
+
+        // IMPORTANT: clamp based on CAMERA POSITION, not target.
+        // If we clamp the target, click+drag rotation (which changes target) would cause camera translation,
+        // which feels like "dragging moves location". WASD should be responsible for translation.
+        const px0 = this.camera.position[0];
+        const pz0 = this.camera.position[2];
+        const px = Math.max(minX, Math.min(maxX, px0));
+        const pz = Math.max(minZ, Math.min(maxZ, pz0));
+        const dx = px - px0;
+        const dz = pz - pz0;
+        if (dx !== 0.0 || dz !== 0.0) {
+            // Translate both position and target to preserve view direction while keeping the camera "over the map".
+            this.camera.position[0] += dx;
+            this.camera.position[2] += dz;
+            this.camera.target[0] += dx;
+            this.camera.target[2] += dz;
+            this.camera.updateViewMatrix();
+        }
+    }
+
+    _updateMapViewClipPlanes() {
+        // Fix: when we frame the whole map (frameAABB), nearPlane can become huge and then
+        // close geometry gets clipped when you zoom in. Keep clip planes responsive to distance.
+        if (this.followPed && this.ped) return; // follow/ped mode manages clip planes separately
+
+        const d = this.camera.getDistance?.() ?? glMatrix.vec3.distance(this.camera.position, this.camera.target);
+        const dist = Number(d);
+        if (!Number.isFinite(dist) || dist <= 0.01) return;
+
+        // Heuristic tuned for GTA-scale viewing:
+        // - near: small enough for close inspection, but grows with distance to preserve depth precision.
+        // - far: large enough for full-map view, but not insanely large when close (avoids z-fighting).
+        const near = Math.max(0.05, Math.min(10.0, dist * 0.001));    // dist=100 -> 0.1, 1k -> 1, 10k -> 10
+        const far = Math.max(5000.0, Math.min(1000000.0, dist * 600)); // dist=1k -> 600k, dist=10k -> 1M (clamped)
+        this.camera.setClipPlanes?.(near, far);
+    }
+
+    _keepMapViewCameraAboveTerrain() {
+        // In map view you can fly the camera below the terrain (e.g. holding E).
+        // Keep camera + target above terrain in DATA space by lifting both together.
+        if (this.followPed && this.ped) return;
+        if (!this.terrainRenderer?.getHeightAtXY) return;
+
+        const posD = this._viewerPosToDataPos(this.camera.position);
+        const tgtD = this._viewerPosToDataPos(this.camera.target);
+        if (!posD || !tgtD) return;
+
+        const px = Number(posD[0]), py = Number(posD[1]), pz = Number(posD[2]);
+        const tx = Number(tgtD[0]), ty = Number(tgtD[1]), tz = Number(tgtD[2]);
+        if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) return;
+        if (!Number.isFinite(tx) || !Number.isFinite(ty) || !Number.isFinite(tz)) return;
+
+        const hPos = this.terrainRenderer.getHeightAtXY(px, py);
+        const hp = (hPos === null || hPos === undefined) ? NaN : Number(hPos);
+
+        // Clearances in DATA-space Z units (GTA-ish). Keep a tiny cushion to avoid z-fighting/going underground.
+        const posClear = 2.0;
+
+        let raise = 0.0;
+        if (Number.isFinite(hp)) raise = Math.max(raise, (hp + posClear) - pz);
+
+        if (!(raise > 0.0)) return;
+        // Avoid absurd lifts from bad samples.
+        raise = Math.min(5000.0, raise);
+
+        const posV = this._dataToViewer([px, py, pz + raise]);
+        const tgtV = this._dataToViewer([tx, ty, tz + raise]);
+        if (!posV || !tgtV) return;
+
+        this.camera.position[0] = posV[0]; this.camera.position[1] = posV[1]; this.camera.position[2] = posV[2];
+        this.camera.target[0] = tgtV[0]; this.camera.target[1] = tgtV[1]; this.camera.target[2] = tgtV[2];
+        this.camera.updateViewMatrix();
     }
     
     resize() {
@@ -2321,7 +3071,12 @@ export class App {
                 if (hz !== null && hz !== undefined) this.ped.posData[2] = hz + this.pedEyeHeightData;
                 this.pedRenderer.setPositions([this.ped.posData]);
             } else {
-                this.camera.move(moveDir);
+                // Map view (not following a ped): fly camera in the air (move along look direction).
+                // Ped view/follow: keep WASD level to avoid unwanted bobbing while orbiting around the character.
+                // Only flatten in *actual* ped-follow mode (a ped exists). The UI defaults "Follow ped" to checked,
+                // but in the default map view there is no ped, and movement should be true fly (move along look).
+                const flattenForward = !!(this.followPed && this.ped);
+                this.camera.move(moveDir, dt, { flattenForward });
             }
         }
 
@@ -2343,6 +3098,14 @@ export class App {
                 this._updateGameplayCamera(dt);
             } else {
                 this.ped.posView = this._dataToViewer(this.ped.posData);
+
+                // Smooth vertical component to reduce bobbing while walking over terrain.
+                if (!Number.isFinite(this._followPedYSmoothed)) this._followPedYSmoothed = this.ped.posView[1];
+                const ySharp = Number.isFinite(Number(this._followPedYSharpness)) ? Number(this._followPedYSharpness) : 18.0;
+                const ay = 1.0 - Math.exp(-Math.max(1.0, ySharp) * Math.max(0.001, dt));
+                this._followPedYSmoothed = this._followPedYSmoothed * (1 - ay) + this.ped.posView[1] * ay;
+                this.ped.posView[1] = this._followPedYSmoothed;
+
                 this.camera.lookAtPoint(this.ped.posView);
                 this.camera.position[0] = this.ped.posView[0] + this.ped.camOffset[0];
                 this.camera.position[1] = this.ped.posView[1] + this.ped.camOffset[1];
@@ -2350,6 +3113,16 @@ export class App {
                 this.camera.updateViewMatrix();
             }
         }
+
+        // Map-view guardrails: keep the camera from drifting far away from the world bounds.
+        // This is intentionally light-touch: it only clamps the horizontal (XZ) target/position.
+        try { this._clampMapViewCameraToBounds(); } catch { /* ignore */ }
+
+        // Map-view grounding: keep camera above the terrain so the viewer doesn't end up underground.
+        try { this._keepMapViewCameraAboveTerrain(); } catch { /* ignore */ }
+
+        // Map-view clip planes: prevent near-plane clipping of close meshes after map framing/zooming.
+        try { this._updateMapViewClipPlanes(); } catch { /* ignore */ }
 
         // Keep the player mesh instance updated (single-instance archetype render).
         try { this._syncPlayerEntityMesh(false); } catch { /* ignore */ }
@@ -2363,6 +3136,8 @@ export class App {
         // Stream drawables based on camera (requires exported meshes manifest)
         if (this.showModels && this.modelsInitialized) {
             const center = (!this.streamFromCamera && this.followPed && this.ped) ? this.ped.posData : null;
+            try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
+            try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             this.drawableStreamer.update(this.camera, center);
         }
 
@@ -2371,6 +3146,7 @@ export class App {
             const eLoaded = this.entityStreamer?.loaded?.size ?? 0;
             const eLoading = this.entityStreamer?.loading?.size ?? 0;
             const eChunks = this.entityRenderer?.chunkBuffers?.size ?? 0;
+            const es = this.entityStreamer?.stats || null;
             const dLoaded = this.drawableStreamer?.loaded?.size ?? 0;
             const dLoading = this.drawableStreamer?.loading?.size ?? 0;
             const mCount = (this.modelsInitialized && this.modelManager?.manifest?.meshes)
@@ -2388,7 +3164,10 @@ export class App {
                 : 'Coverage (loaded area): n/a';
 
             this._streamDebugEl.textContent =
-                `Entities: ready=${!!this.entityReady} chunks=${eChunks} loaded=${eLoaded} loading=${eLoading} dots=${!!this.showEntityDots}\n` +
+                `Entities: ready=${!!this.entityReady} chunks=${eChunks} loaded=${eLoaded} loading=${eLoading} dots=${!!this.showEntityDots}` +
+                (es ? ` started=${es.started ?? 0} ok=${es.loaded ?? 0} abort=${es.aborted ?? 0} fail=${es.failed ?? 0}` : '') +
+                (es && es.lastError ? ` lastErr=${String(es.lastError).slice(0, 80)}` : '') +
+                `\n` +
                 `Drawables: on=${modelsOn} initialized=${!!this.modelsInitialized} manifestMeshes=${mCount} loaded=${dLoaded} loading=${dLoading}\n` +
                 covLine;
         }
@@ -2408,8 +3187,10 @@ export class App {
         if (this._pedDebugEl && this._pedGroundingDebug) {
             const d = this._pedGroundingDebug;
             const gz = (d.groundZ === null || d.groundZ === undefined) ? 'n/a' : d.groundZ.toFixed(2);
+            const iz = (d.interiorFloorZ === null || d.interiorFloorZ === undefined) ? 'n/a' : d.interiorFloorZ.toFixed(2);
             const dz = Number.isFinite(d.desiredZ) ? d.desiredZ.toFixed(2) : 'n/a';
-            this._pedDebugEl.textContent = `Z desired=${dz} | ground=${gz} | final=${d.finalZ.toFixed(2)} | ${d.usedGround ? 'snapped' : 'kept'}`;
+            const mode = d.usedInterior ? 'interior' : (d.usedGround ? 'terrain' : 'kept');
+            this._pedDebugEl.textContent = `Z desired=${dz} | ground=${gz} | interiorFloor=${iz} | final=${d.finalZ.toFixed(2)} | ${mode}`;
         } else if (this._pedDebugEl) {
             this._pedDebugEl.textContent = '';
         }
@@ -2419,6 +3200,19 @@ export class App {
     }
     
     render() {
+        // Color pipeline note:
+        // The UI stores colors in sRGB-ish space (what humans pick), but our shaders do lighting/fog math in *linear*.
+        // Passing sRGB colors directly into linear math causes an overly strong blue/purple cast (especially fog/env).
+        const _srgbToLinear1 = (c) => {
+            const x = Math.max(0, Math.min(1, Number(c) || 0));
+            return (x <= 0.04045) ? (x / 12.92) : Math.pow((x + 0.055) / 1.055, 2.4);
+        };
+        const _srgbToLinear3 = (rgb) => {
+            const r = Array.isArray(rgb) ? rgb : [0.6, 0.7, 0.8];
+            return [_srgbToLinear1(r[0]), _srgbToLinear1(r[1]), _srgbToLinear1(r[2])];
+        };
+        const fogColorLinear = _srgbToLinear3(this.fogColor || [0.6, 0.7, 0.8]);
+
         // Per-frame texture visibility/distance policy (models call textureStreamer.touch(...) while drawing).
         try { this.textureStreamer?.beginFrame?.(); } catch { /* ignore */ }
 
@@ -2427,26 +3221,74 @@ export class App {
             try { this._gpuTimer?.beginFrame?.(); } catch { /* ignore */ }
         }
 
-        // Clear buffers first.
-        this.gl.clearColor(0.0, 0.0, 0.0, 1.0);
-        this.gl.clear(this.gl.COLOR_BUFFER_BIT | this.gl.DEPTH_BUFFER_BIT);
+        // Optional CodeWalker-like post FX:
+        // render the whole scene into an offscreen framebuffer in linear space, then tonemap+encode once.
+        const postFxReady = !!(this.enablePostFx && this.postFx && this.postFx.ready);
+        let sceneFbo = null;
+        if (postFxReady) {
+            try {
+                this.postFx.enabled = true;
+                this.postFx.exposure = this.postFxExposure;
+                this.postFx.avgLum = this.postFxLum;
+                this.postFx.enableAutoExposure = !!this.enableAutoExposure;
+                this.postFx.autoExposureSpeed = this.autoExposureSpeed;
+                this.postFx.enableBloom = !!this.enableBloom;
+                this.postFx.bloomStrength = this.bloomStrength;
+                this.postFx.bloomThreshold = this.bloomThreshold;
+                this.postFx.bloomRadius = this.bloomRadius;
+                sceneFbo = this.postFx.beginScene({ w: this.canvas.width, h: this.canvas.height });
+            } catch {
+                sceneFbo = null;
+            }
+        }
+
+        // PostFX is only "active" if we successfully acquired a scene framebuffer.
+        // If beginScene() failed (sceneFbo==null), we must NOT run tonemap this frame (avoids flicker / double pipeline).
+        const postFxOn = !!(postFxReady && sceneFbo);
+        try { if (this.postFx) this.postFx.enabled = postFxOn; } catch { /* ignore */ }
+
+        if (!postFxOn) {
+            // Clear buffers first (default framebuffer).
+            this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, null);
+            this.gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            this.gl.clear(this.gl.COLOR_BUFFER_BIT | this.gl.DEPTH_BUFFER_BIT);
+        }
+
+        // --- Global lighting (best-effort CodeWalker-ish) ---
+        // We derive a simple directional light from time-of-day and pass it into renderers.
+        // This also helps the HDR tonemap/bloom path because scene values become meaningfully > 1.0 at daytime.
+        const t01 = (this.timeOfDayHours % 24.0) / 24.0;
+        const ang = (t01 * Math.PI * 2.0) - (Math.PI * 0.5); // noon-ish up
+        const sunDirRaw = [Math.cos(ang) * 0.35, Math.sin(ang) * 0.95, 0.20];
+        const n3 = (v) => {
+            const x = Number(v?.[0]) || 0, y = Number(v?.[1]) || 0, z = Number(v?.[2]) || 0;
+            const l = Math.hypot(x, y, z) || 1.0;
+            return [x / l, y / l, z / l];
+        };
+        const sunDir = n3(sunDirRaw);
+        const sunUp = Math.sin(ang); // -1..1
+        const day01 = Math.max(0.0, Math.min(1.0, (sunUp * 0.55) + 0.45));
+        // Intensity in linear HDR-ish units. (CodeWalker scene is HDR; tonemap expects this.)
+        const sunI = Math.max(0.03, day01 * 1.15);
+        const sunCol = [1.0, 0.97, 0.88];
+        const lightColor = [sunCol[0] * sunI * 2.5, sunCol[1] * sunI * 2.5, sunCol[2] * sunI * 2.5];
+        // Ambient term: used as a scalar in our forward shaders and as additive irradiance in terrain deferred.
+        const ambientIntensity = 0.08 + 0.35 * day01;
 
         // Draw sky gradient (atmosphere). This is a pure background pass.
         if (this.atmosphereEnabled && this.skyRenderer?.ready) {
-            // Approximate sun direction from time-of-day: morning/evening near horizon.
-            const t01 = (this.timeOfDayHours % 24.0) / 24.0;
-            const ang = (t01 * Math.PI * 2.0) - (Math.PI * 0.5); // noon-ish up
-            const sunDir = [Math.cos(ang) * 0.35, Math.sin(ang) * 0.95, 0.20];
-            const sunUp = Math.sin(ang); // -1..1
-            const day01 = Math.max(0.0, Math.min(1.0, (sunUp * 0.55) + 0.45)); // clamp
-            const sunI = Math.max(0.03, day01 * 1.15);
-
             // Simple timecycle-ish sky colors (blend between a night palette and the configured day palette).
             const nightTop = [0.02, 0.03, 0.06];
             const nightBottom = [0.01, 0.02, 0.03];
             const lerp3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-            const topColor = lerp3(nightTop, this.skyTopColor, day01);
-            const bottomColor = lerp3(nightBottom, this.skyBottomColor, day01);
+            const topColorSrgb = lerp3(nightTop, this.skyTopColor, day01);
+            const bottomColorSrgb = lerp3(nightBottom, this.skyBottomColor, day01);
+
+            // IMPORTANT:
+            // SkyRenderer outputs *linear* (it does no encode). For PostFX/HDR we must feed linear values.
+            // The UI stores colors in sRGB-ish space, so convert here.
+            const topColor = _srgbToLinear3(topColorSrgb);
+            const bottomColor = _srgbToLinear3(bottomColorSrgb);
 
             // Moon is opposite the sun in this simple model.
             const moonDir = [-sunDir[0], -sunDir[1], -sunDir[2]];
@@ -2456,10 +3298,11 @@ export class App {
                 topColor,
                 bottomColor,
                 sunDir,
-                sunColor: [1.0, 0.97, 0.88],
+                // Treat these UI-ish colors as sRGB and convert to linear for the shader.
+                sunColor: _srgbToLinear3(sunCol),
                 sunIntensity: sunI,
                 moonDir,
-                moonColor: [0.70, 0.78, 0.90],
+                moonColor: _srgbToLinear3([0.70, 0.78, 0.90]),
                 moonIntensity: moonI,
                 starIntensity: starI,
             });
@@ -2475,12 +3318,20 @@ export class App {
         }
         
         // Render terrain (heightmap)
+        const outputSrgb = !postFxOn;
+
         if (this.showTerrain) {
+            // Tell TerrainRenderer where to composite (default vs offscreen) and whether to encode.
+            try { this.terrainRenderer?.setOutputFramebuffer?.(sceneFbo); } catch { /* ignore */ }
             this.terrainRenderer.render(this.camera.viewProjectionMatrix, this.camera.position, {
                 enabled: this.atmosphereEnabled && this.fogEnabled,
-                color: this.fogColor,
+                color: fogColorLinear,
                 start: this.fogStart,
                 end: this.fogEnd,
+                lightDir: sunDir,
+                lightColor,
+                ambientIntensity,
+                outputSrgb,
             });
         }
 
@@ -2495,9 +3346,12 @@ export class App {
                     waterEps: 0.05,
                     fog: {
                         enabled: this.atmosphereEnabled && this.fogEnabled,
-                        color: this.fogColor,
+                        color: fogColorLinear,
                         start: this.fogStart,
                         end: this.fogEnd,
+                        lightDir: sunDir,
+                        lightColor,
+                        ambientIntensity,
                     },
                     cameraPos: this.camera.position,
                 }
@@ -2515,12 +3369,9 @@ export class App {
                     drawOccluders: () => {
                         // Use current scene toggles as occluders; water is excluded (transparent).
                         if (this.showTerrain) {
-                            this.terrainRenderer.render(this.camera.viewProjectionMatrix, this.camera.position, {
-                                enabled: false,
-                                color: this.fogColor,
-                                start: this.fogStart,
-                                end: this.fogEnd,
-                            });
+                            // IMPORTANT: OcclusionCuller binds its own depth-only framebuffer.
+                            // Do NOT call the full terrain render path here (it may bind/composite other FBOs).
+                            this.terrainRenderer.renderDepthOnly?.(this.camera.viewProjectionMatrix);
                         }
                         if (this.buildingRenderer?.ready && this.showBuildings) {
                             this.buildingRenderer.render(
@@ -2538,8 +3389,8 @@ export class App {
                     },
                 });
 
-                // If the GPU/browser rejects depth readPixels, auto-disable occlusion culling so users
-                // don't think rendering/streaming is "stuck" (occlusion is optional).
+                // If the GPU/browser rejects *all* occlusion readback modes, auto-disable occlusion culling
+                // so users don't think rendering/streaming is "stuck" (occlusion is optional).
                 try {
                     const s = this.occlusionCuller.getStats?.();
                     if (s && s.readbackSupported === false) {
@@ -2553,14 +3404,32 @@ export class App {
                 this.occlusionCuller.enabled = false;
             }
 
+            // IMPORTANT:
+            // Some renderers (occlusion, terrain deferred, etc) may bind their own FBO/viewport temporarily.
+            // Ensure models always render into the intended scene target (PostFX scene FBO when enabled).
+            try {
+                this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+            } catch { /* ignore */ }
+
             this.instancedModelRenderer.render(this.camera.viewProjectionMatrix, this.showModels, this.camera.position, {
                 enabled: this.atmosphereEnabled && this.fogEnabled,
-                color: this.fogColor,
+                color: fogColorLinear,
                 start: this.fogStart,
                 end: this.fogEnd,
+                lightDir: sunDir,
+                lightColor,
+                ambientIntensity,
+                // Use the same UI toggle for BOTH building-water and model-water materials.
+                // This lets us isolate whether water shaders are causing the "grey screen when drawables render" issue.
+                showWater: !!this.showWater,
+                // Directional shadow map (optional; experimental)
+                shadowEnabled: !!this.enableShadows,
+                shadowMapSize: Number(this.shadowMapSize) || 2048,
                 occlusion: (this.enableOcclusionCulling ? this.occlusionCuller : null),
                 viewportWidth: this.canvas.width,
                 viewportHeight: this.canvas.height,
+                outputSrgb,
             });
 
             // Kick texture streaming even if the first few frames are mesh-bound or camera is far away.
@@ -2607,10 +3476,22 @@ export class App {
             if (depthWasEnabled) this.gl.enable(this.gl.DEPTH_TEST);
         }
         
+        // If postFX is enabled (and active), tonemap+encode to the canvas now.
+        if (postFxOn) {
+            try {
+                this.postFx.endScene({ canvasW: this.canvas.width, canvasH: this.canvas.height });
+            } catch { /* ignore */ }
+        }
+
         // Check for WebGL errors after render
         const errorAfter = this.gl.getError();
         if (errorAfter !== this.gl.NO_ERROR) {
             console.error('WebGL error after render:', errorAfter);
+            // If models are enabled and the model renderer recorded a culprit drawable, surface it here too.
+            try {
+                const e = this.instancedModelRenderer?._lastGlError || null;
+                if (e) console.error('InstancedModelRenderer last GL error detail:', e);
+            } catch { /* ignore */ }
         }
 
         // End-of-frame: allow streamer to do eviction/housekeeping.
@@ -2717,6 +3598,31 @@ window.addEventListener('load', () => {
     //   __viewerReportMaterialReuse({ lod: 'high', minCount: 10, limitGroups: 50 })
     try {
         window.__viewerApp = app;
+        // Texture dump helper:
+        // - If the local dump server is running (started by `webgl_viewer/run.py`), this will write to:
+        //   webgl_viewer/tools/out/viewer_dumps/*.json
+        // - Otherwise it falls back to downloading a JSON file.
+        window.__viewerDumpTextures = async (opts = {}) => {
+            try {
+                const ts = app?.textureStreamer || null;
+                if (!ts || typeof ts.buildDebugDump !== 'function') return null;
+                const dump = ts.buildDebugDump({ reason: opts?.reason || 'manual' });
+                const endpoint = (opts && typeof opts.endpoint === 'string')
+                    ? opts.endpoint
+                    : '/__viewer_dump';
+                try {
+                    if (typeof ts.postDebugDump === 'function') {
+                        return await ts.postDebugDump(dump, { endpoint });
+                    }
+                } catch {
+                    // fall through to download
+                }
+                try { if (typeof ts.downloadDebugDump === 'function') ts.downloadDebugDump(dump); } catch { /* ignore */ }
+                return null;
+            } catch {
+                return null;
+            }
+        };
         window.__viewerSetCrossArchetypeInstancing = (on) => {
             try {
                 const el = document.getElementById('crossArchetypeInstancing');
@@ -2750,6 +3656,155 @@ window.addEventListener('load', () => {
             } catch (e) {
                 console.error('viewer: report failed', e);
                 return null;
+            }
+        };
+
+        /**
+         * Texture coverage dump (DevTools helper).
+         *
+         * This is the texture analogue of the mesh/archetype coverage dump:
+         * - Scans the currently-loaded model manifest entries (loaded shards only).
+         * - Counts referenced `models_textures/<hash>...` texture rel paths.
+         * - Uses TexturePathResolver's loaded `models_textures/index.json` to classify "missing from exported set".
+         * - Includes runtime missing-404 cache + recent decode/fetch errors from TextureStreamer.
+         *
+         * Usage:
+         *   await __viewerDumpTextureCoverage()
+         *   copy(JSON.stringify(await __viewerDumpTextureCoverage({ topN: 50 }), null, 2))
+         */
+        window.__viewerDumpTextureCoverage = async (opts = {}) => {
+            const topN = Number.isFinite(Number(opts?.topN)) ? Math.max(1, Math.min(500, Math.floor(Number(opts.topN)))) : 50;
+            const maxMeshes = Number.isFinite(Number(opts?.maxMeshes)) ? Math.max(1, Math.min(500000, Math.floor(Number(opts.maxMeshes)))) : 50000;
+            const includeAllLods = !!opts?.includeAllLods;
+            const lod = String(opts?.lod || 'high').toLowerCase();
+
+            const mm = app?.modelManager;
+            const imr = app?.instancedModelRenderer;
+            const ts = app?.textureStreamer;
+
+            // Best-effort wait for models_textures index to load (optional but improves missing classification).
+            try {
+                const r = imr?._texResolver;
+                if (r && r._modelsTexturesIndexPromise) await r._modelsTexturesIndexPromise;
+            } catch { /* ignore */ }
+
+            const meshes = mm?.manifest?.meshes;
+            if (!meshes || typeof meshes !== 'object') {
+                return {
+                    schema: 'webglgta-texture-coverage-v1',
+                    error: 'model manifest not loaded',
+                    textureStats: ts?.getStats?.() || null,
+                    recentTextureErrors: ts?.getRecentErrors?.(25) || [],
+                    missing404: ts?.getMissing404Summary?.(topN) || [],
+                };
+            }
+
+            const resolver = imr?._texResolver || null;
+            const seenByRel = new Map(); // rel -> count
+            const missingFromIndex = new Map(); // hash -> { count, sampleRel }
+
+            let scannedMeshes = 0;
+            let scannedSubmeshes = 0;
+
+            const bumpRel = (rel) => {
+                const k = String(rel || '').trim();
+                if (!k) return;
+                seenByRel.set(k, (seenByRel.get(k) || 0) + 1);
+            };
+
+            const considerMissing = (rel) => {
+                const r = String(rel || '').trim();
+                if (!r) return;
+                // Only handle model textures here.
+                if (!/models_textures\//i.test(r)) return;
+                const m = r.replace(/^\/+/, '').replace(/^assets\//i, '').match(/^models_textures\/(\d+)/i);
+                const hash = m ? String(m[1]) : null;
+                if (!hash) return;
+                // If resolver exists and index is loaded, it returns null when index proves missing.
+                try {
+                    if (resolver && typeof resolver.chooseTextureUrl === 'function') {
+                        const url = resolver.chooseTextureUrl(r);
+                        if (url === null) {
+                            const prev = missingFromIndex.get(hash) || { count: 0, sampleRel: r };
+                            prev.count += 1;
+                            if (!prev.sampleRel) prev.sampleRel = r;
+                            missingFromIndex.set(hash, prev);
+                        }
+                    }
+                } catch { /* ignore */ }
+            };
+
+            // Scan loaded manifest entries (loaded shards only).
+            for (const [hash, entry] of Object.entries(meshes)) {
+                scannedMeshes++;
+                if (scannedMeshes > maxMeshes) break;
+                if (!entry || typeof entry !== 'object') continue;
+
+                const entryMat = entry.material ?? null;
+                const lodKeys = includeAllLods
+                    ? Object.keys(entry.lods || {}).map((k) => String(k || '').toLowerCase()).filter(Boolean)
+                    : [lod];
+
+                for (const lk of lodKeys) {
+                    const subs = mm?.getLodSubmeshes?.(hash, lk) || [];
+                    if (!Array.isArray(subs) || subs.length === 0) continue;
+                    for (const sm of subs) {
+                        scannedSubmeshes++;
+                        const subMat = sm?.material ?? null;
+                        // Effective material merge (same idea as renderer).
+                        const eff = { ...(entryMat || {}), ...(subMat || {}) };
+
+                        const keys = [
+                            'diffuse', 'diffuse2', 'normal', 'spec', 'detail', 'ao', 'emissive', 'alphaMask',
+                            // KTX2 variants (if present)
+                            'diffuseKtx2', 'diffuse2Ktx2', 'normalKtx2', 'specKtx2', 'detailKtx2', 'aoKtx2', 'emissiveKtx2', 'alphaMaskKtx2',
+                        ];
+                        for (const k of keys) {
+                            const rel = eff?.[k];
+                            if (typeof rel !== 'string' || !rel) continue;
+                            bumpRel(rel);
+                            considerMissing(rel);
+                        }
+                    }
+                }
+            }
+
+            const topMissing = Array.from(missingFromIndex.entries())
+                .map(([hash, v]) => ({ hash, count: v.count | 0, sampleRel: v.sampleRel }))
+                .sort((a, b) => (b.count - a.count) || (a.hash.localeCompare(b.hash)))
+                .slice(0, topN);
+
+            return {
+                schema: 'webglgta-texture-coverage-v1',
+                opts: { topN, maxMeshes, includeAllLods, lod },
+                scannedMeshes,
+                scannedSubmeshes,
+                uniqueTextureRels: seenByRel.size,
+                // Missing classification only covers model textures when models_textures/index.json is loaded.
+                missingFromExportedSetTop: topMissing,
+                // Runtime health:
+                textureStats: ts?.getStats?.() || null,
+                missing404: ts?.getMissing404Summary?.(topN) || [],
+                recentTextureErrors: ts?.getRecentErrors?.(25) || [],
+            };
+        };
+
+        // Frame-level texture dump (what the renderer actually used this frame).
+        // Usage:
+        //   copy(JSON.stringify(__viewerDumpTextureFrame(80), null, 2))
+        window.__viewerDumpTextureFrame = (limit = 80) => {
+            try {
+                const rep = app?.instancedModelRenderer?.getTextureFrameReport?.(limit) || null;
+                const ts = app?.textureStreamer;
+                return {
+                    schema: 'webglgta-texture-frame-dump-v1',
+                    frameReport: rep,
+                    missing404: ts?.getMissing404Summary?.(limit) || [],
+                    recentTextureErrors: ts?.getRecentErrors?.(25) || [],
+                    textureStats: ts?.getStats?.() || null,
+                };
+            } catch (e) {
+                return { schema: 'webglgta-texture-frame-dump-v1', error: String(e?.message || e || 'unknown') };
             }
         };
     } catch {

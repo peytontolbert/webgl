@@ -49,20 +49,29 @@ const vsSource = `#version 300 es
             worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
             worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
             
-            // Sample height from heightmap
-            vec2 heightmapCoord = vec2(gridPos.x, 1.0 - gridPos.y);
-            float height = texture(uHeightmap, heightmapCoord).r;
+            // Sample height from heightmap (exact texel fetch for 1:1 mapping).
+            // Our mesh gridPos is in "image space" where v increases downward (y=0 is top row),
+            // while texelFetch uses (0,0) as the *bottom* row, so we flip Y.
+            ivec2 ts = textureSize(uHeightmap, 0);
+            vec2 grid = max(vec2(ts), vec2(2.0, 2.0));
+            vec2 pix = gridPos * (grid - 1.0);
+            ivec2 ip = ivec2(clamp(floor(pix + vec2(0.5)), vec2(0.0), grid - 1.0));
+            ivec2 texel = ivec2(ip.x, (ts.y - 1) - ip.y);
+            float height = texelFetch(uHeightmap, texel, 0).r;
             vHeight01 = height;
             
             // Scale height to match the terrain bounds (height is already 0..1 from R8 texture)
             worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
             
-            // Calculate normal from heightmap
-            vec2 texelSize = 1.0 / max(uTerrainGrid, vec2(2.0, 2.0));
-            float left = texture(uHeightmap, heightmapCoord - vec2(texelSize.x, 0.0)).r;
-            float right = texture(uHeightmap, heightmapCoord + vec2(texelSize.x, 0.0)).r;
-            float top = texture(uHeightmap, heightmapCoord - vec2(0.0, texelSize.y)).r;
-            float bottom = texture(uHeightmap, heightmapCoord + vec2(0.0, texelSize.y)).r;
+            // Calculate normal from heightmap (exact neighbor texels).
+            ivec2 ipL = ivec2(max(ip.x - 1, 0), ip.y);
+            ivec2 ipR = ivec2(min(ip.x + 1, ts.x - 1), ip.y);
+            ivec2 ipT = ivec2(ip.x, max(ip.y - 1, 0));
+            ivec2 ipB = ivec2(ip.x, min(ip.y + 1, ts.y - 1));
+            float left = texelFetch(uHeightmap, ivec2(ipL.x, (ts.y - 1) - ipL.y), 0).r;
+            float right = texelFetch(uHeightmap, ivec2(ipR.x, (ts.y - 1) - ipR.y), 0).r;
+            float top = texelFetch(uHeightmap, ivec2(ipT.x, (ts.y - 1) - ipT.y), 0).r;
+            float bottom = texelFetch(uHeightmap, ivec2(ipB.x, (ts.y - 1) - ipB.y), 0).r;
             
             // Calculate normal using central differences
             vec3 normal = normalize(vec3(
@@ -130,13 +139,29 @@ const fsSource = `#version 300 es
     // Color pipeline:
     // - If terrain layer textures are uploaded as sRGB, sampling returns linear.
     // - If not, set uDecodeSrgb so we decode manually.
+    // - If uOutputSrgb is true, we encode at the end for display (legacy path).
+    //   If false, we output linear so a final post-process pass can tonemap+encode once.
     uniform bool uDecodeSrgb;
+    uniform bool uOutputSrgb;
 
     vec3 decodeSrgb(vec3 c) {
-        return pow(max(c, vec3(0.0)), vec3(2.2));
+        // Exact-ish sRGB -> linear (matches GPU sRGB decode much better than pow(2.2)).
+        vec3 x = clamp(c, 0.0, 1.0);
+        vec3 low = x / 12.92;
+        vec3 high = pow((x + 0.055) / 1.055, vec3(2.4));
+        bvec3 cut = lessThanEqual(x, vec3(0.04045));
+        return vec3(cut.x ? low.x : high.x,
+                    cut.y ? low.y : high.y,
+                    cut.z ? low.z : high.z);
     }
     vec3 encodeSrgb(vec3 c) {
-        return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+        vec3 x = max(c, vec3(0.0));
+        vec3 low = x * 12.92;
+        vec3 high = 1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055;
+        bvec3 cut = lessThanEqual(x, vec3(0.0031308));
+        return vec3(cut.x ? low.x : high.x,
+                    cut.y ? low.y : high.y,
+                    cut.z ? low.z : high.z);
     }
     
     void main() {
@@ -175,7 +200,8 @@ const fsSource = `#version 300 es
         
         // Calculate lighting
         float diff = max(dot(normal, uLightDir), 0.0);
-        vec3 lighting = uAmbientIntensity * uLightColor + diff * uLightColor;
+        // IMPORTANT: don't multiply ambient by uLightColor (blows out HDR / greys out on some drivers).
+        vec3 lighting = vec3(uAmbientIntensity) + (uLightColor * diff);
         
         // Final color (linear lighting)
         vec3 finalColor = finalDiffuse.rgb * lighting;
@@ -187,8 +213,10 @@ const fsSource = `#version 300 es
             finalColor = mix(finalColor, uFogColor, fogF);
         }
 
-        // Gamma encode for display
-        finalColor = encodeSrgb(finalColor);
+        // Gamma encode for display (only in the legacy direct-to-screen path)
+        if (uOutputSrgb) {
+            finalColor = encodeSrgb(finalColor);
+        }
         
         // Ensure alpha is preserved
         fragColor = vec4(finalColor, finalDiffuse.a);
@@ -202,11 +230,18 @@ export class TerrainRenderer {
         this.gbufferProgram = new ShaderProgram(gl);
         this.compositeProgram = new ShaderProgram(gl);
         this.shadowProgram = new ShaderProgram(gl);
+        // Depth-only fallback: used when we cannot blit terrain DEPTH into the default framebuffer
+        // (e.g. default framebuffer is multisampled/MSAA).
+        this._depthOnlyProgram = new ShaderProgram(gl);
+        this._depthOnlyUniforms = null;
+        this._depthOnlyReady = false;
         this.textureManager = new TextureManager(gl);
         this.mesh = null;
         this.heightmap = null;
-        // CPU copy of heightmap pixels for sampling (optional)
-        this.heightmapPixels = null; // { width, height, data: Uint8ClampedArray }
+        // CPU copy of heightmap samples for sampling (optional).
+        // - If loaded from PNG via canvas: `data` is Uint8ClampedArray RGBA (we use .r).
+        // - If loaded from u16 raw: `dataU16` is Uint16Array (single-channel).
+        this.heightmapPixels = null; // { width, height, data?: Uint8ClampedArray, dataU16?: Uint16Array }
         this.terrainBounds = [0, 0, 0];
         this.terrainSize = [0, 0, 0];
         // Used by shaders for heightmap sampling/normal reconstruction; must match heightmap texture resolution.
@@ -250,6 +285,9 @@ export class TerrainRenderer {
         // Dummy textures for required samplers (shadow map / tint palette etc.)
         this._dummyBlack = null;
         this._dummyWhite = null;
+
+        // Optional output framebuffer for deferred composite (used by PostFxRenderer to render into an offscreen scene FBO).
+        this._outputFramebuffer = null;
         
         // Initialize textures with proper organization
         this.textures = {
@@ -305,6 +343,15 @@ export class TerrainRenderer {
         glMatrix.mat4.rotateX(this.modelMatrix, this.modelMatrix, -Math.PI / 2);
         
         this.initShaders();
+    }
+
+    /**
+     * When set, the deferred composite pass will render into this framebuffer instead of the default framebuffer.
+     * (Forward terrain path simply draws into whatever framebuffer is currently bound.)
+     * @param {WebGLFramebuffer|null} fbo
+     */
+    setOutputFramebuffer(fbo) {
+        this._outputFramebuffer = fbo || null;
     }
 
     _ensureTerrainTextureFallbacks() {
@@ -452,6 +499,7 @@ export class TerrainRenderer {
                 uFogEnd: this.gl.getUniformLocation(this.program.program, 'uFogEnd'),
 
                 uDecodeSrgb: this.gl.getUniformLocation(this.program.program, 'uDecodeSrgb'),
+                uOutputSrgb: this.gl.getUniformLocation(this.program.program, 'uOutputSrgb'),
                 
                 // Texture uniforms
                 uColourmap0: this.gl.getUniformLocation(this.program.program, 'uColourmap0'),
@@ -500,6 +548,68 @@ export class TerrainRenderer {
                 console.warn('Deferred terrain shader path unavailable; using forward terrain shaders.', e);
                 this._deferredReady = false;
             }
+
+            // Depth-only (default framebuffer) fallback shader for terrain depth population.
+            // This avoids gl.blitFramebuffer DEPTH into a multisampled default framebuffer (invalid in many WebGL2 implementations).
+            try {
+                const depthVs = `#version 300 es
+in vec3 aPosition;
+
+uniform mat4 uViewProjectionMatrix;
+uniform mat4 uModelMatrix;
+uniform vec3 uTerrainBounds;  // (min_x, min_y, min_z)
+uniform vec3 uTerrainSize;    // (size_x, size_y, size_z) in world units
+uniform vec2 uTerrainGrid;    // (width, height) in samples
+uniform sampler2D uHeightmap;
+uniform bool uHasHeightmap;
+
+void main() {
+    vec3 worldPos;
+    if (uHasHeightmap) {
+        vec2 gridPos = aPosition.xy;
+        worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
+        worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
+        ivec2 ts = textureSize(uHeightmap, 0);
+        vec2 grid = max(vec2(ts), vec2(2.0, 2.0));
+        vec2 pix = gridPos * (grid - 1.0);
+        ivec2 ip = ivec2(clamp(floor(pix + vec2(0.5)), vec2(0.0), grid - 1.0));
+        ivec2 texel = ivec2(ip.x, (ts.y - 1) - ip.y);
+        float height = texelFetch(uHeightmap, texel, 0).r;
+        worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
+    } else {
+        worldPos = aPosition;
+    }
+    vec4 modelPos = uModelMatrix * vec4(worldPos, 1.0);
+    gl_Position = uViewProjectionMatrix * modelPos;
+}
+`;
+                const depthFs = `#version 300 es
+precision mediump float;
+out vec4 outColor;
+void main() {
+    // Color writes are disabled during the depth-only pass; still output something.
+    outColor = vec4(0.0);
+}
+`;
+                const okDepth = await this._depthOnlyProgram.createProgram(depthVs, depthFs);
+                if (okDepth) {
+                    this._depthOnlyUniforms = {
+                        uViewProjectionMatrix: this.gl.getUniformLocation(this._depthOnlyProgram.program, 'uViewProjectionMatrix'),
+                        uModelMatrix: this.gl.getUniformLocation(this._depthOnlyProgram.program, 'uModelMatrix'),
+                        uTerrainBounds: this.gl.getUniformLocation(this._depthOnlyProgram.program, 'uTerrainBounds'),
+                        uTerrainSize: this.gl.getUniformLocation(this._depthOnlyProgram.program, 'uTerrainSize'),
+                        uTerrainGrid: this.gl.getUniformLocation(this._depthOnlyProgram.program, 'uTerrainGrid'),
+                        uHeightmap: this.gl.getUniformLocation(this._depthOnlyProgram.program, 'uHeightmap'),
+                        uHasHeightmap: this.gl.getUniformLocation(this._depthOnlyProgram.program, 'uHasHeightmap'),
+                    };
+                    this._depthOnlyReady = true;
+                } else {
+                    this._depthOnlyReady = false;
+                }
+            } catch (e) {
+                this._depthOnlyReady = false;
+                console.warn('Terrain depth-only program unavailable; depth blit fallback will be disabled.', e);
+            }
         } catch (error) {
             console.error('Failed to initialize shader program:', error);
         }
@@ -508,6 +618,135 @@ export class TerrainRenderer {
     _ensureDummyTextures() {
         if (!this._dummyBlack) this._dummyBlack = this._createSolidTextureRGBA([0, 0, 0, 255]);
         if (!this._dummyWhite) this._dummyWhite = this._createSolidTextureRGBA([255, 255, 255, 255]);
+    }
+
+    _renderDepthToDefault(viewProjectionMatrix, w, h) {
+        const gl = this.gl;
+        if (!this._depthOnlyReady || !this._depthOnlyProgram?.program || !this._depthOnlyUniforms) return false;
+        if (!this.mesh) return false;
+
+        this._ensureDummyTextures();
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, w, h);
+
+        let prevColorMask = null;
+        try { prevColorMask = gl.getParameter(gl.COLOR_WRITEMASK); } catch { prevColorMask = null; }
+        gl.colorMask(false, false, false, false);
+
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.depthMask(true);
+        try { gl.disable(gl.BLEND); } catch { /* ignore */ }
+
+        this._depthOnlyProgram.use();
+        const U = this._depthOnlyUniforms;
+        if (U.uViewProjectionMatrix) gl.uniformMatrix4fv(U.uViewProjectionMatrix, false, viewProjectionMatrix);
+        if (U.uModelMatrix) gl.uniformMatrix4fv(U.uModelMatrix, false, this.modelMatrix);
+        if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.terrainBounds);
+        if (U.uTerrainSize) gl.uniform3fv(U.uTerrainSize, this.terrainSize);
+        if (U.uTerrainGrid) gl.uniform2fv(U.uTerrainGrid, this.terrainGrid);
+
+        // Heightmap on unit 0
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.heightmap || this._dummyBlack);
+        if (U.uHeightmap) gl.uniform1i(U.uHeightmap, 0);
+        if (U.uHasHeightmap) gl.uniform1i(U.uHasHeightmap, this.heightmap ? 1 : 0);
+
+        // Match gbuffer pass bias to reduce z-fighting.
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(1.0, 1.0);
+        this.mesh.render(this._depthOnlyProgram);
+        gl.disable(gl.POLYGON_OFFSET_FILL);
+
+        if (prevColorMask && prevColorMask.length >= 4) {
+            gl.colorMask(!!prevColorMask[0], !!prevColorMask[1], !!prevColorMask[2], !!prevColorMask[3]);
+        } else {
+            gl.colorMask(true, true, true, true);
+        }
+        return true;
+    }
+
+    /**
+     * Render terrain depth into the *currently bound* framebuffer.
+     * Intended for OcclusionCuller.buildDepth() which binds its own small depth-only FBO.
+     *
+     * IMPORTANT: This function must NOT rebind framebuffers, resize viewports, or composite to screen.
+     * It only draws depth (color writes are controlled by the caller).
+     *
+     * @param {Float32Array} viewProjectionMatrix
+     * @returns {boolean}
+     */
+    renderDepthOnly(viewProjectionMatrix) {
+        const gl = this.gl;
+        if (!this.mesh) return false;
+        if (!viewProjectionMatrix || viewProjectionMatrix.length < 16) return false;
+
+        // Prefer the dedicated depth-only program when available.
+        if (this._depthOnlyReady && this._depthOnlyProgram?.program && this._depthOnlyUniforms) {
+            this._ensureDummyTextures();
+
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL);
+            gl.depthMask(true);
+            try { gl.disable(gl.BLEND); } catch { /* ignore */ }
+
+            this._depthOnlyProgram.use();
+            const U = this._depthOnlyUniforms;
+            if (U.uViewProjectionMatrix) gl.uniformMatrix4fv(U.uViewProjectionMatrix, false, viewProjectionMatrix);
+            if (U.uModelMatrix) gl.uniformMatrix4fv(U.uModelMatrix, false, this.modelMatrix);
+            if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.terrainBounds);
+            if (U.uTerrainSize) gl.uniform3fv(U.uTerrainSize, this.terrainSize);
+            if (U.uTerrainGrid) gl.uniform2fv(U.uTerrainGrid, this.terrainGrid || [1, 1]);
+
+            // Heightmap on unit 0 (matches other passes).
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, this.heightmap || this._dummyBlack);
+            if (U.uHeightmap) gl.uniform1i(U.uHeightmap, 0);
+            if (U.uHasHeightmap) gl.uniform1i(U.uHasHeightmap, this.heightmap ? 1 : 0);
+
+            // Same bias as main terrain draw to reduce z-fighting with near-ground geometry.
+            try {
+                gl.enable(gl.POLYGON_OFFSET_FILL);
+                gl.polygonOffset(1.0, 1.0);
+            } catch { /* ignore */ }
+
+            this.mesh.render(this._depthOnlyProgram);
+
+            try { gl.disable(gl.POLYGON_OFFSET_FILL); } catch { /* ignore */ }
+            return true;
+        }
+
+        // Fallback: draw with the forward program (still writes depth), assuming caller has colorMask(false).
+        // This is slower, but keeps occlusion functional if depth-only program isn't available.
+        try {
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL);
+            gl.depthMask(true);
+            try { gl.disable(gl.BLEND); } catch { /* ignore */ }
+            this.program.use();
+            if (this.uniforms?.uViewProjectionMatrix) gl.uniformMatrix4fv(this.uniforms.uViewProjectionMatrix, false, viewProjectionMatrix);
+            if (this.uniforms?.uModelMatrix) gl.uniformMatrix4fv(this.uniforms.uModelMatrix, false, this.modelMatrix);
+            if (this.uniforms?.uTerrainBounds) gl.uniform3fv(this.uniforms.uTerrainBounds, this.terrainBounds);
+            if (this.uniforms?.uTerrainSize) gl.uniform3fv(this.uniforms.uTerrainSize, this.terrainSize);
+            if (this.uniforms?.uTerrainGrid) gl.uniform2fv(this.uniforms.uTerrainGrid, this.terrainGrid || [1, 1]);
+
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, this.heightmap || this._dummyBlack);
+            if (this.uniforms?.uHeightmap) gl.uniform1i(this.uniforms.uHeightmap, 0);
+            if (this.uniforms?.uHasHeightmap) gl.uniform1i(this.uniforms.uHasHeightmap, this.heightmap ? 1 : 0);
+
+            try {
+                gl.enable(gl.POLYGON_OFFSET_FILL);
+                gl.polygonOffset(1.0, 1.0);
+            } catch { /* ignore */ }
+            this.mesh.render(this.program);
+            try { gl.disable(gl.POLYGON_OFFSET_FILL); } catch { /* ignore */ }
+            return true;
+        } catch {
+            try { gl.disable(gl.POLYGON_OFFSET_FILL); } catch { /* ignore */ }
+            return false;
+        }
     }
 
     async _initDeferredShaders() {
@@ -592,6 +831,8 @@ export class TerrainRenderer {
 
             uSpecularIntensity: U('uSpecularIntensity'),
             uSpecularPower: U('uSpecularPower'),
+            uTerrainBlendMode: U('uTerrainBlendMode'),
+            uBumpiness: U('uBumpiness'),
         };
 
         // Composite program (fullscreen triangle). Diffuse * irradiance.
@@ -610,17 +851,30 @@ precision highp float;
 in vec2 vUv;
 uniform sampler2D uDiffuseTex;
 uniform sampler2D uIrradianceTex;
+uniform bool uOutputSrgb;
 out vec4 fragColor;
+
+vec3 encodeSrgb(vec3 c) {
+    vec3 x = max(c, vec3(0.0));
+    vec3 low = x * 12.92;
+    vec3 high = 1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055;
+    bvec3 cut = lessThanEqual(x, vec3(0.0031308));
+    return vec3(cut.x ? low.x : high.x,
+                cut.y ? low.y : high.y,
+                cut.z ? low.z : high.z);
+}
 void main() {
     vec4 d = texture(uDiffuseTex, vUv);
     vec4 irr = texture(uIrradianceTex, vUv);
-    fragColor = vec4(d.rgb * irr.rgb, d.a);
+    vec3 c = d.rgb * irr.rgb;
+    fragColor = vec4(uOutputSrgb ? encodeSrgb(c) : c, d.a);
 }`;
         const ok2 = await this.compositeProgram.createProgram(compVs, compFs);
         if (!ok2) throw new Error('compositeProgram.createProgram failed');
         this._compositeUniforms = {
             uDiffuseTex: gl.getUniformLocation(this.compositeProgram.program, 'uDiffuseTex'),
             uIrradianceTex: gl.getUniformLocation(this.compositeProgram.program, 'uIrradianceTex'),
+            uOutputSrgb: gl.getUniformLocation(this.compositeProgram.program, 'uOutputSrgb'),
         };
 
         // Shadow depth program (renders terrain depth into a depth texture from light POV).
@@ -643,8 +897,12 @@ void main() {
         vec2 gridPos = aPosition.xy;
         worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
         worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
-        vec2 heightmapCoord = vec2(gridPos.x, 1.0 - gridPos.y);
-        float height = texture(uHeightmap, heightmapCoord).r;
+        ivec2 ts = textureSize(uHeightmap, 0);
+        vec2 grid = max(vec2(ts), vec2(2.0, 2.0));
+        vec2 pix = gridPos * (grid - 1.0);
+        ivec2 ip = ivec2(clamp(floor(pix + vec2(0.5)), vec2(0.0), grid - 1.0));
+        ivec2 texel = ivec2(ip.x, (ts.y - 1) - ip.y);
+        float height = texelFetch(uHeightmap, texel, 0).r;
         worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
     } else {
         worldPos = aPosition;
@@ -674,56 +932,143 @@ void main() { }
         this._ensureDummyTextures();
         this._deferredReady = true;
     }
+
+    async _tryLoadHeightmapU16() {
+        // Browser image decode paths (ImageBitmap/canvas) are effectively 8-bit per channel.
+        // To get true 16-bit precision, we load raw uint16 samples from a binary blob.
+        //
+        // Expected files:
+        // - assets/heightmap_u16.json: { width, height, file: "heightmap_u16.bin", endian?: "little"|"big" }
+        // - assets/heightmap_u16.bin: width*height uint16 samples, row-major, top-to-bottom.
+        try {
+            const meta = await fetchJSON('assets/heightmap_u16.json', { priority: 'high' });
+            const w = Math.max(1, meta?.width | 0);
+            const h = Math.max(1, meta?.height | 0);
+            const file = (typeof meta?.file === 'string' && meta.file.length > 0) ? meta.file : 'heightmap_u16.bin';
+            const endian = (meta?.endian === 'big') ? 'big' : 'little';
+            if (!w || !h) throw new Error('heightmap_u16.json missing width/height');
+
+            const blob = await fetchBlob(`assets/${file}`, { priority: 'high' });
+            const buf = await blob.arrayBuffer();
+            const expectedBytes = w * h * 2;
+            if (buf.byteLength < expectedBytes) {
+                throw new Error(`heightmap_u16.bin too small (${buf.byteLength} < ${expectedBytes})`);
+            }
+
+            // Parse into Uint16Array, applying endianness if needed.
+            let dataU16;
+            if (endian === 'little') {
+                // Fast path: most extractors will emit little-endian on disk.
+                dataU16 = new Uint16Array(buf, 0, w * h);
+            } else {
+                const dv = new DataView(buf);
+                dataU16 = new Uint16Array(w * h);
+                for (let i = 0; i < w * h; i++) dataU16[i] = dv.getUint16(i * 2, false);
+            }
+
+            return { width: w, height: h, dataU16 };
+        } catch {
+            return null;
+        }
+    }
+
+    _uploadHeightmapFloat32(width, height, height01Float32) {
+        const gl = this.gl;
+        const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+        if (!isWebGL2) throw new Error('16-bit heightmap path requires WebGL2');
+
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+        // Single-channel float texture. Shader still uses sampler2D and reads .r in [0..1].
+        gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.R32F,
+            width,
+            height,
+            0,
+            gl.RED,
+            gl.FLOAT,
+            height01Float32
+        );
+
+        return tex;
+    }
     
     async loadTerrainMesh() {
         try {
-            // Load heightmap data
-            let heightmapBlob;
-            try {
-                // HIGH priority: required for the first playable frame.
-                heightmapBlob = await fetchBlob('assets/heightmap.png', { priority: 'high' });
-            } catch {
-                console.warn('Heightmap texture not found, terrain will be rendered without heightmap');
-                return false;
-            }
-            const heightmapImage = await createImageBitmap(heightmapBlob);
+            // Prefer 16-bit heightmap (raw uint16) if available; fall back to 8-bit PNG.
+            let hmW = 0;
+            let hmH = 0;
+            const hm16 = await this._tryLoadHeightmapU16();
+            if (hm16 && hm16.dataU16) {
+                try { console.log(`[terrain] Loaded 16-bit heightmap: ${hm16.width}x${hm16.height} (assets/heightmap_u16.*)`); } catch { /* ignore */ }
+                hmW = hm16.width;
+                hmH = hm16.height;
+                this.heightmapPixels = { width: hmW, height: hmH, dataU16: hm16.dataU16 };
 
-            // Keep a CPU-side copy for height sampling (spawn ped on ground, etc.)
-            try {
-                const canvas = document.createElement('canvas');
-                canvas.width = heightmapImage.width;
-                canvas.height = heightmapImage.height;
-                const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                if (ctx) {
-                    ctx.drawImage(heightmapImage, 0, 0);
-                    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                    this.heightmapPixels = { width: canvas.width, height: canvas.height, data: img.data };
+                // Upload as float32 normalized to [0..1] for shaders.
+                const f32 = new Float32Array(hmW * hmH);
+                for (let i = 0; i < f32.length; i++) f32[i] = (hm16.dataU16[i] ?? 0) / 65535.0;
+                this.heightmap = this._uploadHeightmapFloat32(hmW, hmH, f32);
+            } else {
+                try { console.log('[terrain] Using 8-bit heightmap PNG fallback: assets/heightmap.png'); } catch { /* ignore */ }
+                // Load heightmap via PNG (8-bit effective)
+                let heightmapBlob;
+                try {
+                    // HIGH priority: required for the first playable frame.
+                    heightmapBlob = await fetchBlob('assets/heightmap.png', { priority: 'high' });
+                } catch {
+                    console.warn('Heightmap texture not found, terrain will be rendered without heightmap');
+                    return false;
                 }
-            } catch {
-                // Ignore if browser disallows canvas readback or any error occurs.
-                this.heightmapPixels = null;
+                const heightmapImage = await createImageBitmap(heightmapBlob);
+                hmW = heightmapImage.width;
+                hmH = heightmapImage.height;
+
+                // Keep a CPU-side copy for height sampling (spawn ped on ground, etc.)
+                try {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = heightmapImage.width;
+                    canvas.height = heightmapImage.height;
+                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                    if (ctx) {
+                        ctx.drawImage(heightmapImage, 0, 0);
+                        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                        this.heightmapPixels = { width: canvas.width, height: canvas.height, data: img.data };
+                    }
+                } catch {
+                    // Ignore if browser disallows canvas readback or any error occurs.
+                    this.heightmapPixels = null;
+                }
+                
+                // Create heightmap texture
+                this.heightmap = this.gl.createTexture();
+                this.gl.bindTexture(this.gl.TEXTURE_2D, this.heightmap);
+                
+                // Set texture parameters for heightmap
+                // Use NEAREST so terrain sampling stays 1:1 with heightmap pixels (no blur/half-texel artifacts).
+                this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.NEAREST);
+                this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.NEAREST);
+                this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
+                this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
+                
+                // Upload heightmap data
+                // For ImageBitmap sources, use the 6-arg overload.
+                this.gl.texImage2D(
+                    this.gl.TEXTURE_2D,
+                    0,                // mip level
+                    this.gl.R8,       // internal format (single channel for height)
+                    this.gl.RED,      // format
+                    this.gl.UNSIGNED_BYTE, // type
+                    heightmapImage    // source
+                );
             }
-            
-            // Create heightmap texture
-            this.heightmap = this.gl.createTexture();
-            this.gl.bindTexture(this.gl.TEXTURE_2D, this.heightmap);
-            
-            // Set texture parameters for heightmap
-            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.LINEAR);
-            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.LINEAR);
-            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
-            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
-            
-            // Upload heightmap data
-            // For ImageBitmap sources, use the 6-arg overload.
-            this.gl.texImage2D(
-                this.gl.TEXTURE_2D,
-                0,                // mip level
-                this.gl.R8,       // internal format (single channel for height)
-                this.gl.RED,      // format
-                this.gl.UNSIGNED_BYTE, // type
-                heightmapImage    // source
-            );
             
             // Load terrain info
             // HIGH priority: required for the first playable frame.
@@ -753,8 +1098,8 @@ void main() { }
             // IMPORTANT: this must match the actual heightmap *texture* size used in the shader.
             // terrain_info.json dimensions may refer to the original extraction grid, which can differ from the
             // viewer's downsampled heightmap.png.
-            this.terrainGrid = [heightmapImage.width, heightmapImage.height];
-            this.meshGrid = this._chooseMeshGrid(heightmapImage.width, heightmapImage.height);
+            this.terrainGrid = [hmW, hmH];
+            this.meshGrid = this._chooseMeshGrid(hmW, hmH);
 
             // Precompute scene AABB in *viewer space* for the camera (transform 8 corners).
             const corners = [
@@ -804,7 +1149,7 @@ void main() { }
      * Returns null if sampling isn't available yet.
      */
     getHeightAtXY(x, y) {
-        if (!this.heightmapPixels || !this.heightmapPixels.data) return null;
+        if (!this.heightmapPixels) return null;
         const [minX, minY, minZ] = this.terrainBounds || [0, 0, 0];
         const [sizeX, sizeY, sizeZ] = this.terrainSize || [0, 0, 0];
         if (!sizeX || !sizeY || !sizeZ) return null;
@@ -820,14 +1165,34 @@ void main() { }
         const h = this.heightmapPixels.height;
         const px = Math.round(u * (w - 1));
         const py = Math.round((1.0 - v) * (h - 1));
-        const idx = (py * w + px) * 4;
-        const r = this.heightmapPixels.data[idx] ?? 0;
-        const height01 = r / 255.0;
+        let height01 = 0.0;
+        if (this.heightmapPixels.dataU16) {
+            const idx = (py * w + px);
+            const v16 = this.heightmapPixels.dataU16[idx] ?? 0;
+            height01 = v16 / 65535.0;
+        } else if (this.heightmapPixels.data) {
+            const idx = (py * w + px) * 4;
+            const r = this.heightmapPixels.data[idx] ?? 0;
+            height01 = r / 255.0;
+        } else {
+            return null;
+        }
         return minZ + height01 * sizeZ;
     }
     
     async loadHeightmapTexture() {
         try {
+            // Prefer 16-bit heightmap if available.
+            const hm16 = await this._tryLoadHeightmapU16();
+            if (hm16 && hm16.dataU16) {
+                const f32 = new Float32Array(hm16.width * hm16.height);
+                for (let i = 0; i < f32.length; i++) f32[i] = (hm16.dataU16[i] ?? 0) / 65535.0;
+                this.heightmap = this._uploadHeightmapFloat32(hm16.width, hm16.height, f32);
+                this.heightmapPixels = { width: hm16.width, height: hm16.height, dataU16: hm16.dataU16 };
+                this.terrainGrid = [hm16.width, hm16.height];
+                return true;
+            }
+
             let blob;
             try {
                 blob = await fetchBlob('assets/heightmap.png', { priority: 'high' });
@@ -835,15 +1200,21 @@ void main() { }
                 console.warn('Heightmap texture not found, terrain will be rendered without heightmap');
                 return false;
             }
-            const image = await createImageBitmap(blob);
+            let image;
+            try {
+                image = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+            } catch {
+                image = await createImageBitmap(blob);
+            }
             
             // Create texture
             const texture = this.gl.createTexture();
             this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
             
             // Set texture parameters for heightmap
-            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.LINEAR);
-            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.LINEAR);
+            // Use NEAREST so any sampling path stays 1:1 with heightmap pixels.
+            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.NEAREST);
+            this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.NEAREST);
             this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
             this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
             
@@ -929,7 +1300,13 @@ void main() { }
             }
 
             // Decode without <img> to avoid noisy onerror Events.
-            const imageBitmap = await createImageBitmap(blob);
+            // Request no implicit color space conversion / alpha premultiply when supported (browser-dependent).
+            let imageBitmap;
+            try {
+                imageBitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+            } catch {
+                imageBitmap = await createImageBitmap(blob);
+            }
             
             // Create texture
             const texture = this.gl.createTexture();
@@ -955,9 +1332,18 @@ void main() { }
             const prevCsc = (() => {
                 try { return gl.getParameter(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL); } catch { return null; }
             })();
+            const prevPma = (() => {
+                try { return gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL); } catch { return null; }
+            })();
             try {
                 if (prevCsc !== null && typeof gl.UNPACK_COLORSPACE_CONVERSION_WEBGL !== 'undefined') {
                     gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+                }
+            } catch { /* ignore */ }
+            // GTA textures are authored as straight alpha; avoid premultiply on upload.
+            try {
+                if (prevPma !== null && typeof gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL !== 'undefined') {
+                    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
                 }
             } catch { /* ignore */ }
 
@@ -980,6 +1366,11 @@ void main() { }
             try {
                 if (prevCsc !== null && typeof gl.UNPACK_COLORSPACE_CONVERSION_WEBGL !== 'undefined') {
                     gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, prevCsc);
+                }
+            } catch { /* ignore */ }
+            try {
+                if (prevPma !== null && typeof gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL !== 'undefined') {
+                    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, prevPma);
                 }
             } catch { /* ignore */ }
             
@@ -1027,7 +1418,7 @@ void main() { }
 
         // Prefer deferred shader path when available (WebGL2 only); fall back to forward shader path.
         if (this._deferredReady) {
-            this._renderDeferred(viewProjectionMatrix);
+            this._renderDeferred(viewProjectionMatrix, fog);
             return;
         }
 
@@ -1094,6 +1485,11 @@ void main() { }
         this.gl.uniform3fv(this.uniforms.uFogColor, fog?.color || [0.6, 0.7, 0.8]);
         this.gl.uniform1f(this.uniforms.uFogStart, Number(fog?.start ?? 1500));
         this.gl.uniform1f(this.uniforms.uFogEnd, Number(fog?.end ?? 9000));
+
+        // Output encoding: if outputSrgb is false, the shader outputs linear for a final post-process pass.
+        try {
+            if (this.uniforms.uOutputSrgb) this.gl.uniform1i(this.uniforms.uOutputSrgb, (fog?.outputSrgb === false) ? 0 : 1);
+        } catch { /* ignore */ }
 
         // If we can't upload sRGB textures, decode in shader.
         try {
@@ -1362,7 +1758,7 @@ void main() { }
         gl.bufferSubData(gl.UNIFORM_BUFFER, 0, arrayBuffer);
     }
 
-    _renderDeferred(viewProjectionMatrix) {
+    _renderDeferred(viewProjectionMatrix, fog = null) {
         const gl = this.gl;
         const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
         if (!isWebGL2) return;
@@ -1376,8 +1772,20 @@ void main() { }
         this._ensureTerrainTextureFallbacks();
         this._ensureDummyTextures();
 
+        // Lighting inputs:
+        // - By default, use a stable sun-ish direction.
+        // - main.js may pass fog.lightDir/lightColor/ambientIntensity to better match time-of-day + HDR pipeline.
+        const lightDir = (fog && Array.isArray(fog.lightDir) && fog.lightDir.length >= 3)
+            ? [Number(fog.lightDir[0]) || 0, Number(fog.lightDir[1]) || 0, Number(fog.lightDir[2]) || 0]
+            : [0.5, 0.8, 0.3];
+        const lightColor = (fog && Array.isArray(fog.lightColor) && fog.lightColor.length >= 3)
+            ? [Number(fog.lightColor[0]) || 1, Number(fog.lightColor[1]) || 1, Number(fog.lightColor[2]) || 1]
+            : [1.0, 1.0, 1.0];
+        const ambientIntensity = (fog && Number.isFinite(Number(fog.ambientIntensity)))
+            ? Math.max(0.0, Math.min(10.0, Number(fog.ambientIntensity)))
+            : 0.7;
+
         // Optional shadow map update (before UBO upload so we can fill matrices + bind the real shadow texture).
-        const lightDir = [0.5, 0.8, 0.3];
         const shadowOk = this._renderShadowMap(lightDir);
 
         // Update matrices
@@ -1423,9 +1831,9 @@ void main() { }
             const ld = lightDir;
             setF(0, ld[0]); setF(4, ld[1]); setF(8, ld[2]); setF(12, 0);
             // vec3 uLightColor (16 bytes)
-            setF(16, 1.0); setF(20, 1.0); setF(24, 1.0); setF(28, 0);
+            setF(16, lightColor[0]); setF(20, lightColor[1]); setF(24, lightColor[2]); setF(28, 0);
             // float uAmbientIntensity at offset 32
-            setF(32, 0.7);
+            setF(32, ambientIntensity);
             const f32 = new Float32Array(buf);
             // mat4 uLightViewMatrix at byte offset 48 (float idx 12)
             f32.set(shadowOk ? this._shadow.lightView : glMatrix.mat4.create(), 12);
@@ -1515,10 +1923,12 @@ void main() { }
         bind2D(6, this._dummyWhite, U.uColorMap4);
 
         // Normal maps (unused by default)
-        bind2D(7, this._dummyWhite, U.uNormalMap0);
-        bind2D(8, this._dummyWhite, U.uNormalMap1);
-        bind2D(9, this._dummyWhite, U.uNormalMap2);
-        bind2D(10, this._dummyWhite, U.uNormalMap3);
+        // Hook up per-layer normal maps when available (these are loaded by main.js as normal1..normal4).
+        // If a normal is missing, fall back to a flat normal so lighting remains stable.
+        bind2D(7, this.textures.normal1 || this._flatNormal, U.uNormalMap0);
+        bind2D(8, this.textures.normal2 || this._flatNormal, U.uNormalMap1);
+        bind2D(9, this.textures.normal3 || this._flatNormal, U.uNormalMap2);
+        bind2D(10, this.textures.normal4 || this._flatNormal, U.uNormalMap3);
         bind2D(11, this._dummyWhite, U.uNormalMap4);
 
         // Tint palette required by includes; shadow map is real if available
@@ -1532,10 +1942,13 @@ void main() { }
         if (U.uEnableTexture3) gl.uniform1i(U.uEnableTexture3, 1);
         if (U.uEnableTexture4) gl.uniform1i(U.uEnableTexture4, 0);
         if (U.uEnableTextureMask) gl.uniform1i(U.uEnableTextureMask, 1);
-        if (U.uEnableNormalMap) gl.uniform1i(U.uEnableNormalMap, 0);
+        if (U.uEnableNormalMap) gl.uniform1i(U.uEnableNormalMap, 1);
         if (U.uEnableVertexColour) gl.uniform1i(U.uEnableVertexColour, 0);
         if (U.uSpecularIntensity) gl.uniform1f(U.uSpecularIntensity, 0.15);
         if (U.uSpecularPower) gl.uniform1f(U.uSpecularPower, 16.0);
+        // Heightmap terrain uses RGBA splat weights (not CodeWalker vertex-colour terrain materials).
+        if (U.uTerrainBlendMode) gl.uniform1i(U.uTerrainBlendMode, 0);
+        if (U.uBumpiness) gl.uniform1f(U.uBumpiness, 0.5);
 
         // Depth-bias terrain slightly to reduce z-fighting.
         gl.enable(gl.POLYGON_OFFSET_FILL);
@@ -1543,17 +1956,13 @@ void main() { }
         this.mesh.render(this.gbufferProgram);
         gl.disable(gl.POLYGON_OFFSET_FILL);
 
-        // Copy terrain depth into default framebuffer so subsequent passes (models/buildings) can depth-test.
-        try {
-            gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._gbuffer.fbo);
-            gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-            gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
-        } catch {
-            // ignore
-        }
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-        // --- Composite to screen ---
+        // --- Composite to output framebuffer ---
+        // IMPORTANT:
+        // We MUST unbind the G-buffer FBO before sampling from its attached textures.
+        // Otherwise WebGL will detect a feedback loop (drawing into an FBO while reading from a texture attached to it)
+        // and raise GL_INVALID_OPERATION (1282), which can also poison subsequent GL work.
+        const outFbo = this._outputFramebuffer || null;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, outFbo);
         gl.viewport(0, 0, w, h);
         gl.disable(gl.DEPTH_TEST);
         gl.depthMask(false);
@@ -1562,9 +1971,49 @@ void main() { }
         gl.bindVertexArray(this._fsVao);
         bind2D(0, this._gbuffer.texDiffuse, this._compositeUniforms?.uDiffuseTex);
         bind2D(1, this._gbuffer.texIrr, this._compositeUniforms?.uIrradianceTex);
+        try {
+            const outSrgb = (fog && fog.outputSrgb === false) ? 0 : 1;
+            if (this._compositeUniforms?.uOutputSrgb) gl.uniform1i(this._compositeUniforms.uOutputSrgb, outSrgb);
+        } catch { /* ignore */ }
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         gl.bindVertexArray(null);
         gl.depthMask(true);
+
+        // Populate output framebuffer depth so subsequent passes can depth-test against terrain.
+        // - For an offscreen scene FBO (PostFx), depth blit is valid and preferred.
+        // - For the default framebuffer, depth blit may be invalid when MSAA is enabled; keep the existing fallback.
+        if (outFbo) {
+            try {
+                gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._gbuffer.fbo);
+                gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, outFbo);
+                gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+            } catch { /* ignore */ }
+            // Restore draw target for subsequent passes.
+            gl.bindFramebuffer(gl.FRAMEBUFFER, outFbo);
+        } else {
+            // Default framebuffer is often multisampled (MSAA) when antialiasing is enabled. Blitting DEPTH into a
+            // multisampled framebuffer is invalid on many WebGL2 implementations (causes GL_INVALID_OPERATION / 1282).
+            let defaultIsMultisampled = false;
+            try {
+                gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._gbuffer.fbo);
+                gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+                const sb = gl.getParameter(gl.SAMPLE_BUFFERS) | 0;
+                const s = gl.getParameter(gl.SAMPLES) | 0;
+                defaultIsMultisampled = (sb > 0 && s > 0);
+                if (!defaultIsMultisampled) {
+                    gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+                }
+            } catch {
+                // ignore; we'll try depth-only fallback below
+                defaultIsMultisampled = true;
+            } finally {
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            }
+
+            if (defaultIsMultisampled) {
+                try { this._renderDepthToDefault(viewProjectionMatrix, w, h); } catch { /* ignore */ }
+            }
+        }
     }
     
     dispose() {

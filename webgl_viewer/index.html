@@ -150,6 +150,19 @@
             <input type="checkbox" id="wireframe">
         </div>
         <div class="control-group">
+            <label>Camera</label>
+            <label style="margin-top: 6px;">Camera speed: <span id="cameraSpeedValue" style="opacity: 0.85;">10 (1.0×)</span></label>
+            <input id="cameraSpeedPct" type="range" min="0.1" max="200" step="0.1" value="10">
+            <button id="resetCamera" style="width: 100%; padding: 6px; margin-top: 6px;">Reset camera (full map)</button>
+            <label style="margin-top: 10px;">Teleport camera (viewer-space)</label>
+            <input id="teleportCoords" placeholder="vec3(553.981, 44.409, -176.917)  or  553.981 44.409 -176.917">
+            <button id="teleportCamera" style="width: 100%; padding: 6px; margin-top: 6px;">Teleport</button>
+            <div style="margin-top: 6px; font-size: 12px; opacity: 0.75; line-height: 1.25;">
+                Paste from debug output like <span style="font-family: Consolas, 'Courier New', monospace;">viewer: vec3(...)</span>.
+                Teleport switches to free camera (disables follow/character view) so it won’t snap back.
+            </div>
+        </div>
+        <div class="control-group">
             <label>Ped</label>
             <button id="spawnCharacter" style="width: 100%; padding: 6px;">Spawn character (GTA camera)</button>
             <button id="spawnPedCity" style="width: 100%; padding: 6px;">Spawn ped (city)</button>
@@ -209,6 +222,35 @@
             <input id="fogStart" type="number" min="0" max="1000000" value="1200">
             <label style="margin-top: 6px;">Fog end (viewer units)</label>
             <input id="fogEnd" type="number" min="0" max="2000000" value="9000">
+            <label style="margin-top: 10px;">Post FX (CodeWalker-like)</label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enablePostFx">
+                Enable tone mapping (final pass, linear-space)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                Exposure (multiplier)
+            </label>
+            <input id="postFxExposure" type="number" min="0" max="10" step="0.05" value="1.0">
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                Avg luminance (stand-in for auto-exposure)
+            </label>
+            <input id="postFxLum" type="number" min="0" max="10" step="0.05" value="1.0">
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="enableAutoExposure">
+                Auto exposure (log-average luminance)
+            </label>
+            <label style="margin-top: 6px; margin-left: 28px; opacity: 0.9;">Auto exposure speed</label>
+            <input id="autoExposureSpeed" type="number" min="0" max="10" step="0.1" value="1.5">
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="enableBloom">
+                Enable bloom
+            </label>
+            <label style="margin-top: 6px; margin-left: 28px; opacity: 0.9;">Bloom strength</label>
+            <input id="bloomStrength" type="number" min="0" max="4" step="0.05" value="0.6">
+            <label style="margin-top: 6px; margin-left: 28px; opacity: 0.9;">Bloom threshold (linear)</label>
+            <input id="bloomThreshold" type="number" min="0" max="1000" step="0.1" value="50.0">
+            <label style="margin-top: 6px; margin-left: 28px; opacity: 0.9;">Bloom radius</label>
+            <input id="bloomRadius" type="number" min="0" max="8" step="0.1" value="2.0">
             <button id="applyHighDetail" style="width: 100%; padding: 6px; margin-top: 8px;">
                 Apply High Detail (GTA-like)
             </button>
@@ -246,7 +288,7 @@
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
                 <input type="checkbox" id="showPlaceholders">
-                Show placeholder meshes for unexported archetypes
+                Show placeholder meshes for unexported archetypes (NOT textures)
             </label>
             <button id="dumpMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Dump missing archetypes (console)</button>
             <button id="downloadMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Download missing archetypes (json)</button>
@@ -258,8 +300,8 @@
                 <input type="checkbox" id="streamFromCamera" checked>
                 Stream around camera (faster first-view)
             </label>
-            <label style="margin-top: 6px;">Max archetypes (instanced meshes)</label>
-            <input id="maxArchetypes" type="number" min="0" max="20000" value="900">
+            <label style="margin-top: 6px;">Max archetypes (instanced meshes) (0 = unlimited)</label>
+            <input id="maxArchetypes" type="number" min="0" value="900">
             <label style="margin-top: 6px;">Model stream distance (data units)</label>
             <input id="maxModelDistance" type="number" min="0" max="100000" value="1200">
             <label style="margin-top: 6px;">Mesh loads in flight</label>
@@ -279,6 +321,16 @@
                 <input type="checkbox" id="enableOcclusionCulling">
                 Occlusion culling (experimental)
             </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enableShadows">
+                Directional shadows (sun shadow map; experimental)
+            </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">Shadow map size</label>
+            <select id="shadowMapSize" style="margin-left: 14px;">
+                <option value="1024">1024</option>
+                <option value="2048" selected>2048</option>
+                <option value="4096">4096</option>
+            </select>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enablePerfHud">
                 Perf HUD (diagnostics)

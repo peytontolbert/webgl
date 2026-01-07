@@ -11,22 +11,22 @@ Usage:
 import argparse
 import json
 import os
+import re
 import traceback
 from pathlib import Path
 from typing import Optional
 
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.rpf_reader import RpfReader
+from gta5_modules.script_paths import auto_assets_dir
+from gta5_modules.hash_utils import as_u32_int as _as_u32_int
+from gta5_modules.codewalker_archetypes import get_archetype_best_effort
+from gta5_modules.cw_loaders import try_get_drawable as _try_get_drawable
 
 
 def _as_u32(s: str) -> Optional[int]:
-    try:
-        ss = str(s).strip()
-        if not ss or not ss.lstrip("-").isdigit():
-            return None
-        return int(ss, 10) & 0xFFFFFFFF
-    except Exception:
-        return None
+    # Wrapper kept for backwards-compat within this script.
+    return _as_u32_int(s)
 
 
 def _ensure_entry_material(entry: dict) -> dict:
@@ -65,6 +65,151 @@ def _entry_has_any_map(entry: dict, key: str) -> bool:
 def _entry_has_any_diffuse(entry: dict) -> bool:
     return _entry_has_any_map(entry, "diffuse")
 
+
+def _normalize_rel_asset_path(rel: str) -> str:
+    """
+    Normalize a manifest-relative-ish texture path to something under assets_dir.
+    Examples:
+      "models_textures/123.png" -> "models_textures/123.png"
+      "assets/models_textures/123.png" -> "models_textures/123.png"
+      "/assets/models_textures/123.png" -> "models_textures/123.png"
+    """
+    r = str(rel or "").strip().replace("\\", "/")
+    r = r.lstrip("/")
+    if r.lower().startswith("assets/"):
+        r = r[len("assets/") :]
+    return r
+
+
+def _material_map_file_exists(assets_dir: Path, rel: str) -> bool:
+    """
+    Returns True if the referenced file exists on disk under assets_dir.
+    Only meant for exported/runtime asset paths (not URLs).
+    """
+    r = _normalize_rel_asset_path(rel)
+    if not r:
+        return False
+    try:
+        p = assets_dir / r
+        return p.exists() and p.is_file()
+    except Exception:
+        return False
+
+
+def _entry_has_any_map_file(assets_dir: Path, entry: dict, key: str) -> bool:
+    """
+    Like _entry_has_any_map, but requires that the referenced file exists.
+    This is critical because many manifests already contain 'diffuse' paths, but the files
+    may not have been exported/synced yet.
+    """
+    if not isinstance(entry, dict):
+        return False
+    mat = entry.get("material")
+    if isinstance(mat, dict):
+        v = mat.get(key)
+        if isinstance(v, str) and v.strip() and _material_map_file_exists(assets_dir, v):
+            return True
+    lods = entry.get("lods")
+    if isinstance(lods, dict):
+        for lod_meta in lods.values():
+            if not isinstance(lod_meta, dict):
+                continue
+            subs = lod_meta.get("submeshes")
+            if not isinstance(subs, list):
+                continue
+            for sm in subs:
+                if not isinstance(sm, dict):
+                    continue
+                smm = sm.get("material")
+                if isinstance(smm, dict):
+                    v = smm.get(key)
+                    if isinstance(v, str) and v.strip() and _material_map_file_exists(assets_dir, v):
+                        return True
+    return False
+
+
+_MODELS_TEX_RE = re.compile(r"^models_textures/(?P<hash>\d+)(?:_(?P<slug>[^/]+))?\.png$", re.IGNORECASE)
+
+
+def _maybe_name_from_models_textures_rel(rel: str) -> str | None:
+    """
+    Best-effort: infer a texture *name* from a models_textures/<hash>_<slug>.png rel.
+    Returns the slug portion (usually identical to the real GTA texture name, modulo casing).
+    """
+    s = str(rel or "").strip().replace("\\", "/")
+    s = s.lstrip("/")
+    if s.lower().startswith("assets/"):
+        s = s[len("assets/") :]
+    m = _MODELS_TEX_RE.match(s)
+    if not m:
+        return None
+    slug = str(m.group("slug") or "").strip()
+    return slug or None
+
+
+def _iter_entry_material_dicts(entry: dict):
+    """
+    Iterate material dicts found at entry-level and per-submesh for all LODs.
+    """
+    if not isinstance(entry, dict):
+        return []
+    mats = []
+    m0 = entry.get("material")
+    if isinstance(m0, dict):
+        mats.append(m0)
+    lods = entry.get("lods")
+    if isinstance(lods, dict):
+        for lod_meta in lods.values():
+            if not isinstance(lod_meta, dict):
+                continue
+            subs = lod_meta.get("submeshes")
+            if not isinstance(subs, list):
+                continue
+            for sm in subs:
+                if isinstance(sm, dict) and isinstance(sm.get("material"), dict):
+                    mats.append(sm.get("material"))
+    return mats
+
+
+def _collect_texture_names_from_entry(entry: dict, want_keys: list[str]) -> set[str]:
+    """
+    Collect texture *names* to export for an entry without requiring a Drawable.
+    Sources:
+      - explicit <key>Name fields (diffuseName/etc)
+      - slug inferred from explicit <key> rel path (models_textures/<hash>_<slug>.png)
+      - shaderParams.texturesByHash string values (CodeWalker-style names)
+    """
+    out: set[str] = set()
+    mats = _iter_entry_material_dicts(entry)
+    for mat in mats:
+        if not isinstance(mat, dict):
+            continue
+
+        for k in want_keys:
+            kn = f"{k}Name"
+            v = mat.get(kn)
+            if isinstance(v, str) and v.strip():
+                out.add(v.strip())
+            rel = mat.get(k)
+            if isinstance(rel, str) and rel.strip():
+                nm = _maybe_name_from_models_textures_rel(rel)
+                if nm:
+                    out.add(nm)
+
+        sp = mat.get("shaderParams")
+        tex_by_hash = sp.get("texturesByHash") if isinstance(sp, dict) else None
+        if isinstance(tex_by_hash, dict):
+            for v in tex_by_hash.values():
+                if not isinstance(v, str):
+                    continue
+                s = v.strip()
+                if not s:
+                    continue
+                if ("/" in s) or ("\\" in s) or (".png" in s.lower()) or (".dds" in s.lower()) or (".ktx2" in s.lower()):
+                    continue
+                out.add(s)
+
+    return out
 
 def _promote_first_submesh_material_to_entry_level(entry: dict) -> bool:
     """
@@ -140,11 +285,33 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
+    ap.add_argument(
+        "--selected-dlc",
+        default="all",
+        help="CodeWalker DLC level. Use 'all' for full DLC overlays (except patchday27ng unless explicitly selected).",
+    )
+    ap.add_argument("--split-by-dlc", action="store_true", help="Write exported textures into assets/packs/<dlcname>/models_textures when possible.")
+    ap.add_argument("--pack-root-prefix", default="packs", help="Pack root dir under assets/ (default: packs).")
+    ap.add_argument("--force-pack", default="", help="Force writing all exported textures into a single pack id.")
     ap.add_argument("--max", type=int, default=0, help="Limit number of textures exported (0 = all)")
+    ap.add_argument(
+        "--only-from-dump",
+        default="",
+        help=(
+            "Optional: restrict processing to archetypes referenced by a debug dump JSON "
+            "(e.g. tools/debug_textures_near_coords.py --out ...). "
+            "This is a targeted 'fix textures near X' mode."
+        ),
+    )
     ap.add_argument(
         "--only-missing",
         action="store_true",
         help="Only export when selected material maps are missing (see --only-missing-maps).",
+    )
+    ap.add_argument(
+        "--only-missing-files",
+        action="store_true",
+        help="When used with --only-missing, treat a material map as missing if its referenced file does not exist on disk under --assets-dir.",
     )
     ap.add_argument(
         "--only-missing-maps",
@@ -174,14 +341,7 @@ def main():
     if not game_path:
         raise SystemExit("Missing --game-path (or gta_location env var)")
 
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
 
     manifest_path = assets_dir / "models" / "manifest.json"
     if not manifest_path.exists():
@@ -192,11 +352,11 @@ def main():
     if not isinstance(meshes, dict) or not meshes:
         raise SystemExit("Manifest has no meshes.")
 
-    tex_dir = assets_dir / "models_textures"
-    tex_dir.mkdir(parents=True, exist_ok=True)
-    ktx2_dir = assets_dir / "models_textures_ktx2"
+    tex_dir_base = assets_dir / "models_textures"
+    tex_dir_base.mkdir(parents=True, exist_ok=True)
+    ktx2_dir_base = assets_dir / "models_textures_ktx2"
     if args.export_ktx2:
-        ktx2_dir.mkdir(parents=True, exist_ok=True)
+        ktx2_dir_base.mkdir(parents=True, exist_ok=True)
 
     # Optional sharded-manifest support: if present, we should update the shard files too,
     # because the WebGL viewer prefers loading shards via manifest_index.json.
@@ -207,7 +367,7 @@ def main():
     dm = DllManager(game_path)
     if not dm.initialized:
         raise SystemExit("Failed to initialize DllManager")
-    if not dm.init_game_file_cache():
+    if not dm.init_game_file_cache(selected_dlc=str(args.selected_dlc or "").strip() or None):
         raise SystemExit("Failed to init GameFileCache (required for textures)")
     # NOTE: Texture decode can happen either via CodeWalker texture.GetPixels(0) or via DDSIO.GetPixels(tex,0).
     # RpfReader.get_ytd_textures handles both paths, so do not hard-fail here.
@@ -219,11 +379,57 @@ def main():
 
     rpf_reader = RpfReader(str(game_path), dm)
 
+    packs_root = assets_dir / str(args.pack_root_prefix or "packs").strip().strip("/").strip("\\")
+    force_pack = str(args.force_pack or "").strip().lower()
+    split_by_dlc = bool(args.split_by_dlc)
+
+    def _infer_dlc_name_from_entry_path(p: str) -> str:
+        s = str(p or "").strip().lower().replace("/", "\\")
+        m = re.search(r"\\dlcpacks\\([^\\]+)\\", s)
+        return str(m.group(1) or "").strip().lower() if m else ""
+
     # Reuse CodeWalker-aware material export helpers from the main drawable exporter.
     # This script is specifically for "fast texture/material fixups" without re-exporting geometry.
-    from export_drawables_for_chunk import _update_existing_manifest_materials_for_drawable  # type: ignore
+    from export_drawables_for_chunk import _update_existing_manifest_materials_for_drawable, _export_texture_png  # type: ignore
 
     keys = list(meshes.keys())
+
+    # Optional targeting: restrict to archetypes referenced by a debug dump.
+    # This keeps the workflow fast when you're iterating on a specific coordinate.
+    dump_path = str(args.only_from_dump or "").strip()
+    if dump_path:
+        try:
+            dump_obj = json.loads(Path(dump_path).read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            dump_obj = None
+        wanted_hashes: set[str] = set()
+        if isinstance(dump_obj, dict):
+            rows = dump_obj.get("textures")
+            if isinstance(rows, list):
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    # Only consider missing rows; we want to fix the gaps.
+                    if str(r.get("reason") or "") == "ok":
+                        continue
+                    refs = r.get("refs")
+                    if not isinstance(refs, list):
+                        continue
+                    for ref in refs:
+                        if not isinstance(ref, dict):
+                            continue
+                        ah = ref.get("archetype_hash")
+                        if ah is None:
+                            continue
+                        s = str(ah).strip()
+                        if s:
+                            wanted_hashes.add(s)
+        if wanted_hashes:
+            keys = [k for k in keys if str(k) in wanted_hashes]
+            print(f"[target] --only-from-dump={dump_path} -> archetypes={len(wanted_hashes)} manifestKeysSelected={len(keys)}")
+        else:
+            print(f"[target] --only-from-dump={dump_path} -> no archetype refs found; processing full manifest ({len(keys)} keys)")
+
     maxn = int(args.max or 0)
     if maxn > 0:
         keys = keys[:maxn]
@@ -365,21 +571,30 @@ def main():
             want_keys = ["diffuse"]
 
         have_all = True
-        if isinstance(entry, dict):
-            for k in want_keys:
-                if not _entry_has_any_map(entry, k):
-                    have_all = False
-                    break
-        else:
+        if not isinstance(entry, dict):
             have_all = False
+        else:
+            for k in want_keys:
+                if args.only_missing_files:
+                    if not _entry_has_any_map_file(assets_dir, entry, k):
+                        have_all = False
+                        break
+                else:
+                    if not _entry_has_any_map(entry, k):
+                        have_all = False
+                        break
 
         if args.only_missing and have_all:
             skip_reasons["only_missing_already_has_required_maps"] += 1
-            _sample("only_missing_already_has_required_maps", want=",".join(want_keys))
+            _sample(
+                "only_missing_already_has_required_maps",
+                want=",".join(want_keys),
+                mode=("file-exists" if args.only_missing_files else "field-present"),
+            )
             skipped += 1
             continue
 
-        arch = gfc.GetArchetype(h)
+        arch = get_archetype_best_effort(gfc, int(h) & 0xFFFFFFFF, dll_manager=dm)
         if arch is None:
             skip_reasons["no_archetype"] += 1
             _sample("no_archetype", archetype=None)
@@ -388,30 +603,17 @@ def main():
 
         try:
             # Load the Drawable too so we can read per-geometry shader params (uv tiling + correct sampler picks).
-            drawable = None
-            try:
-                drawable = gfc.TryGetDrawable(arch)
-            except Exception:
-                drawable = None
-            spins_d = 0
             max_spins_d = int(args.drawable_spins or 600)
             if max_spins_d < 0:
                 max_spins_d = 0
-            while drawable is None and spins_d < max_spins_d:
-                gfc.ContentThreadProc()
-                spins_d += 1
-                try:
-                    drawable = gfc.TryGetDrawable(arch)
-                except Exception:
-                    drawable = None
+            drawable = _try_get_drawable(gfc, arch, spins=max_spins_d)
             if drawable is None:
-                skip_reasons["no_drawable"] += 1
-                _sample("no_drawable", spins=spins_d)
-                skipped += 1
-                continue
-
-            if dump_shader_left > 0:
-                _dump_drawable_shader_params(h, drawable)
+                # Don't early-exit: we can still export textures directly from the YTD using
+                # manifest-provided texture names/paths (fallback path).
+                pass
+            else:
+                if dump_shader_left > 0:
+                    _dump_drawable_shader_params(h, drawable)
 
             tdh = getattr(arch, "TextureDict", None)
             td_hash = None
@@ -442,24 +644,51 @@ def main():
                 skipped += 1
                 continue
 
-            # Primary: treat TextureDict as a YTD shortname hash (common case).
-            ytd = gfc.GetYtd(td_hash)
+            # CodeWalker parity: apply HD-TXD mapping first (from `_manifest.ymf` HDTxdAssetBindings).
+            # This can change which YTD contains textures for a given archetype/asset.
+            td_hash_hd = None
+            try:
+                td_hash_hd = int(gfc.TryGetHDTextureHash(int(td_hash) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            except Exception:
+                td_hash_hd = int(td_hash) & 0xFFFFFFFF
+            # Prefer HD-mapped hash when it differs.
+            td_hash_candidates = []
+            if td_hash_hd and td_hash_hd != (int(td_hash) & 0xFFFFFFFF):
+                td_hash_candidates.append(td_hash_hd)
+            td_hash_candidates.append(int(td_hash) & 0xFFFFFFFF)
+
+            # Primary: treat TextureDict as a YTD shortname hash (common case), trying HD first.
+            ytd = None
+            for cand in td_hash_candidates:
+                if ytd is not None:
+                    break
+                try:
+                    ytd = gfc.GetYtd(int(cand) & 0xFFFFFFFF)
+                except Exception:
+                    ytd = None
+
             # CodeWalker has additional indirection helpers for cases where a hash is a *texture* name
             # (not the ytd shortname) or when a texture dict is inherited from a parent.
             if ytd is None:
-                try:
-                    # If td_hash is actually a texture name hash, resolve it to the owning YTD.
-                    ytd = gfc.TryGetTextureDictForTexture(td_hash)
-                except Exception:
-                    ytd = None
+                for cand in td_hash_candidates:
+                    if ytd is not None:
+                        break
+                    try:
+                        # If td_hash is actually a texture name hash, resolve it to the owning YTD.
+                        ytd = gfc.TryGetTextureDictForTexture(int(cand) & 0xFFFFFFFF)
+                    except Exception:
+                        ytd = None
             if ytd is None:
-                try:
-                    # Try parent texture dict chain (rare but exists for some assets).
-                    ph = gfc.TryGetParentYtdHash(td_hash)
-                    if ph and int(ph) != 0:
-                        ytd = gfc.GetYtd(int(ph) & 0xFFFFFFFF)
-                except Exception:
-                    pass
+                for cand in td_hash_candidates:
+                    if ytd is not None:
+                        break
+                    try:
+                        # Try parent texture dict chain (rare but exists for some assets).
+                        ph = gfc.TryGetParentYtdHash(int(cand) & 0xFFFFFFFF)
+                        if ph and int(ph) != 0:
+                            ytd = gfc.GetYtd(int(ph) & 0xFFFFFFFF)
+                    except Exception:
+                        pass
             spins = 0
             max_spins = int(args.ytd_spins or 2000)
             if max_spins < 0:
@@ -476,6 +705,23 @@ def main():
                     _sample("ytd_not_loaded", texture_dict_hash=td_hash, spins=spins)
                 skipped += 1
                 continue
+
+            # Pick texture output dirs (base vs pack) based on the source YTD.
+            tex_dir = tex_dir_base
+            ktx2_dir = ktx2_dir_base
+            if force_pack:
+                tex_dir = packs_root / force_pack / "models_textures"
+                ktx2_dir = packs_root / force_pack / "models_textures_ktx2"
+            elif split_by_dlc:
+                try:
+                    ent = getattr(ytd, "RpfFileEntry", None)
+                    ep = str(getattr(ent, "Path", "") or "") if ent is not None else ""
+                except Exception:
+                    ep = ""
+                dlc = _infer_dlc_name_from_entry_path(ep)
+                if dlc:
+                    tex_dir = packs_root / dlc / "models_textures"
+                    ktx2_dir = packs_root / dlc / "models_textures_ktx2"
 
             if debug_left > 0:
                 debug_left -= 1
@@ -562,17 +808,41 @@ def main():
                 entry = {}
                 meshes[hs] = entry
 
-            wrote_now = _update_existing_manifest_materials_for_drawable(
-                entry=entry,
-                drawable=drawable,
-                textures=textures,
-                td_hash=int(td_hash) & 0xFFFFFFFF,
-                tex_dir=tex_dir,
-                dll_manager=dm,
-                export_ktx2=bool(args.export_ktx2),
-                ktx2_dir=ktx2_dir,
-                toktx_exe=str(args.toktx or "toktx"),
-            )
+            wrote_now = 0
+            if drawable is not None:
+                wrote_now = _update_existing_manifest_materials_for_drawable(
+                    entry=entry,
+                    drawable=drawable,
+                    textures=textures,
+                    td_hash=int(td_hash) & 0xFFFFFFFF,
+                    tex_dir=tex_dir,
+                    dll_manager=dm,
+                    export_ktx2=bool(args.export_ktx2),
+                    ktx2_dir=ktx2_dir,
+                    toktx_exe=str(args.toktx or "toktx"),
+                )
+            else:
+                # Fallback export: no drawable available, but we have a decoded YTD textures dict.
+                # Export by NAME using manifest hints (diffuseName/etc, shaderParams.texturesByHash, and slug inferred from paths).
+                names = _collect_texture_names_from_entry(entry, want_keys)
+                if not names:
+                    skip_reasons["no_drawable"] += 1
+                    _sample("no_drawable", spins=spins_d, note="fallback had no names")
+                    skipped += 1
+                    continue
+
+                exported_now = 0
+                for nm in sorted(names):
+                    _relp, wrote = _export_texture_png(textures, nm, tex_dir, td_hash=int(td_hash) & 0xFFFFFFFF, dll_manager=dm)
+                    if wrote:
+                        exported_now += 1
+                wrote_now = exported_now
+                if wrote_now == 0:
+                    # Nothing new written; likely already exported by other entries sharing this YTD.
+                    skip_reasons["no_drawable"] += 1
+                    _sample("no_drawable", spins=spins_d, note="fallback wrote 0 new (already present)")
+                    skipped += 1
+                    continue
             # NOTE:
             # `_update_existing_manifest_materials_for_drawable(...)` returns the number of *new PNG files written*.
             # That can legitimately be 0 even when it updated manifest material params (or when textures already existed).

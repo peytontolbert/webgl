@@ -94,9 +94,13 @@ There are two ways textures are resolved:
 
 - **Explicit material paths (best)**: if the manifest already contains a relative path (e.g. `models_textures/123_slug.png`), the viewer uses it as-is.
 - **Shader-param name → hash (fallback)**: if the manifest only has CodeWalker-style `shaderParams.texturesByHash` entries that are *names* (e.g. `"Prop_LOD"`), the viewer computes `joaat(name)` and maps to:
-  - `models_textures/<hash>.png`
+  - `models_textures/<hash>_<slug>.png` (preferred, so the runtime can probe both hash-only and slugged variants)
 
-This avoids reliance on slugged filenames in the hot path, but it requires that **`<hash>.png` exists** in `assets/models_textures/`.
+The final URL selection (hash-only vs hash+slug, plus optional index-based existence gating) is centralized in:
+
+- `webgl/webgl_viewer/js/texture_path_resolver.js`
+
+This keeps renderers from accumulating one-off patches for naming/fallback rules.
 
 #### 3) Streaming / decoding / GPU upload
 
@@ -122,12 +126,32 @@ If your export produces `<hash>_<slug>.png` only, either:
 - also export the hash-only alias, or
 - ensure your manifests store explicit relative paths like `models_textures/<hash>_<slug>.png` (do not store just the bare filename without the `models_textures/` directory).
 
+Optional but recommended:
+- Generate `assets/models_textures/index.json` (via `webgl_viewer/setup_assets.py`) so the runtime can:
+  - resolve hash-only requests to slug-only files deterministically, and
+  - skip requesting textures that are provably not in the exported set (reduces 404 spam).
+
 ### Terrain textures
 
 - **Directory**: `webgl/webgl_viewer/assets/textures/`
 - **Referenced by**: `assets/terrain_info.json` (and the terrain renderer).
 
 ## Known discrepancy modes + symptoms
+
+### 0) “Placeholders everywhere” (mesh placeholders vs texture placeholders)
+
+The viewer has **two different “placeholder” systems** that can look similar at a glance:
+
+- **Placeholder meshes (missing exports)**: rendered when an archetype exists in world data but **no mesh was exported**.
+  - Controlled by the UI toggle **“Show placeholder meshes for unexported archetypes (NOT textures)”**.
+  - Diagnostic buttons: **“Dump missing archetypes”** / **“Download missing archetypes”**.
+- **Placeholder textures (missing/failed texture fetch)**: a **1×1 gray** texture used when a material texture URL is missing or failed to decode.
+  - Diagnostics:
+    - Enable **Perf HUD** and look at: `tex(diffuse): wanted=... real=... placeholder=...`
+    - Check DevTools Console for: `TextureStreamer: failed to load texture ...`
+    - Use `webgl/webgl_viewer/tools/trace_texture_pipeline.py <missing-name-or-url>`
+
+If you are seeing lots of placeholder **cubes**, it’s usually the **mesh export** side (archetypes missing from `assets/models/...`), not the texture pipeline.
 
 ### 1) **404 Not Found** for `assets/models_textures/...`
 

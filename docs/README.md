@@ -12,6 +12,14 @@ This directory contains documentation for the GTA 5 Terrain Extractor project, w
 - [Example Usage](example_usage.md): Examples of how to use the terrain extractor in various scenarios.
 - [Next Steps](next_steps.md): Roadmap for future enhancements to the terrain extractor.
 
+## WebGL viewer (models + textures) docs
+
+This repo also contains a WebGL viewer and a set of CodeWalker-backed export/repair tools. Key docs:
+
+- [WebGL Viewer Pipeline Repair Guide](PIPELINE_REPAIR_GUIDE_WEBGL_VIEWER.md): single source of truth for getting to **zero placeholder textures** and parity-critical export steps.
+- [Texture Pipeline Review](texture_pipeline_review.md): deeper review of naming/indexing, common failure modes, and runtime behavior.
+- [Texture naming contract (hash-only vs hash+slug)](../webgl_viewer/TEXTURE_NAMING_AND_DISCREPANCIES.md): canonical filename/index contract enforced by the viewer.
+
 ## Quick Start
 
 To get started with the GTA 5 Terrain Extractor, follow these steps:

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Earth Street-Level Wrapper (Prototype)</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+        }
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #controls {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 5px;
+            color: white;
+            font-family: Arial, sans-serif;
+            z-index: 10;
+            width: 320px;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+            overflow-x: hidden;
+            -webkit-overflow-scrolling: touch;
+        }
+        .control-group { margin: 10px 0; }
+        label { display: block; margin-bottom: 5px; }
+        select, input, button {
+            width: 100%;
+            padding: 6px;
+            margin-bottom: 6px;
+        }
+        code { font-family: Consolas, 'Courier New', monospace; }
+    </style>
+</head>
+<body>
+    <canvas id="earthCanvas"></canvas>
+    <div id="controls">
+        <div class="control-group">
+            <label>Earth wrapper (separate from GTA viewer)</label>
+            <div style="margin-top: 6px; font-size: 12px; opacity: 0.78; line-height: 1.25;">
+                This is a standalone prototype entrypoint for the “Earth street-level” mode.
+                Current feature: load small GeoJSON overlays from <code>assets/datasets/</code> (including OSM bbox exports).
+            </div>
+            <div style="margin-top: 8px; font-size: 12px; opacity: 0.78; line-height: 1.25;">
+                OSM Virginia extract downloaded to:
+                <code>data/osm/virginia-latest.osm.pbf</code>
+                (not parsed/rendered yet).
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label>Dataset overlay</label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showExternalDataset">
+                Show dataset overlay
+            </label>
+            <label style="margin-top: 6px;">Dataset</label>
+            <select id="externalDataset">
+                <option value="">Loading…</option>
+            </select>
+            <div id="externalDatasetStatus" style="margin-top: 6px; font-size: 12px; opacity: 0.88; line-height: 1.25; white-space: pre-line;"></div>
+            <div style="margin-top: 6px; font-size: 12px; opacity: 0.78; line-height: 1.25;">
+                Tip: pick <code>OSM VA (Richmond small) — streets + buildings (scene)</code> to validate “street level”.
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label>Controls</label>
+            <div style="margin-top: 6px; font-size: 12px; opacity: 0.78; line-height: 1.25; white-space: pre-line;">
+Left-drag: rotate
+Mouse wheel: zoom
+WASD: move on ground plane
+Q/E: down/up
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="./js/earth_main.js"></script>
+</body>
+</html>
+
+

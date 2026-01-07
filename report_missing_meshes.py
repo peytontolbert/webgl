@@ -16,77 +16,25 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-
-def _as_uint32_str(x) -> str | None:
-    try:
-        s = str(x).strip()
-        if not s:
-            return None
-        if s.lstrip("-").isdigit():
-            n = int(s, 10) & 0xFFFFFFFF
-            return str(n)
-        return None
-    except Exception:
-        return None
-
-
-def _joaat(s: str) -> int:
-    """
-    GTA "joaat" hash (Jenkins one-at-a-time), matches viewer `joaat.js`.
-    """
-    h = 0
-    for ch in (s or ""):
-        h += ord(ch)
-        h &= 0xFFFFFFFF
-        h += (h << 10) & 0xFFFFFFFF
-        h &= 0xFFFFFFFF
-        h ^= (h >> 6)
-        h &= 0xFFFFFFFF
-    h += (h << 3) & 0xFFFFFFFF
-    h &= 0xFFFFFFFF
-    h ^= (h >> 11)
-    h &= 0xFFFFFFFF
-    h += (h << 15) & 0xFFFFFFFF
-    h &= 0xFFFFFFFF
-    return h & 0xFFFFFFFF
-
-
-def _normalize_archetype_to_hash_str(obj: dict) -> Optional[str]:
-    # Prefer explicit archetype_hash if present.
-    ah = obj.get("archetype_hash")
-    h = _as_uint32_str(ah)
-    if h:
-        return h
-
-    arch = obj.get("archetype")
-    h = _as_uint32_str(arch)
-    if h:
-        return h
-
-    # Fallback: if archetype is a name, hash it like the viewer does.
-    s = str(arch or "").strip()
-    if not s or s.upper() == "UNKNOWN":
-        return None
-    return str(_joaat(s))
-
+from gta5_modules.archetype_utils import normalize_archetype_to_hash_str
+from gta5_modules.entity_coverage import load_entities_index
+from gta5_modules.script_paths import auto_assets_dir
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
     ap.add_argument("--top", type=int, default=50, help="Show top N missing archetypes by occurrence")
     ap.add_argument("--roads-only", action="store_true", help="Only include entities whose Name contains road-ish keywords")
+    ap.add_argument(
+        "--include-mlo-instances",
+        action="store_true",
+        help="Include MLO 'container' instances (is_mlo_instance=true). These often have no drawable and are not meant to be rendered as meshes.",
+    )
     ap.add_argument("--write-json", default="", help="Write missing archetypes list JSON to this path (for export_drawables_from_list.py)")
     ap.add_argument("--min-count", type=int, default=1, help="Only include archetypes seen at least N times (default=1)")
     args = ap.parse_args()
 
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
 
     idx_path = assets_dir / "entities_index.json"
     chunks_dir = assets_dir / "entities_chunks"
@@ -102,7 +50,7 @@ def main():
         mm = json.loads(models_manifest_path.read_text(encoding="utf-8"))
         exported = set((mm.get("meshes") or {}).keys())
 
-    idx = json.loads(idx_path.read_text(encoding="utf-8"))
+    idx = load_entities_index(assets_dir)
     chunks = (idx.get("chunks") or {}).keys()
 
     want_roads = bool(args.roads_only)
@@ -112,6 +60,8 @@ def main():
     total_with_arch = 0
     counts = Counter()
     name_samples: dict[str, Counter] = {}
+
+    include_mlo_instances = bool(args.include_mlo_instances)
 
     for key in chunks:
         p = chunks_dir / f"{key}.jsonl"
@@ -126,6 +76,11 @@ def main():
             except Exception:
                 continue
 
+            # MLO "container" instances generally do not have a renderable drawable; their *children* are the meshes.
+            # Excluding them keeps the report actionable for "what geometry is missing?".
+            if (not include_mlo_instances) and bool(obj.get("is_mlo_instance")):
+                continue
+
             nm = str(obj.get("name") or "")
             if want_roads:
                 low = nm.lower()
@@ -133,7 +88,7 @@ def main():
                     continue
 
             arch = obj.get("archetype")
-            h = _normalize_archetype_to_hash_str(obj)
+            h = normalize_archetype_to_hash_str(obj)
             if not h:
                 continue
             total_with_arch += 1

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
 import numpy as np
 
-from .dll_manager import DllManager
+from .dll_manager import DllManager, canonicalize_cw_path
 from .heightmap import HeightmapFile
 
 # Configure logging
@@ -55,15 +55,16 @@ class RpfReader:
         try:
             logger.info(f"Attempting to load heightmap: {path}")
             
-            # Get heightmap data through RPF manager
-            entry = self.rpf_manager.GetEntry(path)
+            # Get heightmap data through RPF manager (try both relative + GTA-root-prefixed forms).
+            entry = self._find_file_entry(path)
             if not entry:
                 logger.warning(f"Could not find heightmap entry: {path}")
                 return None
                 
             logger.info(f"Found heightmap entry: {entry.Name}")
             
-            data = self.rpf_manager.GetFileData(path)
+            # Prefer entry.Path once resolved (some CodeWalker builds store absolute-prefixed keys).
+            data = self.rpf_manager.GetFileData(canonicalize_cw_path(getattr(entry, "Path", ""), keep_forward_slashes=True))
             if not data:
                 logger.warning(f"No data found for heightmap: {path}")
                 return None
@@ -95,13 +96,13 @@ class RpfReader:
             Dict of texture arrays if successful, None otherwise
         """
         try:
-            # Get texture data through RPF manager
-            entry = self.rpf_manager.GetEntry(path)
+            # Get texture data through RPF manager (try both relative + GTA-root-prefixed forms).
+            entry = self._find_file_entry(path)
             if not entry:
                 logger.warning(f"Could not find texture entry: {path}")
                 return None
                 
-            data = self.rpf_manager.GetFileData(path)
+            data = self.rpf_manager.GetFileData(canonicalize_cw_path(getattr(entry, "Path", ""), keep_forward_slashes=True))
             if not data:
                 logger.warning(f"No data found for texture: {path}")
                 return None
@@ -164,12 +165,12 @@ class RpfReader:
         to avoid accidental mutation between calls.
         """
         try:
-            entry = self.rpf_manager.GetEntry(path)
+            entry = self._find_file_entry(path)
             if not entry:
                 logger.warning(f"Could not find YTD entry: {path}")
                 return None
 
-            data = self.rpf_manager.GetFileData(path)
+            data = self.rpf_manager.GetFileData(canonicalize_cw_path(getattr(entry, "Path", ""), keep_forward_slashes=True))
             if not data:
                 logger.warning(f"No data found for YTD: {path}")
                 return None
@@ -394,14 +395,71 @@ class RpfReader:
             RpfFileEntry if found, None otherwise
         """
         try:
-            # Get file entry through RPF manager
-            entry = self.rpf_manager.GetEntry(file_path)
-            if not entry:
-                logger.warning(f"Could not find file entry: {file_path}")
+            s = str(file_path or "").strip()
+            if not s:
                 return None
-                
-            return entry
-            
+
+            # CodeWalker path conventions:
+            # - RPF-internal paths use backslashes: common.rpf\\data\\levels\\...
+            # - On Linux, some CodeWalker builds store entry keys prefixed with the GTA root:
+            #     /data/.../gta5/common.rpf\\data\\levels\\...
+            # - For nested RPFS like update/update.rpf, CodeWalker often uses the *filesystem* path
+            #   to the RPF (with POSIX slashes) followed by backslash-separated inner paths:
+            #     /data/.../gta5/update/update.rpf\\common\\data\\...
+            #
+            # So try both forms.
+            candidates = []
+            candidates.append(s)
+            game_root = str(self.game_path)
+            if game_root:
+                game_root = game_root.rstrip("/")
+
+            def _prefix_game_root(rel: str) -> str:
+                # Do NOT use Path join for rel, because rel contains backslashes that are meaningful
+                # to CodeWalker (RPF internal paths) and should not be treated as OS separators.
+                return f"{game_root}/{rel}" if game_root else rel
+
+            # Prefix with the physical game dir (raw form).
+            if game_root:
+                candidates.append(_prefix_game_root(s))
+
+            # Also try normalizing any forward slashes to backslashes for the RPF portion.
+            # (Do NOT touch the physical prefix.)
+            s2 = s.replace("/", "\\")
+            if s2 != s:
+                candidates.append(s2)
+                if game_root:
+                    candidates.append(_prefix_game_root(s2))
+
+            # For paths that include an .rpf segment, also try a filesystem-normalized prefix up to the .rpf.
+            # Example:
+            #   "update\\update.rpf\\common\\data\\levels\\gta5\\heightmap.dat"
+            # becomes:
+            #   "<gta_root>/update/update.rpf\\common\\data\\levels\\gta5\\heightmap.dat"
+            s_low = s.lower()
+            marker = ".rpf\\"
+            mi = s_low.find(marker)
+            if mi >= 0 and game_root:
+                prefix = s[: mi + 4]  # includes ".rpf"
+                rest = s[mi + 4 :]    # begins with "\\..."
+                fs_prefix = prefix.replace("\\", "/")
+                candidates.append(f"{game_root}/{fs_prefix}{rest}")
+
+            seen = set()
+            for cand in candidates:
+                if not cand or cand in seen:
+                    continue
+                seen.add(cand)
+                try:
+                    entry = self.rpf_manager.GetEntry(canonicalize_cw_path(cand, keep_forward_slashes=True))
+                except Exception:
+                    entry = None
+                if entry:
+                    return entry
+
+            logger.warning(f"Could not find file entry: {file_path}")
+            return None
+
         except Exception as e:
             logger.error(f"Error finding file entry: {e}")
             return None
@@ -418,7 +476,7 @@ class RpfReader:
         """
         try:
             # Get file data through RPF manager
-            data = self.rpf_manager.GetFileData(entry.Path)
+            data = self.rpf_manager.GetFileData(canonicalize_cw_path(getattr(entry, "Path", ""), keep_forward_slashes=True))
             if not data:
                 logger.warning(f"No data found for file: {entry.Path}")
                 return None

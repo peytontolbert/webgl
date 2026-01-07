@@ -31,7 +31,18 @@ import numpy as np
 from PIL import Image
 
 from gta5_modules.dll_manager import DllManager
+from gta5_modules.hash_utils import joaat as _joaat
+from gta5_modules.script_paths import auto_assets_dir
 from gta5_modules.rpf_reader import RpfReader
+from gta5_modules.codewalker_archetypes import get_archetype_best_effort
+from gta5_modules.cw_loaders import try_get_drawable as _try_get_drawable
+from gta5_modules.cw_loaders import try_get_ytd as _try_get_ytd
+from gta5_modules.dlc_paths import infer_dlc_pack_from_entry_path as _infer_dlc_pack_from_entry_path
+
+
+def _infer_dlc_name_from_entry_path(p: str) -> str:
+    # Wrapper kept for backwards-compat within this script.
+    return _infer_dlc_pack_from_entry_path(p)
 
 
 MESH_MAGIC = b"MSH0"
@@ -46,6 +57,9 @@ FLAG_HAS_COLOR1 = 64
 
 # Shader param hashes from CodeWalker.Core (ShaderParamNames enum).
 _SP_G_TEXCOORD_SCALE_OFFSET0 = 3099617970  # gTexCoordScaleOffset0
+_SP_G_TEXCOORD_SCALE_OFFSET1 = 2745647232  # gTexCoordScaleOffset1
+_SP_G_TEXCOORD_SCALE_OFFSET2 = 2499388197  # gTexCoordScaleOffset2
+_SP_G_TEXCOORD_SCALE_OFFSET3 = 2456002041  # gTexCoordScaleOffset3
 _SP_GLOBAL_ANIM_UV0 = 3617324062  # globalAnimUV0 (CodeWalker ShaderParamNames)
 _SP_GLOBAL_ANIM_UV1 = 3126116752  # globalAnimUV1 (CodeWalker ShaderParamNames)
 
@@ -56,6 +70,14 @@ _SP_DIFFUSE_PREFERRED = [
     1399472831,  # baseTextureSampler
     2669264211,  # BaseSampler
     934209648,   # ColorTexture
+    3004704155,  # DiffuseTexSampler
+    255045494,   # DiffuseTexSampler01
+    2707084226,  # DiffuseTexSampler02
+    2981196911,  # DiffuseTexSampler03
+    3291650421,  # DiffuseTexSampler04
+    1429813046,  # DiffuseSampler3
+    756347250,   # diffusetexture (gen9 naming)
+    3370697346,  # diffusetex (gen9 naming)
 ]
 
 # Preferred normal-map-ish shader texture parameters (hashes from CodeWalker.Core ShaderParamNames enum).
@@ -63,12 +85,25 @@ _SP_NORMAL_PREFERRED = [
     1186448975,  # BumpSampler
     2327911600,  # normalSampler
     2903840997,  # DetailNormalSampler (fallback)
+    860923645,   # NormalMapSampler (some shaders)
+    2007347265,  # NormalMapTexSampler (some shaders)
+    2275171214,  # NormalSpecMapTexSampler (some shaders pack normal+spec)
+    225912280,   # NormalMapSampler1
+    4224746123,  # NormalMapSampler2
+    3619914305,  # bumptexture (gen9 naming)
+    511164236,   # bumptex (gen9 naming)
+    3453458978,  # normaltexture (gen9 naming)
+    1679176151,  # normaltex (gen9 naming)
 ]
 
 # Preferred spec-map-ish shader texture parameters (hashes from CodeWalker.Core ShaderParamNames enum).
 _SP_SPEC_PREFERRED = [
     1619499462,  # SpecSampler
     2134197289,  # AnisoNoiseSpecSampler (fallback)
+    3250592964,  # spectexture (gen9 naming)
+    559058186,   # spectex (gen9 naming)
+    2654413540,  # speculartexture (gen9 naming)
+    3337907833,  # speculartex (gen9 naming)
 ]
 
 # Scalar-ish shader params (vec4.x) we can use for rough GTA-like shading (hashes from ShaderParamNames).
@@ -77,21 +112,103 @@ _SP_SPEC_INTENSITY_PREFERRED = [
     247886295,   # gSpecularIntensity
     4095226703,  # specularIntensityMult
     2841625909,  # SpecularIntensity
+    3710484485,  # SpecIntensity (alt naming)
 ]
 _SP_SPEC_POWER_PREFERRED = [
     3204977572,  # gSpecularExponent
-    2272544384,  # specularFalloffMult
+    191070201,   # SpecExp (alt naming)
     2313518026,  # SpecularPower
 ]
+_SP_SPEC_FALLOFF_MULT = 2272544384  # specularFalloffMult (separate from exponent/power)
+_SP_SPEC_FRESNEL = 666481402        # specularFresnel (BasicPS)
+_SP_SPECULAR_FALLOFF = 3957040118   # SpecularFalloff (alt naming; sometimes used like a gloss/falloff control)
 _SP_SPEC_MAP_INT_MASK = 4279333149  # specMapIntMask (float3 in CodeWalker BasicPS)
 _SP_ALPHA_SCALE = 931055822         # AlphaScale
 _SP_HARD_ALPHA_BLEND = 3913511942   # HardAlphaBlend
 _SP_ALPHA_TEST_VALUE = 3310830370   # alphaTestValue
+_SP_ALPHA_TEST = 950204405          # AlphaTest (alt naming)
+_SP_G_ALPHA_CUTOFF_MIN_MAX = 3012586280  # gAlphaCutoffMinMax (global-ish; sometimes authored per-shader)
+_SP_ALPHA_MASK_MAP_SAMPLER = 1705051233  # AlphaMaskMapSampler
+_SP_MASK_TEXTURE_SAMPLER = 2110569141    # maskTextureSampler
+_SP_DIFFUSE_MASK_TEX = 4074157542        # diffusemasktex (gen9 naming)
+_SP_DIFFUSE_MASK_TEXTURE = 951789272     # diffusemasktexture (gen9 naming)
 _SP_DIFFUSE2 = 181641832            # DiffuseSampler2
 _SP_DETAIL_MAP_SAMPLER = 1041827691 # DetailMapSampler
 _SP_DETAIL_SAMPLER = 3393362404     # DetailSampler
 _SP_DETAIL_SETTINGS = 3038654095    # detailSettings
 _SP_OCCLUSION_SAMPLER = 50748941    # occlusionSampler
+_SP_OCCLUSION_TEXTURE = 2967810622  # occlusionTexture (alt naming)
+_SP_AMBIENT_OCC_SAMPLER = 1212577329  # AmbientOccSampler (alt naming)
+_SP_LIGHT_OCCLUSION_SAMPLER = 3039301469  # LightOcclusionSampler (alt naming)
+_SP_EMISSIVE_MULTIPLIER = 1592520008       # emissiveMultiplier
+_SP_EMISSIVE_REFLECT_MULT = 1347035993     # emissiveReflectMultiplier
+
+# Distance map (special-case: used by CodeWalker BasicPS IsDistMap path)
+_SP_DISTANCE_MAP_SAMPLER = 1616890976      # distanceMapSampler
+
+# Tint / palettes (common on vehicles/weapons/peds)
+_SP_TINT_PALETTE_SAMPLER = 4131954791  # TintPaletteSampler
+_SP_TINT_SAMPLER = 1530343050          # tintSampler
+_SP_TINT_PALETTE_SELECTOR = 4258764495 # tintPaletteSelector (usually vec2)
+
+# Env / reflection maps
+_SP_ENVIRONMENT_SAMPLER = 3317411368  # EnvironmentSampler
+_SP_ENV_TEXTURE = 2951443911          # envtexture (gen9 naming)
+_SP_ENV_TEX = 3837901164              # envtex (gen9 naming)
+
+# Dirt / damage overlays
+_SP_DIRT_SAMPLER = 2124031998             # DirtSampler
+_SP_DIRT_LEVEL = 47191856                 # dirtLevel (scalar)
+_SP_DIRT_LEVEL_MOD = 3961814809           # dirtLevelMod (scalar)
+_SP_DIRT_COLOR = 1146381126               # dirtColor (vec4)
+_SP_DAMAGE_SAMPLER = 3579349756           # DamageSampler
+_SP_DAMAGE_TEXTURE_SAMPLER = 4132715990   # damageTextureSampler
+_SP_DAMAGE_SPEC_TEXTURE_SAMPLER = 3820652825  # damageSpecTextureSampler
+_SP_APPLY_DAMAGE_SAMPLER = 1117905904     # ApplyDamageSampler
+
+# Puddles
+_SP_PUDDLE_MASK_SAMPLER = 1899494261      # PuddleMaskSampler
+_SP_PUDDLE_BUMP_SAMPLER = 644999851       # PuddleBumpSampler
+_SP_PUDDLE_PLAYER_BUMP_SAMPLER = 375060758 # PuddlePlayerBumpSampler
+_SP_G_PUDDLE_PARAMS = 3536830402          # g_PuddleParams (vec4)
+_SP_G_PUDDLE_SCALE_XY_RANGE = 529156535   # g_Puddle_ScaleXY_Range (vec4)
+
+# Decal tint (common for decal shaders)
+_SP_DECAL_TINT = 3092072610               # DecalTint (vec4)
+# Decal masks (Gen9 conversion + shader params)
+_SP_AMBIENT_DECAL_MASK = 3686186843       # AmbientDecalMask (usually float3/float4)
+_SP_DIRT_DECAL_MASK = 1050016400          # DirtDecalMask (usually float3/float4)
+
+# Parallax / height mapping (best-effort)
+_SP_PARALLAX_SCALE_BIAS = 2178632789  # parallaxScaleBias
+_SP_PARALLAX_SELF_SHADOW = 242286661  # parallaxSelfShadowAmount
+_SP_HEIGHT_SCALE = 947222050          # heightScale
+_SP_HEIGHT_BIAS = 330974467           # heightBias
+_SP_HEIGHTMAP_PREFERRED = [
+    1008099585,  # HeightMapSampler
+    4049987115,  # heightSampler
+    4152773162,  # heighttexture (gen9 naming)
+    120550549,   # heighttex (gen9 naming)
+]
+
+# Wetness (best-effort)
+_SP_WETNESS_PREFERRED = [
+    3170143313,  # materialWetnessMultiplier
+    853385205,   # wetnessMultiplier
+]
+_SP_WET_DARKEN = 3170546064  # WetDarken
+
+# Terrain / water (CodeWalker ShaderParamNames)
+_SP_FLOW_SAMPLER = 1214194352  # FlowSampler (water flow map)
+_SP_FOAM_SAMPLER = 3266349336  # FoamSampler (water foam)
+_SP_RIPPLE_SPEED = 1172914979  # RippleSpeed
+_SP_RIPPLE_SCALE = 3553443429  # RippleScale
+_SP_RIPPLE_BUMPINESS = 3108440880  # RippleBumpiness
+_SP_BUMP_SAMPLER_LAYER0 = 1073714531  # BumpSampler_layer0
+_SP_BUMP_SAMPLER_LAYER1 = 1422769919  # BumpSampler_layer1
+_SP_BUMP_SAMPLER_LAYER2 = 2745359528  # BumpSampler_layer2
+_SP_BUMP_SAMPLER_LAYER3 = 2975430677  # BumpSampler_layer3
+_SP_BUMP_SAMPLER_LAYER4 = 2417505683  # BumpSampler_layer4
 
 
 def _shader_family_from_shader(shader) -> str:
@@ -102,6 +219,13 @@ def _shader_family_from_shader(shader) -> str:
     Families are used by the viewer to pick a render pipeline/shader program.
     """
     name = _shader_name_str(shader).lower()
+    # Terrain shaders (multi-layer blend)
+    if "terrain" in name:
+        return "terrain"
+    # Water shaders (river/ocean/foam)
+    # Avoid misclassifying unrelated strings like "watermark".
+    if ("water" in name or "river" in name or "ocean" in name) and ("watermark" not in name):
+        return "water"
     # Decals / projected decals / alpha-mask decals
     if any(k in name for k in ("decal", "texturealphamask", "alphamaskdecal", "decalmask")):
         return "decal"
@@ -115,9 +239,52 @@ def _shader_family_from_shader(shader) -> str:
     if any(k in name for k in ("parallax", "heightmap", "pom")):
         return "parallax"
     # Wetness / puddles / damage style (generic bucket)
-    if any(k in name for k in ("wet", "puddle", "water", "rain", "damage", "mud")):
+    if any(k in name for k in ("wet", "puddle", "rain", "damage", "mud")):
         return "wetness"
     return "basic"
+
+
+_SP_OCCLUSION_PREFERRED = [
+    _SP_OCCLUSION_SAMPLER,
+    _SP_OCCLUSION_TEXTURE,
+    _SP_AMBIENT_OCC_SAMPLER,
+    _SP_LIGHT_OCCLUSION_SAMPLER,
+]
+
+_SP_ALPHA_MASK_PREFERRED = [
+    _SP_ALPHA_MASK_MAP_SAMPLER,
+    _SP_MASK_TEXTURE_SAMPLER,
+    _SP_DIFFUSE_MASK_TEX,
+    _SP_DIFFUSE_MASK_TEXTURE,
+]
+
+_SP_TINT_PREFERRED = [
+    _SP_TINT_PALETTE_SAMPLER,
+    _SP_TINT_SAMPLER,
+]
+
+_SP_ENV_PREFERRED = [
+    _SP_ENVIRONMENT_SAMPLER,
+    _SP_ENV_TEXTURE,
+    _SP_ENV_TEX,
+]
+
+_SP_DIRT_PREFERRED = [
+    _SP_DIRT_SAMPLER,
+]
+
+_SP_DAMAGE_PREFERRED = [
+    _SP_DAMAGE_SAMPLER,
+    _SP_DAMAGE_TEXTURE_SAMPLER,
+]
+
+_SP_DAMAGE_MASK_PREFERRED = [
+    _SP_APPLY_DAMAGE_SAMPLER,
+]
+
+_SP_PUDDLE_MASK_PREFERRED = [
+    _SP_PUDDLE_MASK_SAMPLER,
+]
 
 
 def _read_chunk_entities(chunk_path: Path):
@@ -153,16 +320,47 @@ def joaat(input_str: str) -> int:
     GTA "joaat" (Jenkins one-at-a-time) hash.
     Must match the viewer's implementation (see webgl_viewer/js/joaat.js).
     """
-    s = str(input_str or "").lower()
-    h = 0
-    for ch in s:
-        h = (h + ord(ch)) & 0xFFFFFFFF
-        h = (h + ((h << 10) & 0xFFFFFFFF)) & 0xFFFFFFFF
-        h ^= (h >> 6)
-    h = (h + ((h << 3) & 0xFFFFFFFF)) & 0xFFFFFFFF
-    h ^= (h >> 11)
-    h = (h + ((h << 15) & 0xFFFFFFFF)) & 0xFFFFFFFF
-    return h & 0xFFFFFFFF
+    # Wrapper to keep legacy local API, but share implementation.
+    return int(_joaat(input_str, lower=True)) & 0xFFFFFFFF
+
+
+def _normalize_archetype_to_u32(obj: dict) -> int | None:
+    """
+    Best-effort normalization of an entity object's archetype identifier.
+
+    Accepts:
+    - numeric hashes (int or decimal-string)
+    - explicit fields like archetype_hash
+    - string names (hashed with joaat)
+    """
+    try:
+        # Prefer explicit archetype_hash if present.
+        if isinstance(obj, dict):
+            if obj.get("archetype_hash") is not None:
+                try:
+                    return _as_uint32(obj.get("archetype_hash"))
+                except Exception:
+                    pass
+            if obj.get("archetypeHash") is not None:
+                try:
+                    return _as_uint32(obj.get("archetypeHash"))
+                except Exception:
+                    pass
+        arch = obj.get("archetype") if isinstance(obj, dict) else None
+        if arch is None:
+            return None
+        # Numeric (int or numeric string)
+        try:
+            return _as_uint32(arch)
+        except Exception:
+            pass
+        # Name string -> joaat
+        s = str(arch or "").strip()
+        if (not s) or (s.upper() == "UNKNOWN"):
+            return None
+        return int(joaat(s)) & 0xFFFFFFFF
+    except Exception:
+        return None
 
 
 def _slugify_texture_name(name: str) -> str:
@@ -280,15 +478,28 @@ def _compute_vertex_tangents(positions: np.ndarray, uvs: np.ndarray, indices: np
     t1 = w1[:, 1] - w0[:, 1]
     t2 = w2[:, 1] - w0[:, 1]
 
-    r = (s1 * t2 - s2 * t1)
-    eps = 1e-20
+    # Tangent basis per triangle (MikkTSpace-style).
+    #
+    # When UVs are degenerate (r ~= 0), the tangent basis is undefined and naive math will
+    # generate NaNs/Infs. We handle that by computing rInv only where safe, and treating
+    # invalid triangles as contributing zero to tan1/tan2 (later we fall back to a stable
+    # perpendicular tangent for degenerate vertices).
+    r = (s1 * t2 - s2 * t1).astype(np.float32)
+    eps = np.float32(1e-20)
     valid = np.abs(r) > eps
     if np.any(valid):
+        # Use divide-with-where to avoid warnings and ensure invalid entries become 0.
         rv = np.zeros_like(r, dtype=np.float32)
-        rv[valid] = (1.0 / r[valid]).astype(np.float32)
+        np.divide(np.float32(1.0), r, out=rv, where=valid)
 
-        sdir = (x1 * t2[:, None] - x2 * t1[:, None]) * rv[:, None]
-        tdir = (x2 * s1[:, None] - x1 * s2[:, None]) * rv[:, None]
+        # Compute sdir/tdir without emitting RuntimeWarnings on invalid rows.
+        # (rv is 0 for invalid rows, so sdir/tdir become 0 there.)
+        sdir = (x1 * t2[:, None] - x2 * t1[:, None]).astype(np.float32) * rv[:, None]
+        tdir = (x2 * s1[:, None] - x1 * s2[:, None]).astype(np.float32) * rv[:, None]
+
+        # Just in case upstream data already has NaNs, scrub them so they don't poison accumulators.
+        sdir = np.nan_to_num(sdir, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        tdir = np.nan_to_num(tdir, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
         np.add.at(tan1, tris[:, 0], sdir)
         np.add.at(tan1, tris[:, 1], sdir)
@@ -367,7 +578,7 @@ def _component_offset(vdecl, idx: int) -> int:
 
 def _extract_geometry_positions_indices_uv0_uv1_color0(
     geom,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None] | None:
     """
     Extract positions + indices + UV0 (+ Color0 when present) from a CodeWalker drawable geometry.
 
@@ -430,6 +641,20 @@ def _extract_geometry_positions_indices_uv0_uv1_color0(
         except Exception:
             uv1 = None
 
+    # Tangent is semantic index 14 (Tangent) in CodeWalker legacy declarations.
+    # GTA drawables commonly store Float4 or Half4 with w=handedness.
+    tan = None
+    if vdecl and _has_component(vdecl, 14):
+        tan_off = _component_offset(vdecl, 14)
+        tname_t = _component_type_name(vdecl, 14)
+        try:
+            if "Float4" in tname_t:
+                tan = np.ndarray((vcount, 4), dtype=np.float32, buffer=vb, offset=tan_off, strides=(stride, 4)).copy()
+            elif "Half4" in tname_t:
+                tan = np.ndarray((vcount, 4), dtype=np.float16, buffer=vb, offset=tan_off, strides=(stride, 2)).astype(np.float32).copy()
+        except Exception:
+            tan = None
+
     # Color0 is semantic index 4; Color1 is semantic index 5.
     col0 = None
     col1 = None
@@ -477,6 +702,7 @@ def _extract_geometry_positions_indices_uv0_uv1_color0(
         (uv2.astype(np.float32) if uv2 is not None else None),
         (col0.astype(np.uint8) if col0 is not None else None),
         (col1.astype(np.uint8) if col1 is not None else None),
+        (tan.astype(np.float32) if tan is not None else None),
     )
 
 
@@ -496,7 +722,7 @@ def _compute_planar_uvs_xy01(positions: np.ndarray) -> np.ndarray:
 
 def _merge_geometries(
     geoms,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None] | None:
     all_pos = []
     all_idx = []
     all_uv0 = []
@@ -504,17 +730,19 @@ def _merge_geometries(
     all_uv2 = []
     all_col0 = []
     all_col1 = []
+    all_tan = []
     vbase = 0
     any_uv_missing = False
     any_uv1_missing = False
     any_uv2_missing = False
     any_col_missing = False
     any_col1_missing = False
+    any_tan_missing = False
     for geom in geoms:
         res = _extract_geometry_positions_indices_uv0_uv1_color0(geom)
         if res is None:
             continue
-        pos, idx, uv0, uv1, uv2, col0, col1 = res
+        pos, idx, uv0, uv1, uv2, col0, col1, tan = res
         if pos.size == 0 or idx.size == 0:
             continue
         all_pos.append(pos)
@@ -539,6 +767,10 @@ def _merge_geometries(
             any_col1_missing = True
         else:
             all_col1.append(col1)
+        if tan is None:
+            any_tan_missing = True
+        else:
+            all_tan.append(tan)
         vbase += pos.shape[0]
     if not all_pos or not all_idx:
         return None
@@ -549,6 +781,7 @@ def _merge_geometries(
     uv2 = None
     col0 = None
     col1 = None
+    tan = None
     if (not any_uv_missing) and all_uv0 and len(all_uv0) == len(all_pos):
         uv0 = np.vstack(all_uv0).astype(np.float32)
     if (not any_uv1_missing) and all_uv1 and len(all_uv1) == len(all_pos):
@@ -559,7 +792,9 @@ def _merge_geometries(
         col0 = np.vstack(all_col0).astype(np.uint8)
     if (not any_col1_missing) and all_col1 and len(all_col1) == len(all_pos):
         col1 = np.vstack(all_col1).astype(np.uint8)
-    return positions, indices, uv0, uv1, uv2, col0, col1
+    if (not any_tan_missing) and all_tan and len(all_tan) == len(all_pos):
+        tan = np.vstack(all_tan).astype(np.float32)
+    return positions, indices, uv0, uv1, uv2, col0, col1, tan
 
 
 def _extract_drawable_lods(drawable) -> dict:
@@ -690,7 +925,8 @@ def _pick_diffuse_texture_name(textures: dict) -> str | None:
     candidates = []
     for name, (img, _fmt) in textures.items():
         n = (name or "").lower()
-        if any(k in n for k in ("_n", "normal", "nrm", "nm_", "spec", "srm", "mask", "lookup")):
+        # Avoid common non-diffuse maps. IMPORTANT: many GTA assets use "bump" for normal maps.
+        if any(k in n for k in ("_n", "normal", "nrm", "nm_", "bump", "spec", "srm", "mask", "lookup")):
             continue
         if img is None:
             continue
@@ -825,19 +1061,28 @@ def _shader_param_iter(shader):
 
 
 def _extract_uv0_scale_offset_from_shader(shader) -> list[float] | None:
-    for hv, p in _shader_param_iter(shader) or []:
-        if hv != _SP_G_TEXCOORD_SCALE_OFFSET0:
-            continue
-        try:
-            if int(getattr(p, "DataType", 255)) != 1:
-                continue
-            v = getattr(p, "Data", None)
-            out = _vec4_to_list(v)
-            if out:
-                return out
-        except Exception:
-            continue
-    return None
+    return _extract_vec4_from_shader(shader, _SP_G_TEXCOORD_SCALE_OFFSET0)
+
+
+def _extract_uv_scale_offset_from_shader(shader, uv_index: int) -> list[float] | None:
+    """
+    Read CodeWalker ShaderParamNames.gTexCoordScaleOffsetN vec4 for N in [0..3].
+
+    GTA uses these to tile/offset UV sets; without them many materials look "wrong scale"
+    even when the base UVs are correct.
+    """
+    try:
+        i = int(uv_index)
+    except Exception:
+        i = 0
+    hv = _SP_G_TEXCOORD_SCALE_OFFSET0
+    if i == 1:
+        hv = _SP_G_TEXCOORD_SCALE_OFFSET1
+    elif i == 2:
+        hv = _SP_G_TEXCOORD_SCALE_OFFSET2
+    elif i == 3:
+        hv = _SP_G_TEXCOORD_SCALE_OFFSET3
+    return _extract_vec4_from_shader(shader, hv)
 
 
 def _pick_diffuse_texture_name_from_shader(textures: dict, shader) -> str | None:
@@ -860,7 +1105,8 @@ def _pick_diffuse_texture_name_from_shader(textures: dict, shader) -> str | None
             if not nm:
                 continue
             low = nm.lower()
-            if any(k in low for k in ("_n", "normal", "nrm", "nm_", "spec", "srm", "mask", "lookup")):
+            # Avoid common non-diffuse maps. IMPORTANT: many GTA assets use "bump" for normal maps.
+            if any(k in low for k in ("_n", "normal", "nrm", "nm_", "bump", "spec", "srm", "mask", "lookup")):
                 continue
             key = tex_by_lower.get(low)
             if not key:
@@ -882,10 +1128,12 @@ def _pick_diffuse_texture_name_from_shader_with_hash(textures: dict, shader) -> 
     Like _pick_diffuse_texture_name_from_shader, but also returns the shader param hash (u32) that selected it.
     Returns (name, hash_u32) where hash_u32 can be None when we fell back to heuristic selection.
     """
-    if not isinstance(textures, dict) or not textures:
-        return None, None
+    if not isinstance(textures, dict):
+        textures = {}
 
-    tex_by_lower = {str(k).lower(): str(k) for k in textures.keys()}
+    # If textures dict is empty (missing YTD / TextureDict), still try to select a plausible
+    # diffuse name from shader params. We'll rely on shader texture objects for actual decode.
+    tex_by_lower = {str(k).lower(): str(k) for k in (textures.keys() if textures else [])}
     pref_rank = {h: i for i, h in enumerate(_SP_DIFFUSE_PREFERRED)}
     candidates = []
     for hv, p in _shader_param_iter(shader) or []:
@@ -897,11 +1145,10 @@ def _pick_diffuse_texture_name_from_shader_with_hash(textures: dict, shader) -> 
             if not nm:
                 continue
             low = nm.lower()
-            if any(k in low for k in ("_n", "normal", "nrm", "nm_", "spec", "srm", "mask", "lookup")):
+            # Avoid common non-diffuse maps. IMPORTANT: many GTA assets use "bump" for normal maps.
+            if any(k in low for k in ("_n", "normal", "nrm", "nm_", "bump", "spec", "srm", "mask", "lookup")):
                 continue
-            key = tex_by_lower.get(low)
-            if not key:
-                continue
+            key = tex_by_lower.get(low) or nm
             hv_u32 = int(hv) & 0xFFFFFFFF
             rank = pref_rank.get(hv_u32, 999)
             candidates.append((rank, hv_u32, key))
@@ -959,8 +1206,8 @@ def _pick_texture_name_from_shader_with_hash(
     Like _pick_texture_name_from_shader, but also returns the shader param hash (u32) that selected it.
     Returns (name, hash_u32) where hash_u32 can be None if no selection was possible.
     """
-    if not isinstance(textures, dict) or not textures:
-        return None, None
+    if not isinstance(textures, dict):
+        textures = {}
 
     pref_rank = {int(h) & 0xFFFFFFFF: i for i, h in enumerate(preferred_hashes or [])}
 
@@ -1099,7 +1346,13 @@ def _extract_shader_params(shader, max_textures: int = 32, max_vectors: int = 64
                 continue
             try:
                 tex = getattr(p, "Data", None)
-                nm = str(getattr(tex, "Name", "")).strip()
+                # Prefer NameHash (authoritative, avoids string encoding quirks / embedded nulls).
+                nh = getattr(tex, "NameHash", None)
+                if nh is not None:
+                    h = int(nh) & 0xFFFFFFFF
+                    nm = f"models_textures/{h}.png"
+                else:
+                    nm = str(getattr(tex, "Name", "")).strip()
             except Exception:
                 nm = ""
             if nm:
@@ -1237,6 +1490,45 @@ def _export_texture_png(
             fmt = fmt2
             textures[tex_name] = (img, fmt)  # cache for later format queries
 
+    # Gen9 fast-path fallback: if pixels can't be decoded (eg BC7 TODO in CodeWalker.Core DDSIO.GetPixels),
+    # attempt to export the texture as a DDS container instead. The WebGL viewer can upload DDS-compressed
+    # formats directly via extensions (BPTC/RGTC/S3TC) when available.
+    if img is None and shader_tex_obj is not None and dll_manager is not None:
+        try:
+            ddsio = getattr(dll_manager, "DDSIO", None)
+            if ddsio is not None and hasattr(ddsio, "GetDDSFile"):
+                dds = ddsio.GetDDSFile(shader_tex_obj)
+                dds_bytes = bytes(dds) if dds else b""
+                if dds_bytes:
+                    tex_dir.mkdir(parents=True, exist_ok=True)
+                    h = joaat(tex_name)
+                    slug = _slugify_texture_name(tex_name)
+                    if not slug:
+                        slug = _safe_tex_name(tex_name).lower()
+                    h_u32 = int(h) & 0xFFFFFFFF
+                    out_slug = tex_dir / f"{h_u32}_{slug}.dds"
+                    out_hash = tex_dir / f"{h_u32}.dds"
+
+                    wrote = False
+                    if not out_slug.exists():
+                        out_slug.write_bytes(dds_bytes)
+                        wrote = True
+
+                    if not out_hash.exists():
+                        try:
+                            import os
+                            os.link(out_slug, out_hash)
+                        except Exception:
+                            try:
+                                shutil.copy2(out_slug, out_hash)
+                            except Exception:
+                                return f"models_textures/{h_u32}_{slug}.dds", wrote
+
+                    return f"models_textures/{h_u32}.dds", wrote
+        except Exception:
+            # Fall through to "not exported".
+            pass
+
     if img is None:
         return None, False
     try:
@@ -1275,6 +1567,201 @@ def _export_texture_png(
         return f"models_textures/{h_u32}.png", wrote
     except Exception:
         return None, False
+
+
+def _has_texture_full_data(tex_obj) -> bool:
+    """
+    Best-effort check for whether a CodeWalker texture-like object actually has pixel data.
+
+    Many shader params reference TextureBase-like objects that only carry name/hash/format,
+    but have no backing Data.FullData bytes. Those require resolution via YTD lookup.
+    """
+    if tex_obj is None:
+        return False
+    try:
+        data = getattr(tex_obj, "Data", None)
+        if data is None:
+            return False
+        fd = getattr(data, "FullData", None)
+        if fd is None:
+            return False
+        try:
+            return len(fd) > 0
+        except Exception:
+            # Some pythonnet projections don't support len(); treat presence as best-effort.
+            return True
+    except Exception:
+        return False
+
+
+def _get_loaded_ytd(gfc, ytd_hash_u32: int, *, spins: int = 600):
+    """
+    Best-effort: request a YTD by hash and pump ContentThreadProc until loaded (or spins exhausted).
+    """
+    if gfc is None:
+        return None
+    try:
+        ytd = gfc.GetYtd(int(ytd_hash_u32) & 0xFFFFFFFF)
+    except Exception:
+        return None
+    s = 0
+    while (ytd is not None) and (not getattr(ytd, "Loaded", True)) and (s < int(spins)):
+        try:
+            gfc.ContentThreadProc()
+        except Exception:
+            break
+        s += 1
+    return ytd
+
+
+def _lookup_texture_via_codewalker(
+    *,
+    dll_manager: DllManager | None,
+    drawable,
+    txd_hash_u32: int | None,
+    tex_name: str,
+    shader_tex_obj=None,
+    spins: int = 600,
+):
+    """
+    Resolve a shader-referenced texture name to an actual CodeWalker Texture object with Data.FullData.
+
+    This mirrors CodeWalker’s runtime lookup order more closely than our previous approach:
+    - embedded TextureDictionary on the drawable (rare but real)
+    - current archetype texture dict (txd_hash_u32)
+    - parent txd chain
+    - global lookup (TryGetTextureDictForTexture) for resident/shared dicts
+
+    Returns:
+      - a texture-like object (ideally CodeWalker.GameFiles.Texture) with Data.FullData
+      - or None if not resolvable
+    """
+    if not tex_name:
+        return None
+
+    # If the shader object already has data, use it.
+    if _has_texture_full_data(shader_tex_obj):
+        return shader_tex_obj
+
+    texhash = joaat(tex_name) & 0xFFFFFFFF
+
+    # 1) Embedded TextureDictionary in the drawable's ShaderGroup (if any).
+    try:
+        sg = getattr(drawable, "ShaderGroup", None)
+        td = getattr(sg, "TextureDictionary", None) if sg is not None else None
+        if td is not None:
+            t = td.Lookup(int(texhash) & 0xFFFFFFFF)
+            if _has_texture_full_data(t):
+                return t
+    except Exception:
+        pass
+
+    if dll_manager is None:
+        return None
+    try:
+        gfc = dll_manager.get_game_file_cache()
+    except Exception:
+        gfc = None
+    if gfc is None:
+        return None
+
+    # 2) Current TXD hash (archetype.TextureDict), with CodeWalker HD remap first.
+    # CodeWalker can map a TXD to an HD variant via `_manifest.ymf` bindings (TryGetHDTextureHash).
+    # We try both (hd-first, then original) and then walk parents from each start point.
+    start_txds: list[int] = []
+    if txd_hash_u32:
+        base = int(txd_hash_u32) & 0xFFFFFFFF
+        hd = base
+        try:
+            hd = int(gfc.TryGetHDTextureHash(base)) & 0xFFFFFFFF
+        except Exception:
+            hd = base
+        if hd and hd != base:
+            start_txds.append(hd)
+        if base:
+            start_txds.append(base)
+
+    def _try_ytd_and_parents(start_txd_u32: int) -> object | None:
+        # Try the start ytd, then parent chain.
+        try:
+            ytd0 = _get_loaded_ytd(gfc, int(start_txd_u32) & 0xFFFFFFFF, spins=spins)
+            if ytd0 is not None and getattr(ytd0, "Loaded", True):
+                td0 = getattr(ytd0, "TextureDict", None)
+                if td0 is not None:
+                    t0 = td0.Lookup(int(texhash) & 0xFFFFFFFF)
+                    if _has_texture_full_data(t0):
+                        return t0
+        except Exception:
+            pass
+        # Walk parents
+        try:
+            seen = set()
+            cur = int(start_txd_u32) & 0xFFFFFFFF
+            steps = 0
+            while cur and (cur not in seen) and steps < 32:
+                seen.add(cur)
+                try:
+                    parent = int(gfc.TryGetParentYtdHash(int(cur) & 0xFFFFFFFF)) & 0xFFFFFFFF
+                except Exception:
+                    parent = 0
+                if not parent:
+                    break
+                ytdp = _get_loaded_ytd(gfc, parent, spins=spins)
+                if ytdp is not None and getattr(ytdp, "Loaded", True):
+                    tdp = getattr(ytdp, "TextureDict", None)
+                    if tdp is not None:
+                        t = tdp.Lookup(int(texhash) & 0xFFFFFFFF)
+                        if _has_texture_full_data(t):
+                            return t
+                cur = parent
+                steps += 1
+        except Exception:
+            pass
+        return None
+
+    for st in start_txds:
+        got = _try_ytd_and_parents(st)
+        if got is not None:
+            return got
+
+    # 3) Parent TXD chain is handled above (as part of hd/original start txds).
+    try:
+        pass
+    except Exception:
+        pass
+
+    # 4) Global lookup: resident/shared texture dicts (e.g. vehshare/mapdetail), if CW has it indexed.
+    try:
+        ytdg = gfc.TryGetTextureDictForTexture(int(texhash) & 0xFFFFFFFF)
+        if ytdg is not None:
+            if not getattr(ytdg, "Loaded", True):
+                # Ensure loaded: if we can get a ytd hash, enqueue via GetYtd, else just pump loader.
+                try:
+                    key_obj = getattr(ytdg, "Key", None)
+                    ytd_hash = int(getattr(key_obj, "Hash", 0) or 0) & 0xFFFFFFFF
+                except Exception:
+                    ytd_hash = 0
+                if ytd_hash:
+                    ytdg = _get_loaded_ytd(gfc, ytd_hash, spins=spins)
+                else:
+                    # Pump briefly; the object may become loaded in-place.
+                    for _ in range(int(spins)):
+                        try:
+                            if getattr(ytdg, "Loaded", True):
+                                break
+                            gfc.ContentThreadProc()
+                        except Exception:
+                            break
+            if ytdg is not None and getattr(ytdg, "Loaded", True):
+                tdg = getattr(ytdg, "TextureDict", None)
+                if tdg is not None:
+                    t = tdg.Lookup(int(texhash) & 0xFFFFFFFF)
+                    if _has_texture_full_data(t):
+                        return t
+    except Exception:
+        pass
+
+    return None
 
 
 def _which(exe: str) -> str | None:
@@ -1389,8 +1876,13 @@ def _update_existing_manifest_materials_for_drawable(
     """
     if not isinstance(entry, dict) or drawable is None:
         return 0
-    if not textures or not isinstance(textures, dict) or not td_hash:
-        return 0
+    # Even if we can't decode/export textures (missing YTD, unsupported format, etc),
+    # still populate *non-texture* material metadata (shader flags, shaderParams, UV/scalars)
+    # so manifests don't end up with `material: {}`.
+    have_textures = bool(textures and isinstance(textures, dict) and td_hash)
+    if not have_textures:
+        textures = {}
+        td_hash = int(td_hash or 0) & 0xFFFFFFFF
 
     wrote = 0
     for lod in ("High", "Med", "Low", "VLow"):
@@ -1415,6 +1907,8 @@ def _update_existing_manifest_materials_for_drawable(
 
             # Collect shader-referenced texture objects by (lowercased) name.
             # This allows exporting textures that aren't present in the current YTD dict.
+            # IMPORTANT: Many shader params reference "texture-like" objects without Data.FullData.
+            # Resolve them via CodeWalker YTD lookup (txd + parents + resident dicts) so decode/export works.
             shader_tex_objs = {}
             try:
                 for _hv, p in _shader_param_iter(shader) or []:
@@ -1424,7 +1918,14 @@ def _update_existing_manifest_materials_for_drawable(
                         tex_obj = getattr(p, "Data", None)
                         nm = str(getattr(tex_obj, "Name", "")).strip() if tex_obj is not None else ""
                         if nm:
-                            shader_tex_objs[nm.lower()] = tex_obj
+                            resolved = _lookup_texture_via_codewalker(
+                                dll_manager=dll_manager,
+                                drawable=drawable,
+                                txd_hash_u32=int(td_hash or 0) & 0xFFFFFFFF,
+                                tex_name=nm,
+                                shader_tex_obj=tex_obj,
+                            )
+                            shader_tex_objs[nm.lower()] = resolved or tex_obj
                     except Exception:
                         continue
             except Exception:
@@ -1437,18 +1938,39 @@ def _update_existing_manifest_materials_for_drawable(
                 pass
 
             # Export compact raw shader params for future shader-family support.
-            # Keep this small to avoid exploding manifest sizes.
+            # Keep this bounded to avoid exploding manifest sizes, but large enough to not
+            # silently drop texture params on complex shaders.
             try:
-                sp = _extract_shader_params(shader, max_textures=24, max_vectors=48)
+                sp = _extract_shader_params(shader, max_textures=64, max_vectors=96)
                 if sp:
                     mat["shaderParams"] = sp
             except Exception:
                 pass
 
+            # IsDistMap: CodeWalker treats distanceMapSampler as a special diffuse path.
+            try:
+                for hv, p in _shader_param_iter(shader) or []:
+                    if int(getattr(p, "DataType", 255)) != 0:
+                        continue
+                    if (int(hv) & 0xFFFFFFFF) == (_SP_DISTANCE_MAP_SAMPLER & 0xFFFFFFFF):
+                        mat["isDistMap"] = True
+                        break
+            except Exception:
+                pass
+
             # UV scale/offset
-            uvso = _extract_uv0_scale_offset_from_shader(shader)
-            if uvso and len(uvso) >= 4:
-                mat["uv0ScaleOffset"] = [float(uvso[0]), float(uvso[1]), float(uvso[2]), float(uvso[3])]
+            uvso0 = _extract_uv_scale_offset_from_shader(shader, 0)
+            if uvso0 and len(uvso0) >= 4:
+                mat["uv0ScaleOffset"] = [float(uvso0[0]), float(uvso0[1]), float(uvso0[2]), float(uvso0[3])]
+            uvso1 = _extract_uv_scale_offset_from_shader(shader, 1)
+            if uvso1 and len(uvso1) >= 4:
+                mat["uv1ScaleOffset"] = [float(uvso1[0]), float(uvso1[1]), float(uvso1[2]), float(uvso1[3])]
+            uvso2 = _extract_uv_scale_offset_from_shader(shader, 2)
+            if uvso2 and len(uvso2) >= 4:
+                mat["uv2ScaleOffset"] = [float(uvso2[0]), float(uvso2[1]), float(uvso2[2]), float(uvso2[3])]
+            uvso3 = _extract_uv_scale_offset_from_shader(shader, 3)
+            if uvso3 and len(uvso3) >= 4:
+                mat["uv3ScaleOffset"] = [float(uvso3[0]), float(uvso3[1]), float(uvso3[2]), float(uvso3[3])]
 
             # Global UV animation affine transform (CodeWalker BasicVS GlobalUVAnim):
             #   uvw = float3(uv, 1)
@@ -1468,6 +1990,17 @@ def _update_existing_manifest_materials_for_drawable(
             spec_int = _extract_scalar_x_from_shader(shader, _SP_SPEC_INTENSITY_PREFERRED)
             if spec_int is not None:
                 mat["specularIntensity"] = float(spec_int)
+            # Separate falloff and fresnel (BasicPS uses these explicitly).
+            spec_falloff = _extract_scalar_x_from_shader(shader, [_SP_SPEC_FALLOFF_MULT])
+            if spec_falloff is not None:
+                mat["specularFalloffMult"] = float(spec_falloff)
+            spec_fres = _extract_scalar_x_from_shader(shader, [_SP_SPEC_FRESNEL])
+            if spec_fres is not None:
+                mat["specularFresnel"] = float(spec_fres)
+            # Some shaders author a separate "SpecularFalloff" control (alt naming).
+            spec_falloff2 = _extract_scalar_x_from_shader(shader, [_SP_SPECULAR_FALLOFF])
+            if spec_falloff2 is not None:
+                mat["specularFalloff"] = float(spec_falloff2)
             spec_pow = _extract_scalar_x_from_shader(shader, _SP_SPEC_POWER_PREFERRED)
             if spec_pow is not None:
                 mat["specularPower"] = float(spec_pow)
@@ -1481,6 +2014,12 @@ def _update_existing_manifest_materials_for_drawable(
             hab = _extract_scalar_x_from_shader(shader, [_SP_HARD_ALPHA_BLEND])
             if hab is not None:
                 mat["hardAlphaBlend"] = float(hab)
+            at = _extract_scalar_x_from_shader(shader, [_SP_ALPHA_TEST])
+            if at is not None:
+                mat["alphaTest"] = float(at)
+            acmm = _extract_vec4_from_shader(shader, _SP_G_ALPHA_CUTOFF_MIN_MAX)
+            if acmm and len(acmm) >= 2:
+                mat["alphaCutoffMinMax"] = [float(acmm[0]), float(acmm[1])]
 
             # Spec map channel weighting (specMapIntMask)
             v4 = _extract_vec4_from_shader(shader, _SP_SPEC_MAP_INT_MASK)
@@ -1601,10 +2140,84 @@ def _update_existing_manifest_materials_for_drawable(
                     if ds and len(ds) >= 4:
                         mat["detailSettings"] = [float(ds[0]), float(ds[1]), float(ds[2]), float(ds[3])]
 
+            # Parallax scale/bias (vec4; viewer uses x/y)
+            psb = _extract_vec4_from_shader(shader, _SP_PARALLAX_SCALE_BIAS)
+            if psb and len(psb) >= 2:
+                # Keep full vec4 for future expansion.
+                mat["parallaxScaleBias"] = [float(psb[0]), float(psb[1]), float(psb[2] if len(psb) > 2 else 0.0), float(psb[3] if len(psb) > 3 else 0.0)]
+
+            # Wetness (scalar-ish)
+            wet = _extract_scalar_x_from_shader(shader, _SP_WETNESS_PREFERRED)
+            if wet is not None:
+                mat["wetness"] = float(wet)
+            wdark = _extract_scalar_x_from_shader(shader, [_SP_WET_DARKEN])
+            if wdark is not None:
+                mat["wetDarken"] = float(wdark)
+
+            # Decal tint (vec4 -> rgb)
+            dt = _extract_vec4_from_shader(shader, _SP_DECAL_TINT)
+            if dt and len(dt) >= 3:
+                mat["decalTint"] = [float(dt[0]), float(dt[1]), float(dt[2])]
+
+            # Decal masks (best-effort): these are used by CodeWalker BasicPS for decal_dirt style shaders
+            # (TextureAlphaMask * c, then alpha = sum(mask channels)).
+            adm = _extract_vec4_from_shader(shader, _SP_AMBIENT_DECAL_MASK)
+            if adm and len(adm) >= 3:
+                mat["ambientDecalMask"] = [float(adm[0]), float(adm[1]), float(adm[2]), float(adm[3] if len(adm) >= 4 else 0.0)]
+            ddm = _extract_vec4_from_shader(shader, _SP_DIRT_DECAL_MASK)
+            if ddm and len(ddm) >= 3:
+                mat["dirtDecalMask"] = [float(ddm[0]), float(ddm[1]), float(ddm[2]), float(ddm[3] if len(ddm) >= 4 else 0.0)]
+
+            # Dirt controls (best-effort)
+            dl = _extract_scalar_x_from_shader(shader, [_SP_DIRT_LEVEL, _SP_DIRT_LEVEL_MOD])
+            if dl is not None:
+                mat["dirtLevel"] = float(dl)
+            dc = _extract_vec4_from_shader(shader, _SP_DIRT_COLOR)
+            if dc and len(dc) >= 3:
+                mat["dirtColor"] = [float(dc[0]), float(dc[1]), float(dc[2])]
+
+            # Puddle controls (best-effort)
+            pp = _extract_vec4_from_shader(shader, _SP_G_PUDDLE_PARAMS)
+            if pp and len(pp) >= 4:
+                mat["puddleParams"] = [float(pp[0]), float(pp[1]), float(pp[2]), float(pp[3])]
+            psr = _extract_vec4_from_shader(shader, _SP_G_PUDDLE_SCALE_XY_RANGE)
+            if psr and len(psr) >= 4:
+                mat["puddleScaleRange"] = [float(psr[0]), float(psr[1]), float(psr[2]), float(psr[3])]
+
+            # Height map (for parallax family). Export when present.
+            pick_h, pick_h_hv = _pick_texture_name_from_shader_with_hash(
+                textures,
+                shader,
+                _SP_HEIGHTMAP_PREFERRED,
+                require_keywords=("height", "disp", "parallax"),
+            )
+            if not pick_h:
+                pick_h, pick_h_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_HEIGHTMAP_PREFERRED, require_keywords=None)
+            if pick_h:
+                rel_h, wrote_h = _export_texture_png(
+                    textures,
+                    pick_h,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_h).lower()),
+                    dll_manager=dll_manager,
+                )
+                if wrote_h:
+                    wrote += 1
+                if rel_h:
+                    mat["height"] = rel_h
+                    mat["heightName"] = str(pick_h)
+                    if pick_h_hv is not None:
+                        mat["heightParamHash"] = int(pick_h_hv) & 0xFFFFFFFF
+                    if export_ktx2 and ktx2_dir:
+                        rel_k2 = _try_export_texture_ktx2_from_png(rel_h, tex_dir, ktx2_dir, toktx_exe=toktx_exe, srgb=False)
+                        if rel_k2:
+                            mat["heightKtx2"] = rel_k2
+
             # AO / occlusion (common across many GTA shaders)
-            pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=("ao", "occl"))
+            pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_OCCLUSION_PREFERRED, require_keywords=("ao", "occl"))
             if not pick_ao:
-                pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=None)
+                pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_OCCLUSION_PREFERRED, require_keywords=None)
             if not pick_ao:
                 pick_ao = _pick_texture_by_keywords(textures, include_keywords=("ao", "occl", "occ"))
                 pick_ao_hv = None
@@ -1693,11 +2306,13 @@ def _update_existing_manifest_materials_for_drawable(
             # Decal-ish alpha mask (best-effort; only attempt when shader family looks like decal)
             try:
                 if str(mat.get("shaderFamily") or "").lower() == "decal":
-                    pick_am = _pick_texture_by_keywords(
-                        textures,
-                        include_keywords=("alphamask", "alpha_mask", "opacity", "mask"),
-                        exclude_keywords=("normal", "spec", "srm", "ao", "occl"),
-                    )
+                    pick_am, _pick_am_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_ALPHA_MASK_PREFERRED, require_keywords=None)
+                    if not pick_am:
+                        pick_am = _pick_texture_by_keywords(
+                            textures,
+                            include_keywords=("alphamask", "alpha_mask", "opacity", "mask"),
+                            exclude_keywords=("normal", "spec", "srm", "ao", "occl"),
+                        )
                     if pick_am:
                         rel_am, wrote_am = _export_texture_png(
                             textures,
@@ -1722,6 +2337,259 @@ def _update_existing_manifest_materials_for_drawable(
                             mat.setdefault("decalBlendMode", "normal")
             except Exception:
                 pass
+
+            # --- Extra textures for parity (best-effort) ---
+            # Tint palette (if present)
+            pick_tp, _tp_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_TINT_PALETTE_SAMPLER], require_keywords=("tint", "palette"))
+            if not pick_tp:
+                pick_tp, _tp_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_TINT_PALETTE_SAMPLER], require_keywords=None)
+            if pick_tp:
+                rel_tp, wrote_tp = _export_texture_png(
+                    textures,
+                    pick_tp,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_tp).lower()),
+                    dll_manager=dll_manager,
+                )
+                if wrote_tp:
+                    wrote += 1
+                if rel_tp:
+                    mat["tintPalette"] = rel_tp
+                    mat["tintPaletteName"] = str(pick_tp)
+
+            # Env map (if present)
+            pick_env, _env_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_ENV_PREFERRED, require_keywords=("env", "cube", "refl"))
+            if not pick_env:
+                pick_env, _env_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_ENV_PREFERRED, require_keywords=None)
+            if pick_env:
+                rel_env, wrote_env = _export_texture_png(
+                    textures,
+                    pick_env,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_env).lower()),
+                    dll_manager=dll_manager,
+                )
+                if wrote_env:
+                    wrote += 1
+                if rel_env:
+                    mat["env"] = rel_env
+                    mat["envName"] = str(pick_env)
+
+            # Dirt (if present)
+            pick_dirt, _dirt_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_DIRT_PREFERRED, require_keywords=("dirt",))
+            if not pick_dirt:
+                pick_dirt, _dirt_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_DIRT_PREFERRED, require_keywords=None)
+            if pick_dirt:
+                rel_dirt, wrote_dirt = _export_texture_png(
+                    textures,
+                    pick_dirt,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_dirt).lower()),
+                    dll_manager=dll_manager,
+                )
+                if wrote_dirt:
+                    wrote += 1
+                if rel_dirt:
+                    mat["dirt"] = rel_dirt
+                    mat["dirtName"] = str(pick_dirt)
+
+            # Damage + apply damage mask (if present)
+            pick_dmg, _dmg_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_DAMAGE_PREFERRED, require_keywords=("damage", "broken", "crack"))
+            if not pick_dmg:
+                pick_dmg, _dmg_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_DAMAGE_PREFERRED, require_keywords=None)
+            if pick_dmg:
+                rel_dmg, wrote_dmg = _export_texture_png(
+                    textures,
+                    pick_dmg,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_dmg).lower()),
+                    dll_manager=dll_manager,
+                )
+                if wrote_dmg:
+                    wrote += 1
+                if rel_dmg:
+                    mat["damage"] = rel_dmg
+                    mat["damageName"] = str(pick_dmg)
+
+            pick_dmgm, _dmgm_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_DAMAGE_MASK_PREFERRED, require_keywords=("damage", "apply", "mask"))
+            if not pick_dmgm:
+                pick_dmgm, _dmgm_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_DAMAGE_MASK_PREFERRED, require_keywords=None)
+            if pick_dmgm:
+                rel_dmgm, wrote_dmgm = _export_texture_png(
+                    textures,
+                    pick_dmgm,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_dmgm).lower()),
+                    dll_manager=dll_manager,
+                )
+                if wrote_dmgm:
+                    wrote += 1
+                if rel_dmgm:
+                    mat["damageMask"] = rel_dmgm
+                    mat["damageMaskName"] = str(pick_dmgm)
+
+            # Puddle mask (if present)
+            pick_pm, _pm_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_PUDDLE_MASK_PREFERRED, require_keywords=("puddle", "mask", "wet"))
+            if not pick_pm:
+                pick_pm, _pm_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_PUDDLE_MASK_PREFERRED, require_keywords=None)
+            if pick_pm:
+                rel_pm, wrote_pm = _export_texture_png(
+                    textures,
+                    pick_pm,
+                    tex_dir,
+                    td_hash=td_hash,
+                    shader_tex_obj=shader_tex_objs.get(str(pick_pm).lower()),
+                    dll_manager=dll_manager,
+                )
+                if wrote_pm:
+                    wrote += 1
+                if rel_pm:
+                    mat["puddleMask"] = rel_pm
+                    mat["puddleMaskName"] = str(pick_pm)
+
+            # --- Terrain/Water special families (best-effort parity with CodeWalker TerrainShader/WaterShader) ---
+            sf = str(mat.get("shaderFamily") or "").lower()
+            if sf == "terrain":
+                # Terrain uses up to 5 colour maps (0..4) and an optional blend mask.
+                # We export explicit terrain* fields so the viewer can bind a dedicated terrain shader.
+                if mat.get("diffuse"):
+                    mat.setdefault("terrainColor0", mat.get("diffuse"))
+                # Layers 1..4 commonly map to DiffuseTexSampler01..04 in ShaderParamNames.
+                layer_hashes = [
+                    _SP_DIFFUSE_PREFERRED[6],  # DiffuseTexSampler01 (255045494)
+                    _SP_DIFFUSE_PREFERRED[7],  # DiffuseTexSampler02
+                    _SP_DIFFUSE_PREFERRED[8],  # DiffuseTexSampler03
+                    _SP_DIFFUSE_PREFERRED[9],  # DiffuseTexSampler04
+                ]
+                for li, hv in enumerate(layer_hashes, start=1):
+                    pick_t, _pick_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [hv], require_keywords=None)
+                    if not pick_t:
+                        continue
+                    rel_t, wrote_t = _export_texture_png(
+                        textures,
+                        pick_t,
+                        tex_dir,
+                        td_hash=td_hash,
+                        shader_tex_obj=shader_tex_objs.get(str(pick_t).lower()),
+                        dll_manager=dll_manager,
+                    )
+                    if wrote_t:
+                        wrote += 1
+                    if rel_t:
+                        mat[f"terrainColor{li}"] = rel_t
+                        mat[f"terrainColor{li}Name"] = str(pick_t)
+                # Blend mask: no single authoritative hash seen in ShaderParamNames; choose by keyword.
+                pick_m = _pick_texture_by_keywords(
+                    textures,
+                    include_keywords=("mask", "blend", "cm"),
+                    exclude_keywords=("normal", "bump", "spec", "srm", "ao", "occl"),
+                )
+                if pick_m:
+                    rel_m, wrote_m = _export_texture_png(
+                        textures,
+                        pick_m,
+                        tex_dir,
+                        td_hash=td_hash,
+                        shader_tex_obj=shader_tex_objs.get(str(pick_m).lower()),
+                        dll_manager=dll_manager,
+                    )
+                    if wrote_m:
+                        wrote += 1
+                    if rel_m:
+                        mat["terrainMask"] = rel_m
+                        mat["terrainMaskName"] = str(pick_m)
+                # Terrain normals: layer0 falls back to the regular normal export.
+                if mat.get("normal"):
+                    mat.setdefault("terrainNormal0", mat.get("normal"))
+                bump_layers = [
+                    _SP_BUMP_SAMPLER_LAYER1,
+                    _SP_BUMP_SAMPLER_LAYER2,
+                    _SP_BUMP_SAMPLER_LAYER3,
+                    _SP_BUMP_SAMPLER_LAYER4,
+                ]
+                for li, hv in enumerate(bump_layers, start=1):
+                    pick_bn, _bn_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [hv], require_keywords=None)
+                    if not pick_bn:
+                        continue
+                    rel_bn, wrote_bn = _export_texture_png(
+                        textures,
+                        pick_bn,
+                        tex_dir,
+                        td_hash=td_hash,
+                        shader_tex_obj=shader_tex_objs.get(str(pick_bn).lower()),
+                        dll_manager=dll_manager,
+                    )
+                    if wrote_bn:
+                        wrote += 1
+                    if rel_bn:
+                        mat[f"terrainNormal{li}"] = rel_bn
+                        mat[f"terrainNormal{li}Name"] = str(pick_bn)
+
+            elif sf == "water":
+                # Water uses diffuse/bump + optional foam + flow map, plus ripple params.
+                if mat.get("diffuse"):
+                    mat.setdefault("waterDiffuse", mat.get("diffuse"))
+                if mat.get("normal"):
+                    mat.setdefault("waterBump", mat.get("normal"))
+                # FoamSampler / FlowSampler
+                pick_f, _fhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FOAM_SAMPLER], require_keywords=("foam",))
+                if not pick_f:
+                    pick_f, _fhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FOAM_SAMPLER], require_keywords=None)
+                if pick_f:
+                    rel_f, wrote_f = _export_texture_png(
+                        textures,
+                        pick_f,
+                        tex_dir,
+                        td_hash=td_hash,
+                        shader_tex_obj=shader_tex_objs.get(str(pick_f).lower()),
+                        dll_manager=dll_manager,
+                    )
+                    if wrote_f:
+                        wrote += 1
+                    if rel_f:
+                        mat["waterFoam"] = rel_f
+                        mat["waterFoamName"] = str(pick_f)
+                pick_flow, _flhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FLOW_SAMPLER], require_keywords=("flow",))
+                if not pick_flow:
+                    pick_flow, _flhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FLOW_SAMPLER], require_keywords=None)
+                if pick_flow:
+                    rel_fl, wrote_fl = _export_texture_png(
+                        textures,
+                        pick_flow,
+                        tex_dir,
+                        td_hash=td_hash,
+                        shader_tex_obj=shader_tex_objs.get(str(pick_flow).lower()),
+                        dll_manager=dll_manager,
+                    )
+                    if wrote_fl:
+                        wrote += 1
+                    if rel_fl:
+                        mat["waterFlow"] = rel_fl
+                        mat["waterFlowName"] = str(pick_flow)
+
+                # Water mode heuristics (CodeWalker WaterPS ShaderMode: 1=river foam, 2=terrain foam)
+                try:
+                    sn = str(mat.get("shaderName") or "")
+                    if "riverfoam" in sn:
+                        mat["waterMode"] = 1
+                    elif "terrainfoam" in sn:
+                        mat["waterMode"] = 2
+                except Exception:
+                    pass
+                rs = _extract_scalar_x_from_shader(shader, [_SP_RIPPLE_SPEED])
+                if rs is not None:
+                    mat["rippleSpeed"] = float(rs)
+                rsc = _extract_scalar_x_from_shader(shader, [_SP_RIPPLE_SCALE])
+                if rsc is not None:
+                    mat["rippleScale"] = float(rsc)
+                rb = _extract_scalar_x_from_shader(shader, [_SP_RIPPLE_BUMPINESS])
+                if rb is not None:
+                    mat["rippleBumpiness"] = float(rb)
 
     return wrote
 
@@ -1853,7 +2721,7 @@ def _extract_drawable_lod_submeshes(drawable, lod: str) -> list[dict]:
         res = _extract_geometry_positions_indices_uv0_uv1_color0(g)
         if res is None:
             continue
-        pos, idx, uv0, uv1, uv2, col0, col1 = res
+        pos, idx, uv0, uv1, uv2, col0, col1, tan = res
         if pos.size == 0 or idx.size == 0:
             continue
         nrm = _compute_vertex_normals(pos, idx)
@@ -1867,6 +2735,7 @@ def _extract_drawable_lod_submeshes(drawable, lod: str) -> list[dict]:
                 "uv2": uv2,
                 "color0": col0,
                 "color1": col1,
+                "tangents": tan,
                 "shader": getattr(g, "Shader", None),
             }
         )
@@ -1877,6 +2746,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
     ap.add_argument("--assets-dir", default="", help="WebGL viewer assets directory (auto if omitted)")
+    ap.add_argument(
+        "--selected-dlc",
+        default="all",
+        help="CodeWalker DLC level. Use 'all' for full DLC overlays (except patchday27ng unless explicitly selected).",
+    )
+    ap.add_argument("--split-by-dlc", action="store_true", help="When exporting textures, write into assets/packs/<dlcname>/models_textures when possible.")
+    ap.add_argument("--pack-root-prefix", default="packs", help="Pack root dir under assets/ (default: packs).")
+    ap.add_argument("--force-pack", default="", help="Force writing all exported textures into a single pack id (e.g. patchday27ng).")
+    ap.add_argument(
+        "--base-pack",
+        default="",
+        help=(
+            "Optional: when --split-by-dlc is enabled and a texture does NOT belong to a dlcpack "
+            "(e.g. base game / update.rpf), write it into this pseudo-pack id under assets/packs/<base-pack>/models_textures. "
+            "Example: --base-pack update"
+        ),
+    )
     ap.add_argument("--chunk", default="0_0", help='Chunk key like "0_0"')
     ap.add_argument("--max-archetypes", type=int, default=0, help="Limit archetypes exported (0 = no limit)")
     ap.add_argument("--skip-existing", action="store_true", help="Skip archetypes already present in assets/models/manifest.json")
@@ -1900,16 +2786,7 @@ def main():
         raise SystemExit("Missing --game-path (or gta_location env var)")
 
     # Auto-detect assets dir so running from either repo root or ./webgl works.
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        # This script lives in ./webgl
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            # If run from repo root and script path is different than expected, fallback:
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
     chunk_path = assets_dir / "entities_chunks" / f"{args.chunk}.jsonl"
     ents = _read_chunk_entities(chunk_path)
     if not ents:
@@ -1918,16 +2795,12 @@ def main():
             f"Tip: verify your assets dir. I resolved it to: {assets_dir}"
         )
 
-    # Collect unique archetype hashes
+    # Collect unique archetype hashes (entities_chunks may contain numeric hashes OR string names).
     hashes = []
     seen = set()
     for e in ents:
-        a = e.get("archetype")
-        if a is None:
-            continue
-        try:
-            h = _as_uint32(a)
-        except Exception:
+        h = _normalize_archetype_to_u32(e)
+        if h is None:
             continue
         if h in seen:
             continue
@@ -1942,7 +2815,7 @@ def main():
     if not dm.initialized:
         raise SystemExit("Failed to initialize DllManager")
 
-    if not dm.init_game_file_cache():
+    if not dm.init_game_file_cache(selected_dlc=str(args.selected_dlc or "").strip() or None):
         raise SystemExit("Failed to init GameFileCache (required for drawables)")
 
     gfc = dm.get_game_file_cache()
@@ -1972,8 +2845,12 @@ def main():
     already = set((manifest.get("meshes") or {}).keys())
 
     # Optional texture exporting
-    tex_dir = assets_dir / "models_textures"
-    ktx2_dir = assets_dir / "models_textures_ktx2"
+    tex_dir_base = assets_dir / "models_textures"
+    ktx2_dir_base = assets_dir / "models_textures_ktx2"
+    packs_root = assets_dir / str(args.pack_root_prefix or "packs").strip().strip("/").strip("\\")
+    force_pack = str(args.force_pack or "").strip().lower()
+    base_pack = str(args.base_pack or "").strip().lower()
+    split_by_dlc = bool(args.split_by_dlc)
     rpf_reader = RpfReader(str(game_path), dm) if args.export_textures else None
 
     skipped_existing = 0
@@ -1996,10 +2873,7 @@ def main():
         if args.skip_existing and (not args.force) and hs in already and (not args.export_textures or have_diffuse_already):
             skipped_existing += 1
             continue
-        try:
-            arch = gfc.GetArchetype(h)
-        except Exception:
-            arch = None
+        arch = get_archetype_best_effort(gfc, int(h) & 0xFFFFFFFF, dll_manager=dm)
         if arch is None:
             no_archetype += 1
             if len(failures_sample) < 200:
@@ -2007,13 +2881,7 @@ def main():
             continue
 
         # Trigger drawable load and pump the content loader.
-        drawable = gfc.TryGetDrawable(arch)
-        spins = 0
-        while drawable is None and spins < 400:
-            # Progress load queue
-            gfc.ContentThreadProc()
-            drawable = gfc.TryGetDrawable(arch)
-            spins += 1
+        drawable = _try_get_drawable(gfc, arch, spins=400)
 
         if drawable is None:
             no_drawable += 1
@@ -2029,6 +2897,7 @@ def main():
         # Read texdict + textures once per archetype (used for per-submesh texture selection).
         td_hash = None
         textures = None
+        ytd_entry_path = ""
         if args.export_textures and rpf_reader:
             try:
                 tdh = getattr(arch, "TextureDict", None)
@@ -2038,15 +2907,34 @@ def main():
                 td_hash = None
             try:
                 if td_hash and td_hash != 0:
-                    ytd = gfc.GetYtd(td_hash)
-                    spins = 0
-                    while (ytd is not None) and (not getattr(ytd, "Loaded", True)) and spins < 400:
-                        gfc.ContentThreadProc()
-                        spins += 1
+                    ytd = _try_get_ytd(gfc, int(td_hash) & 0xFFFFFFFF, spins=400)
                     if ytd is not None and getattr(ytd, "Loaded", True):
+                        try:
+                            ent = getattr(ytd, "RpfFileEntry", None)
+                            ytd_entry_path = str(getattr(ent, "Path", "") or "") if ent is not None else ""
+                        except Exception:
+                            ytd_entry_path = ""
                         textures = rpf_reader.get_ytd_textures(ytd)
             except Exception:
                 textures = None
+
+        # Choose output dirs for textures (base vs pack).
+        tex_dir = tex_dir_base
+        ktx2_dir = ktx2_dir_base
+        if args.export_textures:
+            if force_pack:
+                tex_dir = packs_root / force_pack / "models_textures"
+                ktx2_dir = packs_root / force_pack / "models_textures_ktx2"
+            elif split_by_dlc:
+                dlc = _infer_dlc_name_from_entry_path(ytd_entry_path)
+                if dlc:
+                    tex_dir = packs_root / dlc / "models_textures"
+                    ktx2_dir = packs_root / dlc / "models_textures_ktx2"
+                elif base_pack:
+                    # Base game / update.rpf textures (not under dlcpacks/) can still be "organized like packs"
+                    # by placing them into a pseudo-pack such as "update".
+                    tex_dir = packs_root / base_pack / "models_textures"
+                    ktx2_dir = packs_root / base_pack / "models_textures_ktx2"
 
         if (not have_mesh_already) or bool(args.force):
             # Export per-geometry submeshes per LOD (this is required for multi-material correctness).
@@ -2088,11 +2976,11 @@ def main():
                         uvs2 = uv2 if (uv2 is not None and getattr(uv2, "size", 0)) else uvs
 
                         out_bin = models_dir / f"{h}_{lod_key}_{si}.bin"
-                        tangents = None
-                        try:
-                            tangents = _compute_vertex_tangents(positions, uvs, indices, normals)
-                        except Exception:
-                            tangents = None
+                        # CodeWalker-style policy:
+                        # - Use tangents from the vertex buffer when present
+                        # - Do NOT synthesize tangents from UVs (degenerate UVs are common; CW shaders
+                        #   often just use a constant fallback tangent when the vertex format has none)
+                        tangents = sub.get("tangents")
                         _write_mesh_bin(out_bin, positions, indices, normals, uvs, tangents, color0=col0, uvs1=uvs1, uvs2=uvs2, color1=col1)
 
                         mat = {}
@@ -2104,15 +2992,35 @@ def main():
 
                         # Export compact raw shader params for future shader-family support.
                         try:
-                            sp = _extract_shader_params(shader, max_textures=24, max_vectors=48)
+                            sp = _extract_shader_params(shader, max_textures=64, max_vectors=96)
                             if sp:
                                 mat["shaderParams"] = sp
                         except Exception:
                             pass
+
+                        # IsDistMap: CodeWalker treats distanceMapSampler as a special diffuse path.
+                        try:
+                            for hv, p in _shader_param_iter(shader) or []:
+                                if int(getattr(p, "DataType", 255)) != 0:
+                                    continue
+                                if (int(hv) & 0xFFFFFFFF) == (_SP_DISTANCE_MAP_SAMPLER & 0xFFFFFFFF):
+                                    mat["isDistMap"] = True
+                                    break
+                        except Exception:
+                            pass
                         # UV scale/offset per submesh (shader param).
-                        uvso = _extract_uv0_scale_offset_from_shader(shader)
-                        if uvso and len(uvso) >= 4:
-                            mat["uv0ScaleOffset"] = [float(uvso[0]), float(uvso[1]), float(uvso[2]), float(uvso[3])]
+                        uvso0 = _extract_uv_scale_offset_from_shader(shader, 0)
+                        if uvso0 and len(uvso0) >= 4:
+                            mat["uv0ScaleOffset"] = [float(uvso0[0]), float(uvso0[1]), float(uvso0[2]), float(uvso0[3])]
+                        uvso1 = _extract_uv_scale_offset_from_shader(shader, 1)
+                        if uvso1 and len(uvso1) >= 4:
+                            mat["uv1ScaleOffset"] = [float(uvso1[0]), float(uvso1[1]), float(uvso1[2]), float(uvso1[3])]
+                        uvso2 = _extract_uv_scale_offset_from_shader(shader, 2)
+                        if uvso2 and len(uvso2) >= 4:
+                            mat["uv2ScaleOffset"] = [float(uvso2[0]), float(uvso2[1]), float(uvso2[2]), float(uvso2[3])]
+                        uvso3 = _extract_uv_scale_offset_from_shader(shader, 3)
+                        if uvso3 and len(uvso3) >= 4:
+                            mat["uv3ScaleOffset"] = [float(uvso3[0]), float(uvso3[1]), float(uvso3[2]), float(uvso3[3])]
 
                         g0 = _extract_vec4_from_shader(shader, _SP_GLOBAL_ANIM_UV0)
                         g1 = _extract_vec4_from_shader(shader, _SP_GLOBAL_ANIM_UV1)
@@ -2128,6 +3036,15 @@ def main():
                         spec_int = _extract_scalar_x_from_shader(shader, _SP_SPEC_INTENSITY_PREFERRED)
                         if spec_int is not None:
                             mat["specularIntensity"] = float(spec_int)
+                        spec_falloff = _extract_scalar_x_from_shader(shader, [_SP_SPEC_FALLOFF_MULT])
+                        if spec_falloff is not None:
+                            mat["specularFalloffMult"] = float(spec_falloff)
+                        spec_fres = _extract_scalar_x_from_shader(shader, [_SP_SPEC_FRESNEL])
+                        if spec_fres is not None:
+                            mat["specularFresnel"] = float(spec_fres)
+                        spec_falloff2 = _extract_scalar_x_from_shader(shader, [_SP_SPECULAR_FALLOFF])
+                        if spec_falloff2 is not None:
+                            mat["specularFalloff"] = float(spec_falloff2)
                         spec_pow = _extract_scalar_x_from_shader(shader, _SP_SPEC_POWER_PREFERRED)
                         if spec_pow is not None:
                             mat["specularPower"] = float(spec_pow)
@@ -2140,12 +3057,23 @@ def main():
                         hab = _extract_scalar_x_from_shader(shader, [_SP_HARD_ALPHA_BLEND])
                         if hab is not None:
                             mat["hardAlphaBlend"] = float(hab)
+                        at = _extract_scalar_x_from_shader(shader, [_SP_ALPHA_TEST])
+                        if at is not None:
+                            mat["alphaTest"] = float(at)
+                        acmm = _extract_vec4_from_shader(shader, _SP_G_ALPHA_CUTOFF_MIN_MAX)
+                        if acmm and len(acmm) >= 2:
+                            mat["alphaCutoffMinMax"] = [float(acmm[0]), float(acmm[1])]
                         v4 = _extract_vec4_from_shader(shader, _SP_SPEC_MAP_INT_MASK)
                         if v4 and len(v4) >= 3:
                             mat["specMaskWeights"] = [float(v4[0]), float(v4[1]), float(v4[2])]
 
                         # Textures per submesh.
-                        if textures and isinstance(textures, dict) and td_hash:
+                        # NOTE: do not require YTD/TextureDict to be present. Many materials reference
+                        # textures that are only accessible via shader texture objects; `_export_texture_png`
+                        # can decode those when `dll_manager` is provided.
+                        if args.export_textures:
+                            if not isinstance(textures, dict):
+                                textures = {}
                             # Collect shader-referenced texture objects by (lowercased) name.
                             # This allows exporting textures that aren't present in the current YTD dict
                             # returned by get_ytd_textures(...).
@@ -2257,10 +3185,59 @@ def main():
                                 if ds and len(ds) >= 4:
                                     mat["detailSettings"] = [float(ds[0]), float(ds[1]), float(ds[2]), float(ds[3])]
 
+                            # Parallax scale/bias (vec4; viewer uses x/y)
+                            psb = _extract_vec4_from_shader(shader, _SP_PARALLAX_SCALE_BIAS)
+                            if psb and len(psb) >= 2:
+                                mat["parallaxScaleBias"] = [float(psb[0]), float(psb[1]), float(psb[2] if len(psb) > 2 else 0.0), float(psb[3] if len(psb) > 3 else 0.0)]
+
+                            # Wetness (scalar-ish)
+                            wet = _extract_scalar_x_from_shader(shader, _SP_WETNESS_PREFERRED)
+                            if wet is not None:
+                                mat["wetness"] = float(wet)
+                            wdark = _extract_scalar_x_from_shader(shader, [_SP_WET_DARKEN])
+                            if wdark is not None:
+                                mat["wetDarken"] = float(wdark)
+
+                        # Decal tint/masks (best-effort; some decals use these even outside texture-only update path)
+                        dt = _extract_vec4_from_shader(shader, _SP_DECAL_TINT)
+                        if dt and len(dt) >= 3:
+                            mat["decalTint"] = [float(dt[0]), float(dt[1]), float(dt[2])]
+                        adm = _extract_vec4_from_shader(shader, _SP_AMBIENT_DECAL_MASK)
+                        if adm and len(adm) >= 3:
+                            mat["ambientDecalMask"] = [float(adm[0]), float(adm[1]), float(adm[2]), float(adm[3] if len(adm) >= 4 else 0.0)]
+                        ddm = _extract_vec4_from_shader(shader, _SP_DIRT_DECAL_MASK)
+                        if ddm and len(ddm) >= 3:
+                            mat["dirtDecalMask"] = [float(ddm[0]), float(ddm[1]), float(ddm[2]), float(ddm[3] if len(ddm) >= 4 else 0.0)]
+
+                            # Height map (for parallax family). Export when present.
+                            pick_h, pick_h_hv = _pick_texture_name_from_shader_with_hash(
+                                textures,
+                                shader,
+                                _SP_HEIGHTMAP_PREFERRED,
+                                require_keywords=("height", "disp", "parallax"),
+                            )
+                            if not pick_h:
+                                pick_h, pick_h_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_HEIGHTMAP_PREFERRED, require_keywords=None)
+                            rel_h, wrote_h = _export_texture_png(
+                                textures,
+                                pick_h,
+                                tex_dir,
+                                td_hash=td_hash,
+                                shader_tex_obj=shader_tex_objs.get(str(pick_h).lower()) if pick_h else None,
+                                dll_manager=dm,
+                            ) if pick_h else (None, False)
+                            if wrote_h:
+                                textures_exported_now += 1
+                            if rel_h:
+                                mat["height"] = rel_h
+                                mat["heightName"] = str(pick_h)
+                                if pick_h_hv is not None:
+                                    mat["heightParamHash"] = int(pick_h_hv) & 0xFFFFFFFF
+
                             # AO / occlusion
-                            pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=("ao", "occl"))
+                            pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_OCCLUSION_PREFERRED, require_keywords=("ao", "occl"))
                             if not pick_ao:
-                                pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_OCCLUSION_SAMPLER], require_keywords=None)
+                                pick_ao, pick_ao_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_OCCLUSION_PREFERRED, require_keywords=None)
                             if not pick_ao:
                                 pick_ao = _pick_texture_by_keywords(textures, include_keywords=("ao", "occl", "occ"))
                                 pick_ao_hv = None
@@ -2333,11 +3310,13 @@ def main():
                             # Decal-ish alpha mask (best-effort; only attempt when shader family looks like decal)
                             try:
                                 if str(mat.get("shaderFamily") or "").lower() == "decal":
-                                    pick_am = _pick_texture_by_keywords(
-                                        textures,
-                                        include_keywords=("alphamask", "alpha_mask", "opacity", "mask"),
-                                        exclude_keywords=("normal", "spec", "srm", "ao", "occl"),
-                                    )
+                                    pick_am, _pick_am_hv = _pick_texture_name_from_shader_with_hash(textures, shader, _SP_ALPHA_MASK_PREFERRED, require_keywords=None)
+                                    if not pick_am:
+                                        pick_am = _pick_texture_by_keywords(
+                                            textures,
+                                            include_keywords=("alphamask", "alpha_mask", "opacity", "mask"),
+                                            exclude_keywords=("normal", "spec", "srm", "ao", "occl"),
+                                        )
                                     rel_am, wrote_am = _export_texture_png(
                                         textures,
                                         pick_am,
@@ -2354,6 +3333,139 @@ def main():
                                         mat.setdefault("decalDepthBias", 1.0)
                                         mat.setdefault("decalSlopeScale", 1.0)
                                         mat.setdefault("decalBlendMode", "normal")
+                            except Exception:
+                                pass
+
+                            # Terrain/Water special families (best-effort parity with CodeWalker TerrainShader/WaterShader).
+                            try:
+                                sf = str(mat.get("shaderFamily") or "").lower()
+                                if sf == "terrain":
+                                    # Colour layers 0..4: prefer DiffuseTexSampler + 01..04 when present.
+                                    if mat.get("diffuse"):
+                                        mat.setdefault("terrainColor0", mat.get("diffuse"))
+                                    layer_hashes = [
+                                        _SP_DIFFUSE_PREFERRED[6],  # DiffuseTexSampler01
+                                        _SP_DIFFUSE_PREFERRED[7],  # DiffuseTexSampler02
+                                        _SP_DIFFUSE_PREFERRED[8],  # DiffuseTexSampler03
+                                        _SP_DIFFUSE_PREFERRED[9],  # DiffuseTexSampler04
+                                    ]
+                                    for li, hv in enumerate(layer_hashes, start=1):
+                                        pick_t, _pick_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [hv], require_keywords=None)
+                                        if not pick_t:
+                                            continue
+                                        rel_t, wrote_t = _export_texture_png(
+                                            textures,
+                                            pick_t,
+                                            tex_dir,
+                                            td_hash=td_hash,
+                                            shader_tex_obj=shader_tex_objs.get(str(pick_t).lower()) if pick_t else None,
+                                            dll_manager=dm,
+                                        )
+                                        if wrote_t:
+                                            textures_exported_now += 1
+                                        if rel_t:
+                                            mat[f"terrainColor{li}"] = rel_t
+                                            mat[f"terrainColor{li}Name"] = str(pick_t)
+                                    pick_m = _pick_texture_by_keywords(
+                                        textures,
+                                        include_keywords=("mask", "blend", "cm"),
+                                        exclude_keywords=("normal", "bump", "spec", "srm", "ao", "occl"),
+                                    )
+                                    if pick_m:
+                                        rel_m, wrote_m = _export_texture_png(
+                                            textures,
+                                            pick_m,
+                                            tex_dir,
+                                            td_hash=td_hash,
+                                            shader_tex_obj=shader_tex_objs.get(str(pick_m).lower()) if pick_m else None,
+                                            dll_manager=dm,
+                                        )
+                                        if wrote_m:
+                                            textures_exported_now += 1
+                                        if rel_m:
+                                            mat["terrainMask"] = rel_m
+                                            mat["terrainMaskName"] = str(pick_m)
+                                    if mat.get("normal"):
+                                        mat.setdefault("terrainNormal0", mat.get("normal"))
+                                    bump_layers = [
+                                        _SP_BUMP_SAMPLER_LAYER1,
+                                        _SP_BUMP_SAMPLER_LAYER2,
+                                        _SP_BUMP_SAMPLER_LAYER3,
+                                        _SP_BUMP_SAMPLER_LAYER4,
+                                    ]
+                                    for li, hv in enumerate(bump_layers, start=1):
+                                        pick_bn, _bn_hv = _pick_texture_name_from_shader_with_hash(textures, shader, [hv], require_keywords=None)
+                                        if not pick_bn:
+                                            continue
+                                        rel_bn, wrote_bn = _export_texture_png(
+                                            textures,
+                                            pick_bn,
+                                            tex_dir,
+                                            td_hash=td_hash,
+                                            shader_tex_obj=shader_tex_objs.get(str(pick_bn).lower()) if pick_bn else None,
+                                            dll_manager=dm,
+                                        )
+                                        if wrote_bn:
+                                            textures_exported_now += 1
+                                        if rel_bn:
+                                            mat[f"terrainNormal{li}"] = rel_bn
+                                            mat[f"terrainNormal{li}Name"] = str(pick_bn)
+
+                                elif sf == "water":
+                                    if mat.get("diffuse"):
+                                        mat.setdefault("waterDiffuse", mat.get("diffuse"))
+                                    if mat.get("normal"):
+                                        mat.setdefault("waterBump", mat.get("normal"))
+                                    pick_f, _fhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FOAM_SAMPLER], require_keywords=("foam",))
+                                    if not pick_f:
+                                        pick_f, _fhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FOAM_SAMPLER], require_keywords=None)
+                                    if pick_f:
+                                        rel_f, wrote_f = _export_texture_png(
+                                            textures,
+                                            pick_f,
+                                            tex_dir,
+                                            td_hash=td_hash,
+                                            shader_tex_obj=shader_tex_objs.get(str(pick_f).lower()) if pick_f else None,
+                                            dll_manager=dm,
+                                        )
+                                        if wrote_f:
+                                            textures_exported_now += 1
+                                        if rel_f:
+                                            mat["waterFoam"] = rel_f
+                                            mat["waterFoamName"] = str(pick_f)
+                                    pick_flow, _flhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FLOW_SAMPLER], require_keywords=("flow",))
+                                    if not pick_flow:
+                                        pick_flow, _flhv = _pick_texture_name_from_shader_with_hash(textures, shader, [_SP_FLOW_SAMPLER], require_keywords=None)
+                                    if pick_flow:
+                                        rel_fl, wrote_fl = _export_texture_png(
+                                            textures,
+                                            pick_flow,
+                                            tex_dir,
+                                            td_hash=td_hash,
+                                            shader_tex_obj=shader_tex_objs.get(str(pick_flow).lower()) if pick_flow else None,
+                                            dll_manager=dm,
+                                        )
+                                        if wrote_fl:
+                                            textures_exported_now += 1
+                                        if rel_fl:
+                                            mat["waterFlow"] = rel_fl
+                                            mat["waterFlowName"] = str(pick_flow)
+
+                                    # Mode + ripple params.
+                                    sn = str(mat.get("shaderName") or "")
+                                    if "riverfoam" in sn:
+                                        mat["waterMode"] = 1
+                                    elif "terrainfoam" in sn:
+                                        mat["waterMode"] = 2
+                                    rs = _extract_scalar_x_from_shader(shader, [_SP_RIPPLE_SPEED])
+                                    if rs is not None:
+                                        mat["rippleSpeed"] = float(rs)
+                                    rsc = _extract_scalar_x_from_shader(shader, [_SP_RIPPLE_SCALE])
+                                    if rsc is not None:
+                                        mat["rippleScale"] = float(rsc)
+                                    rb = _extract_scalar_x_from_shader(shader, [_SP_RIPPLE_BUMPINESS])
+                                    if rb is not None:
+                                        mat["rippleBumpiness"] = float(rb)
                             except Exception:
                                 pass
 
@@ -2389,7 +3501,7 @@ def main():
                     failures_sample.append({"hash": hs, "reason": "exception_writing"})
         else:
             # Texture-only update (or other metadata update)
-            if args.export_textures and textures and td_hash:
+            if args.export_textures:
                 try:
                     textures_exported_now += _update_existing_manifest_materials_for_drawable(
                         entry=entry,
@@ -2397,6 +3509,7 @@ def main():
                         textures=textures,
                         td_hash=td_hash,
                         tex_dir=tex_dir,
+                        dll_manager=dm,
                         export_ktx2=bool(args.export_ktx2),
                         ktx2_dir=ktx2_dir,
                         toktx_exe=str(args.toktx or "toktx"),

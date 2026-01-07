@@ -18,30 +18,31 @@ from pathlib import Path
 
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.rpf_reader import RpfReader
+from gta5_modules.script_paths import auto_assets_dir
+from gta5_modules.hash_utils import try_coerce_u32 as _try_coerce_u32
+from gta5_modules.manifest_utils import load_or_init_models_manifest as _load_or_init_models_manifest
+from gta5_modules.codewalker_archetypes import get_archetype_best_effort
 
 
 def _as_u32(x) -> int:
-    return int(x) & 0xFFFFFFFF
+    """
+    Best-effort conversion to unsigned 32-bit int.
+
+    pythonnet doesn't always allow `int(MetaHash(...))` even though MetaHash has an
+    implicit conversion to uint in C#; explicitly read `.Hash` when present.
+    """
+    # Wrapper kept for legacy callers in this script.
+    if x is None:
+        return 0
+    v = _try_coerce_u32(x, allow_hex=True)
+    if v is None:
+        raise TypeError(f"Cannot convert to u32: {type(x)} {x!r}")
+    return int(v) & 0xFFFFFFFF
 
 
 def _load_or_init_manifest(models_dir: Path) -> tuple[Path, dict]:
-    manifest_path = models_dir / "manifest.json"
-    manifest = {"version": 4, "meshes": {}}
-    if manifest_path.exists():
-        try:
-            existing = json.loads(manifest_path.read_text(encoding="utf-8", errors="ignore"))
-            if isinstance(existing, dict) and isinstance(existing.get("meshes"), dict):
-                manifest = existing
-                try:
-                    v = int(manifest.get("version") or 0)
-                except Exception:
-                    v = 0
-                manifest["version"] = max(4, v)
-        except Exception:
-            pass
-    if not isinstance(manifest.get("meshes"), dict):
-        manifest["meshes"] = {}
-    return manifest_path, manifest
+    # Wrapper kept for legacy callers in this script.
+    return _load_or_init_models_manifest(models_dir, min_version=4)
 
 
 def _iter_dict_keys(d):
@@ -72,11 +73,7 @@ def _resolve_drawable_for_model_hash(gfc, model_hash_u32: int, spins: int = 800)
     - CodeWalker.GameFiles.Drawable
     - CodeWalker.GameFiles.FragDrawable
     """
-    arch = None
-    try:
-        arch = gfc.GetArchetype(int(model_hash_u32) & 0xFFFFFFFF)
-    except Exception:
-        arch = None
+    arch = get_archetype_best_effort(gfc, int(model_hash_u32) & 0xFFFFFFFF, dll_manager=None)
 
     # 1) Archetype path (best: includes TextureDict)
     if arch is not None:
@@ -151,6 +148,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
+    ap.add_argument(
+        "--selected-dlc",
+        default="all",
+        help="CodeWalker DLC level. Use 'all' for full DLC overlays (except patchday27ng unless explicitly selected).",
+    )
+    ap.add_argument("--split-by-dlc", action="store_true", help="Write exported textures into assets/packs/<dlcname>/models_textures when possible.")
+    ap.add_argument("--pack-root-prefix", default="packs", help="Pack root dir under assets/ (default: packs).")
+    ap.add_argument("--force-pack", default="", help="Force writing all exported textures into a single pack id.")
     ap.add_argument("--max-vehicles", type=int, default=0, help="Limit vehicle models exported (0=all)")
     ap.add_argument("--max-peds", type=int, default=0, help="Limit ped models exported (0=all)")
     ap.add_argument("--skip-existing", action="store_true", help="Skip model hashes already in manifest with any LODs")
@@ -164,14 +169,7 @@ def main() -> None:
     if not game_path:
         raise SystemExit("Missing --game-path (or gta_location env var)")
 
-    if args.assets_dir:
-        assets_dir = Path(args.assets_dir)
-    else:
-        assets_dir = Path(__file__).parent / "webgl_viewer" / "assets"
-        if not assets_dir.exists():
-            alt = Path.cwd() / "webgl_viewer" / "assets"
-            if alt.exists():
-                assets_dir = alt
+    assets_dir = auto_assets_dir(args.assets_dir)
 
     models_dir = assets_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +178,7 @@ def main() -> None:
     dm = DllManager(game_path)
     if not dm.initialized:
         raise SystemExit("Failed to initialize DllManager")
-    if not dm.init_game_file_cache(load_vehicles=True, load_peds=True, load_audio=False):
+    if not dm.init_game_file_cache(load_vehicles=True, load_peds=True, load_audio=False, selected_dlc=str(args.selected_dlc or "").strip() or None):
         raise SystemExit("Failed to init GameFileCache (required for vehicles/peds)")
 
     gfc = dm.get_game_file_cache()
@@ -190,7 +188,15 @@ def main() -> None:
         pass
 
     rpf_reader = RpfReader(str(game_path), dm) if args.export_textures else None
-    tex_dir = assets_dir / "models_textures"
+    tex_dir_base = assets_dir / "models_textures"
+    packs_root = assets_dir / str(args.pack_root_prefix or "packs").strip().strip("/").strip("\\")
+    force_pack = str(args.force_pack or "").strip().lower()
+    split_by_dlc = bool(args.split_by_dlc)
+
+    def _infer_dlc_name_from_entry_path(p: str) -> str:
+        s = str(p or "").strip().lower().replace("/", "\\")
+        m = re.search(r"\\dlcpacks\\([^\\]+)\\", s)
+        return str(m.group(1) or "").strip().lower() if m else ""
 
     # Reuse helpers from the chunk exporter so results match the viewer.
     from export_drawables_for_chunk import (  # type: ignore
@@ -260,6 +266,27 @@ def main() -> None:
                 td_hash = (int(hv) & 0xFFFFFFFF) if hv is not None else None
             except Exception:
                 td_hash = None
+
+        # Choose output dir for textures for this model (base vs pack).
+        tex_dir = tex_dir_base
+        if args.export_textures:
+            if force_pack:
+                tex_dir = packs_root / force_pack / "models_textures"
+            elif split_by_dlc and td_hash:
+                try:
+                    ytd = gfc.GetYtd(int(td_hash) & 0xFFFFFFFF)
+                except Exception:
+                    ytd = None
+                ep = ""
+                if ytd is not None:
+                    try:
+                        ent = getattr(ytd, "RpfFileEntry", None)
+                        ep = str(getattr(ent, "Path", "") or "") if ent is not None else ""
+                    except Exception:
+                        ep = ""
+                dlc = _infer_dlc_name_from_entry_path(ep)
+                if dlc:
+                    tex_dir = packs_root / dlc / "models_textures"
 
             if td_hash and int(td_hash) != 0:
                 try:

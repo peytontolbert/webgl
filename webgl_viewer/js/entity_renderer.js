@@ -59,23 +59,34 @@ export class EntityRenderer {
         if (!positionsFloat32 || positionsFloat32.length === 0) return;
 
         const gl = this.gl;
+        // Preserve GL state (VAOs are global state in WebGL2 and can easily clobber other renderers).
+        const prevVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+        const prevArrayBuf = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
         let entry = this.chunkBuffers.get(key);
         if (!entry) {
             entry = { buffer: gl.createBuffer(), vao: gl.createVertexArray(), count: 0 };
             this.chunkBuffers.set(key, entry);
         }
-        gl.bindBuffer(gl.ARRAY_BUFFER, entry.buffer);
-        gl.bufferData(gl.ARRAY_BUFFER, positionsFloat32, gl.STATIC_DRAW);
-        entry.count = positionsFloat32.length / 3;
+        try {
+            gl.bindBuffer(gl.ARRAY_BUFFER, entry.buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, positionsFloat32, gl.STATIC_DRAW);
+            entry.count = positionsFloat32.length / 3;
 
-        // Configure VAO for this chunk so it can't clobber terrain attributes.
-        gl.bindVertexArray(entry.vao);
-        gl.bindBuffer(gl.ARRAY_BUFFER, entry.buffer);
-        if (this.posLoc !== -1) {
-            gl.enableVertexAttribArray(this.posLoc);
-            gl.vertexAttribPointer(this.posLoc, 3, gl.FLOAT, false, 0, 0);
+            // Configure VAO for this chunk so it can't clobber other renderers' attributes.
+            gl.bindVertexArray(entry.vao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, entry.buffer);
+            if (this.posLoc !== -1) {
+                gl.enableVertexAttribArray(this.posLoc);
+                gl.vertexAttribPointer(this.posLoc, 3, gl.FLOAT, false, 0, 0);
+            }
+        } catch (e) {
+            console.warn(`EntityRenderer.setChunk failed for ${String(key)}:`, e);
+            try { this.deleteChunk(key); } catch { /* ignore */ }
+        } finally {
+            // Restore previous bindings.
+            try { gl.bindVertexArray(prevVao); } catch { /* ignore */ }
+            try { gl.bindBuffer(gl.ARRAY_BUFFER, prevArrayBuf); } catch { /* ignore */ }
         }
-        gl.bindVertexArray(null);
     }
 
     deleteChunk(key) {
@@ -94,6 +105,17 @@ export class EntityRenderer {
         if (!this.ready) return;
 
         const gl = this.gl;
+        // Preserve/restore global GL state to avoid "mysterious broken frame" bugs.
+        const prevProg = gl.getParameter(gl.CURRENT_PROGRAM);
+        const prevVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+        const blendWas = gl.isEnabled(gl.BLEND);
+        const prevBlendSrcRGB = gl.getParameter(gl.BLEND_SRC_RGB);
+        const prevBlendDstRGB = gl.getParameter(gl.BLEND_DST_RGB);
+        const prevBlendSrcA = gl.getParameter(gl.BLEND_SRC_ALPHA);
+        const prevBlendDstA = gl.getParameter(gl.BLEND_DST_ALPHA);
+        const prevBlendEqRGB = gl.getParameter(gl.BLEND_EQUATION_RGB);
+        const prevBlendEqA = gl.getParameter(gl.BLEND_EQUATION_ALPHA);
+
         gl.useProgram(this.program.program);
 
         gl.uniformMatrix4fv(this.uniforms.uViewProjectionMatrix, false, viewProjectionMatrix);
@@ -102,15 +124,25 @@ export class EntityRenderer {
 
         // Enable alpha blending (helps dense points)
         gl.enable(gl.BLEND);
+        gl.blendEquation(gl.FUNC_ADD);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-        for (const [_key, entry] of this.chunkBuffers.entries()) {
-            if (!entry || entry.count <= 0) continue;
-            gl.bindVertexArray(entry.vao);
-            gl.drawArrays(gl.POINTS, 0, entry.count);
+        try {
+            for (const [_key, entry] of this.chunkBuffers.entries()) {
+                if (!entry || entry.count <= 0) continue;
+                gl.bindVertexArray(entry.vao);
+                gl.drawArrays(gl.POINTS, 0, entry.count);
+            }
+        } finally {
+            // Restore previous state.
+            try { gl.bindVertexArray(prevVao); } catch { /* ignore */ }
+            try {
+                gl.blendEquationSeparate(prevBlendEqRGB, prevBlendEqA);
+                gl.blendFuncSeparate(prevBlendSrcRGB, prevBlendDstRGB, prevBlendSrcA, prevBlendDstA);
+            } catch { /* ignore */ }
+            try { if (!blendWas) gl.disable(gl.BLEND); else gl.enable(gl.BLEND); } catch { /* ignore */ }
+            try { gl.useProgram(prevProg); } catch { /* ignore */ }
         }
-        gl.bindVertexArray(null);
-        gl.disable(gl.BLEND);
     }
 }
 

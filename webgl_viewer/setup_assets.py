@@ -17,6 +17,8 @@ except Exception:
 import argparse
 import time
 from array import array
+import zlib
+from collections import OrderedDict
 
 # CLI-tunable globals (defaults keep current behavior)
 _SHOULD_BUILD_ENTITY_BINS = False
@@ -35,6 +37,31 @@ def setup_assets():
     # Create legacy assets directory (this is where all exporters/scripts expect to write).
     assets_dir = viewer_dir / 'assets'
     assets_dir.mkdir(parents=True, exist_ok=True)
+
+    # Linux hosting gotcha:
+    # Some older workflows created symlinks inside assets/ (e.g. assets/ymap/entities -> output/ymap/entities).
+    # If the target later moves or isn't generated, the symlink becomes broken and Vite preview (sirv/totalist)
+    # will crash when it tries to stat() it.
+    #
+    # Repair common broken symlink directories by converting them into real directories.
+    def _repair_dir_path(p: Path) -> None:
+        try:
+            if p.is_symlink() and not p.exists():
+                p.unlink()
+        except Exception:
+            pass
+        if p.exists() and not p.is_dir():
+            raise SystemExit(f"Expected directory at {p} but found a file. Please remove it and retry.")
+        p.mkdir(parents=True, exist_ok=True)
+
+    # Ensure assets/ymap/entities is a real directory (or a valid symlink), so preview servers don't crash.
+    try:
+        ymap_dir = assets_dir / "ymap"
+        if ymap_dir.exists() and ymap_dir.is_dir():
+            _repair_dir_path(ymap_dir / "entities")
+    except Exception:
+        # Keep setup best-effort; missing ymap content is not fatal to the core viewer.
+        pass
     
     # Copy terrain.obj if it exists
     terrain_obj = output_dir / 'terrain.obj'
@@ -67,6 +94,27 @@ def setup_assets():
         print("Copied heightmap.png")
     else:
         print("Warning: heightmap.png not found")
+
+    # Copy 16-bit heightmap assets if they exist (preferred by the viewer when present).
+    # Browser image decode paths are effectively 8-bit, so we use a raw uint16 blob + small JSON metadata.
+    # Expected output files:
+    # - heightmap_u16.json + heightmap_u16.bin
+    # - OR collision-derived: heightmap_collision_u16.json + heightmap_collision_u16.bin
+    hm16_json_collision = output_dir / 'heightmap_collision_u16.json'
+    hm16_bin_collision = output_dir / 'heightmap_collision_u16.bin'
+    hm16_json = output_dir / 'heightmap_u16.json'
+    hm16_bin = output_dir / 'heightmap_u16.bin'
+
+    if hm16_bin_collision.exists() and hm16_json_collision.exists():
+        shutil.copy2(hm16_json_collision, assets_dir / 'heightmap_u16.json')
+        shutil.copy2(hm16_bin_collision, assets_dir / 'heightmap_u16.bin')
+        print("Copied heightmap_collision_u16.(json|bin) -> assets/heightmap_u16.(json|bin)")
+    elif hm16_bin.exists() and hm16_json.exists():
+        shutil.copy2(hm16_json, assets_dir / 'heightmap_u16.json')
+        shutil.copy2(hm16_bin, assets_dir / 'heightmap_u16.bin')
+        print("Copied heightmap_u16.(json|bin) -> assets/heightmap_u16.(json|bin)")
+    elif hm16_bin_collision.exists() or hm16_json_collision.exists() or hm16_bin.exists() or hm16_json.exists():
+        print("Warning: Found partial 16-bit heightmap outputs; expected both .json and .bin (viewer will fall back to heightmap.png).")
 
     # Copy normalmap/lod visualization if they exist (useful for viewer shading/debug)
     normalmap = output_dir / 'normalmap.png'
@@ -104,7 +152,18 @@ def setup_assets():
     chunks_src = output_dir / 'entities_chunks'
     if chunks_src.exists():
         chunks_dst = assets_dir / 'entities_chunks'
-        chunks_dst.mkdir(exist_ok=True)
+        # Linux gotcha: a broken symlink returns exists()==False, but still blocks mkdir().
+        # If a previous workflow created `assets/entities_chunks` as a symlink (and the target moved),
+        # remove it and recreate a real directory so setup is idempotent.
+        try:
+            if chunks_dst.is_symlink() and not chunks_dst.exists():
+                chunks_dst.unlink()
+        except Exception:
+            pass
+        # If it exists but isn't a directory, fail loudly (we can't safely proceed).
+        if chunks_dst.exists() and not chunks_dst.is_dir():
+            raise SystemExit(f"Expected directory at {chunks_dst} but found a file. Please remove it and retry.")
+        chunks_dst.mkdir(parents=True, exist_ok=True)
         # Copy chunk files (jsonl)
         for chunk_file in chunks_src.glob('*.jsonl'):
             shutil.copy2(chunk_file, chunks_dst / chunk_file.name)
@@ -133,8 +192,15 @@ def setup_assets():
                 _build_entity_instance_bins(assets_dir, max_chunks=_MAX_INST_BINS_CHUNKS)
             except Exception as e:
                 print(f"Warning: failed to build entity instance bins: {e}")
+
+        # Backfill YMAP-level entity JSON files if a YMAP index exists.
+        # This is used by some coverage tooling (`report_world_coverage.py`) and older workflows.
+        try:
+            _ensure_ymap_entities_from_streamed_chunks(assets_dir)
+        except Exception as e:
+            print(f"Warning: failed to build assets/ymap/entities from entities_chunks: {e}")
     
-    # Copy textures from output/textures directory
+    # Copy terrain textures from output/textures directory (optional; not related to model textures).
     textures_dir = output_dir / 'textures'
     if textures_dir.exists():
         # Create textures directory in assets
@@ -146,7 +212,7 @@ def setup_assets():
             shutil.copy2(texture_file, assets_textures_dir / texture_file.name)
             print(f"Copied texture: {texture_file.name}")
     else:
-        print("Warning: textures directory not found")
+        print("Warning: output/textures directory not found (terrain textures). This is OK for models-only exports.")
 
     # Copy model textures from common export output layouts into assets/models_textures/.
     #
@@ -172,22 +238,131 @@ def setup_assets():
         output_dir / 'models_textures',
         output_dir / 'models' / 'models_textures',
         output_dir / 'models_textures_png',
+        # Common "stage into viewer assets directly" layouts (some export scripts write here).
+        assets_dir / 'models_textures',
     ]
     assets_models_textures_dir = assets_dir / 'models_textures'
     copied_model_textures = 0
+    found_model_tex_src_dirs = []
     for src_dir in model_tex_candidates:
         if not src_dir.exists():
             continue
+        found_model_tex_src_dirs.append(str(src_dir))
         try:
             assets_models_textures_dir.mkdir(parents=True, exist_ok=True)
-            for p in src_dir.glob('*.png'):
+            # Viewer supports these extensions for model textures.
+            for p in (
+                list(src_dir.glob('*.png'))
+                + list(src_dir.glob('*.dds'))
+                + list(src_dir.glob('*.jpg'))
+                + list(src_dir.glob('*.jpeg'))
+                + list(src_dir.glob('*.webp'))
+            ):
                 if _copy_newer(p, assets_models_textures_dir / p.name):
                     copied_model_textures += 1
         except Exception:
             # Keep asset setup best-effort.
             continue
-    if copied_model_textures > 0:
-        print(f"Copied model textures into assets/models_textures: {copied_model_textures} files")
+    # Always print a diagnostic summary (this avoids "it looked like it worked" confusion).
+    try:
+        existing_assets_model_textures = 0
+        if assets_models_textures_dir.exists():
+            existing_assets_model_textures = len([p for p in assets_models_textures_dir.iterdir() if p.is_file() and p.suffix.lower() in ('.png', '.dds', '.jpg', '.jpeg', '.webp')])
+        if copied_model_textures > 0:
+            print(f"Copied model textures into assets/models_textures: {copied_model_textures} files")
+        else:
+            if found_model_tex_src_dirs:
+                print("No newer model textures to copy into assets/models_textures (sources were present, but nothing needed updating).")
+            else:
+                print("Warning: No model texture source directories found in output/. If you expected model textures, ensure your export writes to output/models_textures/ (or similar).")
+        print(f"Model textures staged: assets/models_textures files={existing_assets_model_textures}")
+    except Exception:
+        pass
+
+    # Optional: copy model textures KTX2 (if your exporter/repair tools emitted them).
+    # Layout:
+    #   output/models_textures_ktx2/*.ktx2 -> assets/models_textures_ktx2/*.ktx2
+    model_tex_ktx2_candidates = [
+        output_dir / 'models_textures_ktx2',
+        output_dir / 'models' / 'models_textures_ktx2',
+        # Some pipelines stage directly into viewer assets.
+        assets_dir / 'models_textures_ktx2',
+    ]
+    assets_models_textures_ktx2_dir = assets_dir / 'models_textures_ktx2'
+    copied_model_textures_ktx2 = 0
+    found_model_tex_k2_src_dirs = []
+    for src_dir in model_tex_ktx2_candidates:
+        if not src_dir.exists():
+            continue
+        found_model_tex_k2_src_dirs.append(str(src_dir))
+        try:
+            assets_models_textures_ktx2_dir.mkdir(parents=True, exist_ok=True)
+            for p in list(src_dir.glob('*.ktx2')):
+                if _copy_newer(p, assets_models_textures_ktx2_dir / p.name):
+                    copied_model_textures_ktx2 += 1
+        except Exception:
+            # Keep asset setup best-effort.
+            continue
+    try:
+        existing_assets_model_textures_ktx2 = 0
+        if assets_models_textures_ktx2_dir.exists():
+            existing_assets_model_textures_ktx2 = len([p for p in assets_models_textures_ktx2_dir.iterdir() if p.is_file() and p.suffix.lower() == '.ktx2'])
+        if copied_model_textures_ktx2 > 0:
+            print(f"Copied model textures into assets/models_textures_ktx2: {copied_model_textures_ktx2} files")
+        else:
+            if found_model_tex_k2_src_dirs:
+                print("No newer model KTX2 textures to copy into assets/models_textures_ktx2.")
+        if existing_assets_model_textures_ktx2:
+            print(f"Model textures staged: assets/models_textures_ktx2 files={existing_assets_model_textures_ktx2}")
+    except Exception:
+        pass
+
+    # Optional: copy asset packs from output into assets.
+    #
+    # Layout:
+    #   output/packs/<packId>/models_textures/*.png  -> assets/packs/<packId>/models_textures/*.png
+    #
+    # This lets exporters/repair tools write to output/ first and rely on setup_assets to stage into assets/.
+    try:
+        out_packs = output_dir / "packs"
+        if out_packs.exists() and out_packs.is_dir():
+            assets_packs = assets_dir / "packs"
+            copied_packs = 0
+            for pack_dir in sorted([p for p in out_packs.iterdir() if p.is_dir()]):
+                pack_id = pack_dir.name
+                src_mt = pack_dir / "models_textures"
+                if not (src_mt.exists() and src_mt.is_dir()):
+                    continue
+                dst_mt = assets_packs / pack_id / "models_textures"
+                dst_mt.mkdir(parents=True, exist_ok=True)
+                for p in (
+                    list(src_mt.glob("*.png"))
+                    + list(src_mt.glob("*.dds"))
+                    + list(src_mt.glob("*.jpg"))
+                    + list(src_mt.glob("*.jpeg"))
+                    + list(src_mt.glob("*.webp"))
+                ):
+                    if _copy_newer(p, dst_mt / p.name):
+                        copied_packs += 1
+                # Optional KTX2 pack textures
+                src_k2 = pack_dir / "models_textures_ktx2"
+                if src_k2.exists() and src_k2.is_dir():
+                    dst_k2 = assets_packs / pack_id / "models_textures_ktx2"
+                    dst_k2.mkdir(parents=True, exist_ok=True)
+                    for p in list(src_k2.glob("*.ktx2")):
+                        if _copy_newer(p, dst_k2 / p.name):
+                            copied_packs += 1
+            if copied_packs > 0:
+                print(f"Copied pack model textures into assets/packs/**/models_textures: {copied_packs} files")
+    except Exception:
+        pass
+
+    # Optional but important: build a texture index so the runtime can resolve hash-only <-> hash+slug
+    # naming discrepancies without spamming 404 probes or leaving materials untextured.
+    try:
+        _ensure_models_textures_index(assets_dir)
+    except Exception as e:
+        print(f"Warning: failed to generate models_textures/index.json: {e}")
 
     # If terrain_info.json indicates no textures, try to auto-link terrain textures from the copied PNGs.
     _patch_terrain_info_with_detected_textures(assets_dir / 'terrain_info.json', assets_dir / 'textures')
@@ -235,6 +410,366 @@ def setup_assets():
     print(f"Assets directory: {assets_dir.absolute()}")
 
 
+def _ensure_ymap_entities_from_streamed_chunks(assets_dir: Path, *, force: bool = False) -> None:
+    """
+    Ensure `assets/ymap/entities/*.json` exists for every entry in `assets/ymap/index.json`.
+
+    Why:
+      - `report_world_coverage.py` reports YMAP coverage by checking these files.
+      - Some older pipelines produced per-YMAP entity JSON, while newer ones produce chunked `entities_chunks/*.jsonl`.
+      - When sharding/export pipelines change, it’s easy to end up with `ymap/index.json` but no `ymap/entities/*`,
+        which makes coverage reports misleading (`missing ymap entity json files: N`).
+
+    Source of truth:
+      - We build these files from the already-exported streamed entities under `assets/entities_chunks/*.jsonl`.
+
+    Output format:
+      - JSON object with schema + an `entities` array.
+      - Written in a streaming fashion (no need to hold all entities in memory).
+    """
+    ymap_index_path = assets_dir / "ymap" / "index.json"
+    chunks_dir = assets_dir / "entities_chunks"
+    if not ymap_index_path.exists():
+        return
+    if not chunks_dir.exists():
+        return
+
+    ymap_dir = assets_dir / "ymap"
+    ent_dir = ymap_dir / "entities"
+    ent_dir.mkdir(parents=True, exist_ok=True)
+
+    # If we already have any entity files, assume this step was run before.
+    # (Avoid rewriting 19k+ files on every setup_assets run.)
+    if not force:
+        try:
+            any_existing = next(iter([p for p in ent_dir.glob("*.json") if p.is_file()]), None)
+            if any_existing is not None:
+                return
+        except Exception:
+            pass
+
+    try:
+        idx = json.loads(ymap_index_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return
+
+    rows = idx.get("ymaps") if isinstance(idx, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return
+
+    expected_files = set()
+    base_to_variants = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        fn = str(r.get("file") or "").strip()
+        if not fn:
+            continue
+        expected_files.add(fn)
+        base = fn
+        if base.lower().endswith(".json"):
+            base = base[:-5]
+        # Map base -> list of variant filenames (for __<hash> disambiguation)
+        base_key = base.split("__", 1)[0]
+        base_to_variants.setdefault(base_key, []).append(fn)
+
+    def _basename_no_ext(path: str) -> str:
+        s = str(path or "").replace("/", "\\")
+        name = s.split("\\")[-1]
+        if name.lower().endswith(".ymap"):
+            name = name[:-5]
+        return name
+
+    def _choose_target_filename(ymap_path: str) -> str:
+        base = _basename_no_ext(ymap_path)
+        # Fast path: direct base.json exists in the index.
+        direct = f"{base}.json"
+        if direct in expected_files:
+            return direct
+        # If there’s exactly one indexed variant for this base, use it.
+        vs = base_to_variants.get(base) or []
+        if len(vs) == 1:
+            return vs[0]
+        # If there are multiple variants, try a stable hash suffix candidate.
+        # NOTE: the original pipeline that produced `__<8hex>` may use a different hash;
+        # we try CRC32 first (common + stable) and fall back to the first variant.
+        if vs:
+            h = zlib.crc32(str(ymap_path).encode("utf-8", errors="ignore")) & 0xFFFFFFFF
+            cand = f"{base}__{h:08x}.json"
+            if cand in expected_files:
+                return cand
+            return sorted(vs)[0]
+        # Not present in the index: still write a file so coverage can find it.
+        return direct
+
+    class _Writer:
+        __slots__ = ("path", "f", "first")
+        def __init__(self, path: Path):
+            self.path = path
+            self.f = open(path, "w", encoding="utf-8")
+            self.f.write('{"schema":"webglgta-ymap-entities-v1","entities":[\n')
+            self.first = True
+        def write_entity(self, obj: dict):
+            if not self.first:
+                self.f.write(",\n")
+            else:
+                self.first = False
+            self.f.write(json.dumps(obj, separators=(",", ":")))
+        def close(self):
+            try:
+                self.f.write("\n]}\n")
+            except Exception:
+                pass
+            try:
+                self.f.close()
+            except Exception:
+                pass
+
+    # LRU cache of open writers to avoid "too many open files".
+    max_open = 96
+    writers: "OrderedDict[str, _Writer]" = OrderedDict()
+    counts_by_file = {}
+    total_entities = 0
+
+    # Iterate streamed entities and append to per-YMAP files.
+    for p in sorted([q for q in chunks_dir.glob("*.jsonl") if q.is_file()], key=lambda q: q.name):
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                y = obj.get("ymap")
+                if not isinstance(y, str) or not y.strip():
+                    continue
+                fn = _choose_target_filename(y)
+                out_path = ent_dir / fn
+
+                w = writers.get(fn)
+                if w is None:
+                    # Evict LRU if needed.
+                    if len(writers) >= max_open:
+                        k0, w0 = writers.popitem(last=False)
+                        try:
+                            w0.close()
+                        except Exception:
+                            pass
+                    w = _Writer(out_path)
+                    writers[fn] = w
+                else:
+                    # Touch for LRU.
+                    writers.move_to_end(fn, last=True)
+
+                w.write_entity(obj)
+                counts_by_file[fn] = int(counts_by_file.get(fn) or 0) + 1
+                total_entities += 1
+
+    # Close remaining writers.
+    for _k, w in list(writers.items()):
+        try:
+            w.close()
+        except Exception:
+            pass
+    writers.clear()
+
+    # Ensure every indexed file exists (even if empty) so coverage reports are stable.
+    created_empty = 0
+    for fn in expected_files:
+        out_path = ent_dir / fn
+        if out_path.exists():
+            continue
+        try:
+            out_path.write_text('{"schema":"webglgta-ymap-entities-v1","entities":[]}\n', encoding="utf-8")
+            created_empty += 1
+        except Exception:
+            pass
+
+    # Patch ymap/index.json entityCount fields based on what we observed.
+    try:
+        changed = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            fn = str(r.get("file") or "").strip()
+            if not fn:
+                continue
+            c = int(counts_by_file.get(fn) or 0)
+            if int(r.get("entityCount") or 0) != c:
+                r["entityCount"] = c
+                changed += 1
+        if changed:
+            ymap_index_path.write_text(json.dumps(idx, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    # Patch entities_index.json counts so coverage tooling sees non-zero ymaps_processed/entities.
+    try:
+        idx_path = assets_dir / "entities_index.json"
+        if idx_path.exists():
+            ent_idx = json.loads(idx_path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(ent_idx, dict):
+                counts = ent_idx.get("counts")
+                if not isinstance(counts, dict):
+                    counts = {}
+                    ent_idx["counts"] = counts
+                counts["entities"] = int(total_entities)
+                counts["ymaps_processed"] = int(idx.get("numYmaps") or len(rows) or 0)
+                counts["chunks"] = int(len((ent_idx.get("chunks") or {})) if isinstance(ent_idx.get("chunks"), dict) else 0)
+                idx_path.write_text(json.dumps(ent_idx, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    print(f"Built assets/ymap/entities from streamed chunks: ymaps={len(expected_files)} entities={total_entities} empty_files={created_empty}")
+
+
+def _ensure_models_textures_index(assets_dir: Path) -> None:
+    """
+    Generate `assets/models_textures/index.json`.
+
+    Why:
+      - Some pipelines export only `models_textures/<hash>.png`
+      - Others export only `models_textures/<hash>_<slug>.png`
+      - Some export both
+
+    The viewer can always fall back from hash+slug -> hash-only, but without an index it cannot
+    reliably do the reverse when only slug variants exist. This index makes that deterministic.
+
+    Output schema (v1):
+      {
+        "schema": "webglgta-models-textures-index-v1",
+        "generatedAtUnix": <int>,
+        "byHash": {
+          "<hash>": {
+            "hash": "<hash>",
+            "hashOnly": <bool>,
+            "preferredFile": "<filename>",
+            "files": ["<filename>", ...]
+          },
+          ...
+        }
+      }
+    """
+    if not assets_dir.exists() or not assets_dir.is_dir():
+        return
+
+    def _write_index_for_dir(mdir: Path, *, create_if_missing: bool = False, exts: tuple[str, ...] = ("png", "dds")) -> None:
+        if not mdir.exists() or not mdir.is_dir():
+            if not create_if_missing:
+                return
+            try:
+                mdir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return
+
+        # Index is authoritative for what filename to request for a given hash.
+        ext_re = "|".join([re.escape(e) for e in exts])
+        re_hash_only = re.compile(rf"^(?P<hash>\d+)\.({ext_re})$", re.IGNORECASE)
+        re_hash_slug = re.compile(rf"^(?P<hash>\d+)_(?P<slug>[^/]+)\.({ext_re})$", re.IGNORECASE)
+
+        by_hash = {}
+
+        globs = []
+        for e in exts:
+            globs += list(mdir.glob(f"*.{e}"))
+        for p in sorted(globs):
+            name = p.name
+            m1 = re_hash_only.match(name)
+            m2 = re_hash_slug.match(name) if not m1 else None
+            if not (m1 or m2):
+                continue
+            h = (m1 or m2).group("hash")
+            ent = by_hash.get(h)
+            if ent is None:
+                ent = {"hash": str(h), "hashOnly": False, "preferredFile": None, "files": []}
+                by_hash[h] = ent
+            ent["files"].append(name)
+            if m1:
+                # Keep legacy meaning:
+                # - For PNG/DDS index: "hash-only PNG exists" (fast path in viewer)
+                # - For KTX2 index: "hash-only KTX2 exists"
+                if name.lower().endswith(".png") or name.lower().endswith(".ktx2"):
+                    ent["hashOnly"] = True
+
+        # Choose a stable preferred file per hash:
+        # - If hash-only exists, prefer it (common + fastest).
+        # - Else, pick the lexicographically-smallest slug variant for determinism.
+        for h, ent in by_hash.items():
+            files = list(ent.get("files") or [])
+            files.sort()
+            # Prefer hash-only when possible (fast path), otherwise stable smallest variant.
+            prefer_ext = None
+            for e in exts:
+                if str(e).lower() in ("png", "ktx2"):
+                    prefer_ext = str(e).lower()
+                    break
+            if prefer_ext:
+                ho = f"{h}.{prefer_ext}"
+                if ho in files:
+                    ent["preferredFile"] = ho
+                else:
+                    ent["preferredFile"] = files[0] if files else None
+            else:
+                ent["preferredFile"] = files[0] if files else None
+
+        out = {
+            "schema": "webglgta-models-textures-index-v1",
+            "generatedAtUnix": int(time.time()),
+            "byHash": by_hash,
+        }
+
+        out_path = mdir / "index.json"
+        tmp_path = mdir / "index.json.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, sort_keys=True)
+        tmp_path.replace(out_path)
+
+    mdir = assets_dir / "models_textures"
+    # Include all model-texture extensions the viewer can load.
+    _write_index_for_dir(mdir, create_if_missing=False, exts=("png", "dds", "jpg", "jpeg", "webp"))
+
+    # Optional: KTX2 (preferred GPU upload format when present).
+    #
+    # IMPORTANT:
+    # The viewer will opportunistically fetch `assets/models_textures_ktx2/index.json`.
+    # If it doesn't exist, browsers/dev-servers log a noisy 404 even though the resolver treats it as optional.
+    # Create an empty index + directory so the fetch is clean and pack-aware KTX2 resolution can still work.
+    mdir_k2 = assets_dir / "models_textures_ktx2"
+    _write_index_for_dir(mdir_k2, create_if_missing=True, exts=("ktx2",))
+
+    # Optional: generate indices for asset packs (base + DLC overlays) if configured.
+    # This is used by `TexturePathResolver` when `assets/asset_packs.json` exists.
+    try:
+        packs_path = assets_dir / "asset_packs.json"
+        if packs_path.exists():
+            cfg = json.loads(packs_path.read_text(encoding="utf-8", errors="ignore"))
+            packs = cfg.get("packs") if isinstance(cfg, dict) else None
+            if isinstance(packs, list):
+                for p in packs:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("enabled") is False:
+                        continue
+                    pid = str(p.get("id") or "").strip()
+                    if not pid:
+                        continue
+                    root_rel = str(p.get("rootRel") or p.get("root") or "").strip()
+                    if not root_rel:
+                        root_rel = f"packs/{pid}"
+                    root_rel = root_rel.strip("/").lstrip("/")
+                    pack_dir = assets_dir / root_rel / "models_textures"
+                    # IMPORTANT: create empty pack indices even when the pack has no exported textures yet.
+                    # This avoids noisy 404 spam in dev when TexturePathResolver probes pack indices.
+                    _write_index_for_dir(pack_dir, create_if_missing=True, exts=("png", "dds", "jpg", "jpeg", "webp"))
+                    pack_dir_k2 = assets_dir / root_rel / "models_textures_ktx2"
+                    _write_index_for_dir(pack_dir_k2, create_if_missing=True, exts=("ktx2",))
+    except Exception:
+        # Best-effort; ignore.
+        pass
+
+
 def _ensure_shader_param_name_map(assets_dir: Path) -> None:
     """
     Generate `assets/shader_param_names.json` by parsing CodeWalker's ShaderParamNames enum:
@@ -255,10 +790,20 @@ def _ensure_shader_param_name_map(assets_dir: Path) -> None:
         return
 
     # Locate CodeWalker source relative to this repo layout.
-    # repo_root/webgl/webgl_viewer/setup_assets.py -> repo_root/webgl/CodeWalker/...
+    # This repo may include either:
+    # - `webgl/CodeWalker/...` (older layout)
+    # - `webgl/CodeWalker-master/...` (current vendored layout)
     viewer_dir = Path(__file__).resolve().parent
-    codewalker_shaderparams = (viewer_dir.parent / "CodeWalker" / "CodeWalker.Core" / "GameFiles" / "Resources" / "ShaderParams.cs")
-    if not codewalker_shaderparams.exists():
+    candidates = [
+        (viewer_dir.parent / "CodeWalker" / "CodeWalker.Core" / "GameFiles" / "Resources" / "ShaderParams.cs"),
+        (viewer_dir.parent / "CodeWalker-master" / "CodeWalker.Core" / "GameFiles" / "Resources" / "ShaderParams.cs"),
+    ]
+    codewalker_shaderparams = None
+    for p in candidates:
+        if p.exists():
+            codewalker_shaderparams = p
+            break
+    if codewalker_shaderparams is None:
         # Allow running viewer without CodeWalker sources checked out.
         return
 
@@ -281,7 +826,7 @@ def _ensure_shader_param_name_map(assets_dir: Path) -> None:
         except Exception:
             pass
 
-    text = codewalker_shaderparams.read_text(encoding="utf-8", errors="ignore")
+    text = Path(codewalker_shaderparams).read_text(encoding="utf-8", errors="ignore")
     # Match lines like: "DiffuseSampler = 4059966321,"
     pat = re.compile(r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<val>\d+)\s*,\s*$", re.MULTILINE)
     by_hash = {}

@@ -19,6 +19,8 @@ let _concurrency = DEFAULT_CONCURRENCY;
 let _highShare = DEFAULT_HIGH_SHARE;
 let _activeHigh = 0;
 let _activeLow = 0;
+// Scheduler tie-break counter (used for deterministic weighted fairness when concurrency is tiny).
+let _laneCounter = 0;
 /** @type {Array<() => void>} */
 const _queueHigh = [];
 const _queueLow = [];
@@ -41,8 +43,8 @@ function _supportsDecompressionStream(kind) {
   }
 }
 
-async function _fetchAndDecompressToArrayBuffer(url, { usePersistentCache = true, priority = 'high', compression = 'gzip' } = {}) {
-  const resp = await _fetchResponse(url, { usePersistentCache, priority });
+async function _fetchAndDecompressToArrayBuffer(url, { usePersistentCache = true, priority = 'high', compression = 'gzip', signal = undefined } = {}) {
+  const resp = await _fetchResponse(url, { usePersistentCache, priority, signal });
   if (!resp.ok) return resp;
 
   // Prefer streaming decompression when available.
@@ -104,8 +106,24 @@ function _scheduleWithPriority(fn, priority) {
             if (!hasHigh) return _queueLow.shift();
             if (!hasLow) return _queueHigh.shift();
 
-            // Both lanes have backlog: reserve some capacity for high, but allow low to run up to maxLow.
+            // Both lanes have backlog:
+            // - Ensure high-priority can always claim its reserved share (avoid "high never starts" if low arrived first).
+            // - Still allow low-priority to make progress.
+            //
+            // With very small concurrency (e.g. 1), a pure "maxLow" gate can accidentally starve high (or low).
+            // Use deterministic weighted selection in that case.
+            if (_concurrency <= 1) {
+              const period = 100;
+              const highCutoff = Math.max(1, Math.min(period - 1, Math.round(period * _highShare)));
+              _laneCounter = (_laneCounter + 1) % period;
+              if (_laneCounter < highCutoff) return _queueHigh.shift();
+              return _queueLow.shift();
+            }
+
+            // Reserve some capacity for high, but allow low to run up to maxLow concurrent tasks.
             const maxLow = Math.max(1, Math.floor(_concurrency * (1.0 - _highShare)));
+            const minHigh = Math.max(1, _concurrency - maxLow);
+            if (_activeHigh < minHigh) return _queueHigh.shift();
             if (_activeLow < maxLow) return _queueLow.shift();
             return _queueHigh.shift();
           };
@@ -131,8 +149,20 @@ function _scheduleWithPriority(fn, priority) {
         return;
       }
 
+      // If we have spare capacity but high is queued, prefer filling reserved high capacity
+      // before letting new low work start.
+      if (_concurrency <= 1) {
+        run();
+        return;
+      }
+
       const maxLow = Math.max(1, Math.floor(_concurrency * (1.0 - _highShare)));
-      if (_activeLow < maxLow) {
+      const minHigh = Math.max(1, _concurrency - maxLow);
+      if (_activeHigh < minHigh) {
+        const nextHigh = _queueHigh.shift();
+        if (nextHigh) nextHigh();
+        // Queue this low request below.
+      } else if (_activeLow < maxLow) {
         run();
         return;
       }
@@ -152,7 +182,7 @@ async function _getCache() {
   }
 }
 
-async function _fetchResponse(url, { usePersistentCache = true, priority = 'high' } = {}) {
+async function _fetchResponse(url, { usePersistentCache = true, priority = 'high', signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchResponse: empty url');
 
@@ -165,12 +195,26 @@ async function _fetchResponse(url, { usePersistentCache = true, priority = 'high
   }
 
   // Avoid "too many outstanding requests" by limiting concurrency.
-  const resp = await _scheduleWithPriority(() => fetch(u), priority);
+  // If a caller provides an AbortSignal, respect it:
+  // - If it's already aborted, fail fast.
+  // - Pass it through to fetch() so the browser can abort the request.
+  if (signal?.aborted) {
+    // Match fetch() AbortError shape as closely as possible.
+    throw new DOMException('Aborted', 'AbortError');
+  }
+  const resp = await _scheduleWithPriority(() => fetch(u, signal ? { signal } : undefined), priority);
   if (!resp.ok) return resp;
 
   if (cache) {
     try {
-      await cache.put(u, resp.clone());
+      // Avoid poisoning Cache Storage with HTML fallback responses (common with SPA/static hosts).
+      // If an asset URL (like a texture) is missing and the server returns index.html with 200,
+      // caching it will make future loads "succeed" at the network layer but fail at decode time.
+      const ct = String(resp.headers?.get?.('content-type') || '').toLowerCase();
+      const looksHtml = ct.includes('text/html') || ct.includes('application/xhtml');
+      if (!looksHtml) {
+        await cache.put(u, resp.clone());
+      }
     } catch {
       // Ignore quota/put errors.
     }
@@ -198,6 +242,21 @@ export async function clearAssetCacheStorage() {
   }
 }
 
+export async function deleteAssetCacheEntry(url) {
+  // Remove a single URL from Cache Storage (best-effort).
+  // Useful when an entry becomes corrupted (e.g. Content-Length mismatch / truncated body).
+  const u = String(url || '');
+  if (!u) return false;
+  if (!_supportsCacheStorage()) return false;
+  try {
+    const cache = await _getCache();
+    if (!cache) return false;
+    return await cache.delete(u);
+  } catch {
+    return false;
+  }
+}
+
 export function clearAssetMemoryCaches() {
   try {
     _memJson.clear();
@@ -211,28 +270,34 @@ export function clearAssetMemoryCaches() {
   }
 }
 
-export async function fetchJSON(url, { usePersistentCache = true, useMemoryCache = true, priority = 'high' } = {}) {
+export async function fetchJSON(url, { usePersistentCache = true, useMemoryCache = true, priority = 'high', signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchJSON: empty url');
-  if (useMemoryCache && _memJson.has(u)) return _memJson.get(u);
+  // When a caller provides an AbortSignal, treat this request as "caller-owned":
+  // - skip global inflight de-dupe (otherwise one caller aborting could disrupt others)
+  // - skip memory caching (to avoid "aborted but cached" edge cases)
+  const callerOwned = !!signal;
+  if (!callerOwned && useMemoryCache && _memJson.has(u)) return _memJson.get(u);
 
   const inflightKey = `json:${u}`;
-  const existing = _inflight.get(inflightKey);
-  if (existing) return await existing;
+  if (!callerOwned) {
+    const existing = _inflight.get(inflightKey);
+    if (existing) return await existing;
+  }
 
   const p = (async () => {
-    const resp = await _fetchResponse(u, { usePersistentCache, priority });
+    const resp = await _fetchResponse(u, { usePersistentCache, priority, signal });
     if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
     const data = await resp.json();
-    if (useMemoryCache) _memJson.set(u, data);
+    if (!callerOwned && useMemoryCache) _memJson.set(u, data);
     return data;
   })();
 
-  _inflight.set(inflightKey, p);
+  if (!callerOwned) _inflight.set(inflightKey, p);
   try {
     return await p;
   } finally {
-    _inflight.delete(inflightKey);
+    if (!callerOwned) _inflight.delete(inflightKey);
   }
 }
 
@@ -243,22 +308,23 @@ export async function fetchJSON(url, { usePersistentCache = true, useMemoryCache
  * - decompression isn't supported
  * - decompression/parsing fails
  */
-export async function fetchJSONPreferredCompressed(url, { usePersistentCache = true, useMemoryCache = true, priority = 'high' } = {}) {
+export async function fetchJSONPreferredCompressed(url, { usePersistentCache = true, useMemoryCache = true, priority = 'high', signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchJSONPreferredCompressed: empty url');
-  if (useMemoryCache && _memJson.has(u)) return _memJson.get(u);
+  const callerOwned = !!signal;
+  if (!callerOwned && useMemoryCache && _memJson.has(u)) return _memJson.get(u);
 
   // Only try gzip if the runtime can actually decode it.
   const canGzip = _supportsDecompressionStream('gzip');
   if (canGzip) {
     try {
       const gzUrl = `${u}.gz`;
-      const ab = await _fetchAndDecompressToArrayBuffer(gzUrl, { usePersistentCache, priority, compression: 'gzip' });
+      const ab = await _fetchAndDecompressToArrayBuffer(gzUrl, { usePersistentCache, priority, compression: 'gzip', signal });
       // If _fetchAndDecompressToArrayBuffer returned a Response (non-ok), it'll throw above; keep defensive.
       if (ab && ab.byteLength !== undefined) {
         const text = new TextDecoder().decode(new Uint8Array(ab));
         const data = JSON.parse(text);
-        if (useMemoryCache) _memJson.set(u, data);
+        if (!callerOwned && useMemoryCache) _memJson.set(u, data);
         return data;
       }
     } catch {
@@ -266,30 +332,37 @@ export async function fetchJSONPreferredCompressed(url, { usePersistentCache = t
     }
   }
 
-  return await fetchJSON(u, { usePersistentCache, useMemoryCache, priority });
+  return await fetchJSON(u, { usePersistentCache, useMemoryCache, priority, signal });
 }
 
-export async function fetchText(url, { usePersistentCache = true, priority = 'high' } = {}) {
+export async function fetchText(url, { usePersistentCache = true, priority = 'high', signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchText: empty url');
 
+  const callerOwned = !!signal;
   const inflightKey = `text:${u}`;
-  const existing = _inflight.get(inflightKey);
-  if (existing) return await existing;
+  if (!callerOwned) {
+    const existing = _inflight.get(inflightKey);
+    if (existing) return await existing;
+  }
 
   const p = (async () => {
-    const resp = await _fetchResponse(u, { usePersistentCache, priority });
+    const resp = await _fetchResponse(u, { usePersistentCache, priority, signal });
     if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
     return await resp.text();
   })();
 
-  _inflight.set(inflightKey, p);
+  if (!callerOwned) _inflight.set(inflightKey, p);
   try {
     return await p;
   } finally {
-    _inflight.delete(inflightKey);
+    if (!callerOwned) _inflight.delete(inflightKey);
   }
 }
+
+// NOTE: `fetchArrayBuffer()` already exists later in this file (back-compat signature),
+// along with `fetchArrayBufferWithPriority()` and `fetchArrayBufferPreferredCompressed()`.
+// Keep a single definition to avoid "Identifier has already been declared" at module parse time.
 
 /**
  * Stream-parse NDJSON/JSONL from a URL and invoke onObject(obj) for each parsed JSON object.
@@ -302,17 +375,20 @@ export async function fetchText(url, { usePersistentCache = true, priority = 'hi
  * Notes:
  * - Still parses JSON on the main thread. For extreme loads, move parsing into a Web Worker.
  */
-export async function fetchNDJSON(url, { usePersistentCache = true, priority = 'high', onObject } = {}) {
+export async function fetchNDJSON(url, { usePersistentCache = true, priority = 'high', onObject, signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchNDJSON: empty url');
   if (typeof onObject !== 'function') throw new Error('fetchNDJSON: onObject callback is required');
 
+  const callerOwned = !!signal;
   const inflightKey = `ndjson:${u}`;
-  const existing = _inflight.get(inflightKey);
-  if (existing) return await existing;
+  if (!callerOwned) {
+    const existing = _inflight.get(inflightKey);
+    if (existing) return await existing;
+  }
 
   const p = (async () => {
-    const resp = await _fetchResponse(u, { usePersistentCache, priority });
+    const resp = await _fetchResponse(u, { usePersistentCache, priority, signal });
     if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
 
     // Streaming path (modern browsers).
@@ -324,6 +400,10 @@ export async function fetchNDJSON(url, { usePersistentCache = true, priority = '
       let parsed = 0;
 
       while (true) {
+        if (signal?.aborted) {
+          try { await reader.cancel(); } catch { /* ignore */ }
+          throw new DOMException('Aborted', 'AbortError');
+        }
         const { value, done } = await reader.read();
         if (value) buf += decoder.decode(value, { stream: !done });
 
@@ -360,6 +440,7 @@ export async function fetchNDJSON(url, { usePersistentCache = true, priority = '
     const text = await resp.text();
     let parsed = 0;
     for (const line of text.split('\n')) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const s = (line || '').trim();
       if (!s) continue;
       try {
@@ -372,11 +453,11 @@ export async function fetchNDJSON(url, { usePersistentCache = true, priority = '
     return { parsed };
   })();
 
-  _inflight.set(inflightKey, p);
+  if (!callerOwned) _inflight.set(inflightKey, p);
   try {
     return await p;
   } finally {
-    _inflight.delete(inflightKey);
+    if (!callerOwned) _inflight.delete(inflightKey);
   }
 }
 
@@ -390,18 +471,22 @@ export async function fetchNDJSON(url, { usePersistentCache = true, priority = '
  * - Uses the same concurrency limiting + optional CacheStorage as other fetch helpers.
  * - onChunk is called with Uint8Array views; callers can transfer chunk.buffer.
  */
-export async function fetchStreamBytes(url, { usePersistentCache = true, priority = 'high', onChunk } = {}) {
+export async function fetchStreamBytes(url, { usePersistentCache = true, priority = 'high', onChunk, signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchStreamBytes: empty url');
   if (typeof onChunk !== 'function') throw new Error('fetchStreamBytes: onChunk callback is required');
 
-  const resp = await _fetchResponse(u, { usePersistentCache, priority });
+  const resp = await _fetchResponse(u, { usePersistentCache, priority, signal });
   if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
 
   const body = resp.body;
   if (body && typeof body.getReader === 'function') {
     const reader = body.getReader();
     while (true) {
+      if (signal?.aborted) {
+        try { await reader.cancel(); } catch { /* ignore */ }
+        throw new DOMException('Aborted', 'AbortError');
+      }
       const { value, done } = await reader.read();
       if (value && value.byteLength) onChunk(value);
       if (done) break;
@@ -410,52 +495,59 @@ export async function fetchStreamBytes(url, { usePersistentCache = true, priorit
   }
 
   // Fallback: no streaming body available.
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const buf = await resp.arrayBuffer();
   onChunk(new Uint8Array(buf));
 }
 
-export async function fetchArrayBuffer(url, { usePersistentCache = true } = {}) {
+export async function fetchArrayBuffer(url, { usePersistentCache = true, signal = undefined } = {}) {
   // Back-compat: keep signature stable; treat as high priority by default.
   const u = String(url || '');
   if (!u) throw new Error('fetchArrayBuffer: empty url');
 
+  const callerOwned = !!signal;
   const inflightKey = `ab:${u}`;
-  const existing = _inflight.get(inflightKey);
-  if (existing) return await existing;
+  if (!callerOwned) {
+    const existing = _inflight.get(inflightKey);
+    if (existing) return await existing;
+  }
 
   const p = (async () => {
-    const resp = await _fetchResponse(u, { usePersistentCache, priority: 'high' });
+    const resp = await _fetchResponse(u, { usePersistentCache, priority: 'high', signal });
     if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
     return await resp.arrayBuffer();
   })();
 
-  _inflight.set(inflightKey, p);
+  if (!callerOwned) _inflight.set(inflightKey, p);
   try {
     return await p;
   } finally {
-    _inflight.delete(inflightKey);
+    if (!callerOwned) _inflight.delete(inflightKey);
   }
 }
 
-export async function fetchArrayBufferWithPriority(url, { usePersistentCache = true, priority = 'high' } = {}) {
+export async function fetchArrayBufferWithPriority(url, { usePersistentCache = true, priority = 'high', signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchArrayBufferWithPriority: empty url');
 
+  const callerOwned = !!signal;
   const inflightKey = `abp:${priority}:${u}`;
-  const existing = _inflight.get(inflightKey);
-  if (existing) return await existing;
+  if (!callerOwned) {
+    const existing = _inflight.get(inflightKey);
+    if (existing) return await existing;
+  }
 
   const p = (async () => {
-    const resp = await _fetchResponse(u, { usePersistentCache, priority });
+    const resp = await _fetchResponse(u, { usePersistentCache, priority, signal });
     if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
     return await resp.arrayBuffer();
   })();
 
-  _inflight.set(inflightKey, p);
+  if (!callerOwned) _inflight.set(inflightKey, p);
   try {
     return await p;
   } finally {
-    _inflight.delete(inflightKey);
+    if (!callerOwned) _inflight.delete(inflightKey);
   }
 }
 
@@ -463,7 +555,7 @@ export async function fetchArrayBufferWithPriority(url, { usePersistentCache = t
  * Prefer a gzip sidecar (`<url>.gz`) when supported, else fall back to the raw URL.
  * Useful for large `.bin` or `.json` payloads that we want to ship pre-compressed without relying on server headers.
  */
-export async function fetchArrayBufferPreferredCompressed(url, { usePersistentCache = true, priority = 'high' } = {}) {
+export async function fetchArrayBufferPreferredCompressed(url, { usePersistentCache = true, priority = 'high', signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchArrayBufferPreferredCompressed: empty url');
 
@@ -471,35 +563,38 @@ export async function fetchArrayBufferPreferredCompressed(url, { usePersistentCa
   if (canGzip) {
     try {
       const gzUrl = `${u}.gz`;
-      const ab = await _fetchAndDecompressToArrayBuffer(gzUrl, { usePersistentCache, priority, compression: 'gzip' });
+      const ab = await _fetchAndDecompressToArrayBuffer(gzUrl, { usePersistentCache, priority, compression: 'gzip', signal });
       if (ab && ab.byteLength !== undefined) return ab;
     } catch {
       // Fall back to raw URL.
     }
   }
 
-  return await fetchArrayBufferWithPriority(u, { usePersistentCache, priority });
+  return await fetchArrayBufferWithPriority(u, { usePersistentCache, priority, signal });
 }
 
-export async function fetchBlob(url, { usePersistentCache = true, priority = 'high' } = {}) {
+export async function fetchBlob(url, { usePersistentCache = true, priority = 'high', signal = undefined } = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchBlob: empty url');
 
+  const callerOwned = !!signal;
   const inflightKey = `blob:${u}`;
-  const existing = _inflight.get(inflightKey);
-  if (existing) return await existing;
+  if (!callerOwned) {
+    const existing = _inflight.get(inflightKey);
+    if (existing) return await existing;
+  }
 
   const p = (async () => {
-    const resp = await _fetchResponse(u, { usePersistentCache, priority });
+    const resp = await _fetchResponse(u, { usePersistentCache, priority, signal });
     if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
     return await resp.blob();
   })();
 
-  _inflight.set(inflightKey, p);
+  if (!callerOwned) _inflight.set(inflightKey, p);
   try {
     return await p;
   } finally {
-    _inflight.delete(inflightKey);
+    if (!callerOwned) _inflight.delete(inflightKey);
   }
 }
 

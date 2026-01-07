@@ -40,6 +40,32 @@ Or use the environment variable in the `.env` file:
 python gta5_terrain_extractor.py
 ```
 
+### Linux: wrappers for export + hosted viewer
+
+This repo includes Linux-friendly wrapper scripts under `webgl-gta/scripts/`.
+They default your GTA root to **`/data/webglgta/gta5`** (see `env.local`) and can be overridden via env vars.
+
+- **Export + setup viewer assets**:
+
+```bash
+cd webgl-gta
+./scripts/linux_export_and_setup_assets.sh
+```
+
+- **Full export (models + textures + materials/shader fields)**:
+
+```bash
+cd webgl-gta
+./scripts/linux_full_export_models_textures_materials.sh
+```
+
+- **Build + preview viewer (hosting-friendly)**:
+
+```bash
+cd webgl-gta
+WEBGL_VIEWER_HOST=0.0.0.0 WEBGL_VIEWER_PORT=4173 ./scripts/linux_viewer_build_preview.sh
+```
+
 ### Command Line Arguments
 
 - `--game-path`: Path to GTA 5 or FiveM game directory (overrides .env)
@@ -70,6 +96,14 @@ The application leverages CodeWalker's capabilities to read and process GTA 5 fi
 4. **Export Module**: Exports the terrain as OBJ files for use in 3D modeling software
 
 For more details on the implementation, see the [documentation](docs/README.md).
+
+### WebGL viewer pipeline + texture parity docs
+
+If you're debugging “placeholder textures”, missing model texture exports, or CodeWalker parity issues, start here:
+
+- `webgl-gta/docs/PIPELINE_REPAIR_GUIDE_WEBGL_VIEWER.md`
+- `webgl-gta/docs/texture_pipeline_review.md`
+- `webgl-gta/webgl_viewer/TEXTURE_NAMING_AND_DISCREPANCIES.md`
 
 ## File Locations
 

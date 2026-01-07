@@ -155,6 +155,42 @@ There are two different notions of coverage:
     - `unknownMetaEntities / unknownMetaArchetypes` (shards not loaded yet)
     - `droppedInstances / droppedArchetypes` (capped by current streaming limits)
 
+### Practical “production checks” (scripts)
+
+Use these when your goal is **GTA-like rendering completeness** (not “debug visuals”):
+
+- **Entity/YMAP chunk integrity** (catches missing chunk files / bad counts):
+  - `python3 webgl-gta/verify_entities_index.py --assets-dir webgl-gta/webgl_viewer/assets`
+
+- **Missing meshes (map placements that don’t resolve to exported drawables)**:
+  - `python3 webgl-gta/report_missing_meshes.py --assets-dir webgl-gta/webgl_viewer/assets --top 50`
+
+- **Missing model textures (stop 404s / placeholders from missing YTD exports)**:
+  - `python3 webgl-gta/webgl_viewer/tools/repair_missing_model_textures.py --gta-path /data/webglgta/gta5 --assets-dir webgl-gta/webgl_viewer/assets --selected-dlc all`
+
+- **One-shot world coverage summary (sampled)**:
+  - `python3 webgl-gta/report_world_coverage.py --assets-dir webgl-gta/webgl_viewer/assets`
+  - Add `--chunk-limit 0 --max-entities 0` for a full scan (can be slow).
+
+### Interiors parity (what matters most vs CodeWalker)
+
+CodeWalker’s renderer treats interiors (MLOs) as a special case:
+
+- **MLO instances are “container entities”**: when an entity is an MLO (`ent.IsMlo`), CodeWalker adds its
+  children from `ent.MloInstance.Entities` *and also* `ent.MloInstance.EntitySets` (but only when a set is
+  `VisibleOrForced`).
+- **Entity-set gating**: CodeWalker uses `VisibleOrForced` (visible flag OR `ForceVisible`) on each entity set.
+- **Proxy filtering**: CodeWalker filters out reflection/shadow proxy entities unless `renderproxies` is enabled.
+
+In the WebGL viewer we currently approximate interiors in `DrawableStreamer`:
+
+- **Active-interior selection**: detect if the camera is inside any exported room AABB for an MLO instance.
+- **Room gating**: BFS over portals from the current room (`interiorPortalDepth`) to decide visible rooms.
+- **Entity-set gating**: optional toggles per `(parentGuid, setHash)` to hide/show entity-set children.
+
+If interior meshes are missing from the world, it’s usually **export coverage** (missing archetypes), not
+the gating logic itself: see `report_missing_meshes.py` + `export_drawables_from_list.py`.
+
 ---
 
 ## Prioritized backlog (highest ROI next steps)

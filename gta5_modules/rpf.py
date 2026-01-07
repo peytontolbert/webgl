@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 
 from .rpf_reader import RpfReader
+from .dll_manager import canonicalize_cw_path
 from .meta import Meta
 from .ddsio import DDSIO
 
@@ -109,7 +110,7 @@ class RpfManager:
     def get_file(self, path: str) -> Optional[bytes]:
         """Get file data from RPF archives"""
         try:
-            return self.rpf_reader.rpf_manager.GetFileData(path)
+            return self.rpf_reader.rpf_manager.GetFileData(canonicalize_cw_path(path, keep_forward_slashes=True))
         except Exception as e:
             logger.error(f"Error getting file {path}: {e}")
             return None
@@ -159,13 +160,13 @@ class RpfManager:
         """
         try:
             # Try to get from game cache first
-            ymap = self.rpf_reader.game_cache.GetYmap(path)
+            ymap = self.rpf_reader.game_cache.GetYmap(canonicalize_cw_path(path, keep_forward_slashes=True))
             if ymap:
                 logger.info(f"Loaded YMAP from cache: {path}")
                 return ymap
                 
             # If not in cache, try to load directly using RpfManager
-            entry = self.rpf_reader.rpf_manager.GetEntry(path)
+            entry = self.rpf_reader.rpf_manager.GetEntry(canonicalize_cw_path(path, keep_forward_slashes=True))
             if entry:
                 ymap = self.rpf_reader.rpf_manager.GetFile[self.rpf_reader.YmapFile](entry)
                 if ymap:

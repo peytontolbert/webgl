@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Optional, Set, Tuple
 
+from .dll_manager import canonicalize_cw_path
 
 def sha1_hex(data: bytes) -> str:
     h = hashlib.sha1()
@@ -132,7 +133,7 @@ def write_vfs_snapshot_index(
             if hash_first_n > 0 and hashed < int(hash_first_n):
                 try:
                     # GetFileData returns decompressed bytes; this is the "logical file" content.
-                    data = rpf_manager.GetFileData(pathl)
+                    data = rpf_manager.GetFileData(canonicalize_cw_path(pathl, keep_forward_slashes=True))
                     b = bytes(data) if data else b""
                     rec["source_size"] = int(len(b))
                     rec["source_sha1"] = sha1_hex(b)

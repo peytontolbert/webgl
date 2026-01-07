@@ -21,6 +21,26 @@ from System import Action
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def canonicalize_cw_path(path: str, *, keep_forward_slashes: bool = True) -> str:
+    """
+    Canonicalize a CodeWalker "virtual path" string so it works reliably on Linux/pythonnet.
+
+    Key rules:
+    - Collapse accidental double-backslashes (common when using raw strings like r"common.rpf\\data\\...").
+    - Optionally preserve forward slashes (for mixed physical-prefix keys like:
+        "/gta/root/update/update.rpf\\common\\data\\...").
+      Default keeps forward slashes.
+    """
+    s = str(path or "").strip()
+    if not s:
+        return ""
+    if not keep_forward_slashes:
+        s = s.replace("/", "\\")
+    while "\\\\" in s:
+        s = s.replace("\\\\", "\\")
+    return s
+
 class DllManager:
     """Manages CodeWalker DLL integration and shared resources"""
     
@@ -43,6 +63,29 @@ class DllManager:
             return
             
         self.game_path = Path(game_path)
+        # Keep a string form for passing into CodeWalker APIs that may be Windows-path oriented.
+        # On Linux, some CodeWalker routines append "\\gta5.exe" to the provided folder path.
+        # If the folder path does not end with a "/" separator, that produces:
+        #   /some/path\gta5.exe
+        # which is NOT a valid path on POSIX. Adding a trailing "/" yields:
+        #   /some/path/\gta5.exe
+        # which can be satisfied (this repo's GTA root includes a `\\gta5.exe` symlink).
+        self._game_path_for_keys = str(self.game_path)
+        if os.name != "nt":
+            try:
+                self._game_path_for_keys = self._game_path_for_keys.rstrip("/") + "/"
+            except Exception:
+                pass
+
+        # Linux compatibility: CodeWalker uses Windows-style relative paths for some well-known files,
+        # e.g. "update\\update.rpf" and "\\gta5.exe". On POSIX filesystems those backslashes are
+        # treated as literal characters, so the simplest non-invasive fix is to provide symlinks
+        # with those literal names.
+        if os.name != "nt":
+            try:
+                self._ensure_linux_backslash_compat_symlinks()
+            except Exception:
+                pass
         self.initialized = False
         self.dll = None
         
@@ -84,6 +127,15 @@ class DllManager:
         self._watermap_inited = False
         
         self._initialized = True
+
+        # Diagnostics captured during GameFileCache init (best-effort).
+        # These are useful to understand whether CodeWalker is skipping content due to unsupported formats.
+        self.gfc_nonfatal_rpf7_entry_errors: int = 0
+        self.gfc_nonmeta_ytyp_files: list[str] = []
+        # Best-effort fallback archetype map for YTYP files CodeWalker couldn't parse as Meta/PSO during Init().
+        # Key: archetype hash (u32), Value: CodeWalker.GameFiles.Archetype instance.
+        self._nonmeta_ytyp_archetypes_by_hash: dict[int, Any] = {}
+        self._nonmeta_ytyp_fallback_built: bool = False
         
     def _load_dll(self) -> bool:
         """Load the GTA5 DLL"""
@@ -104,7 +156,9 @@ class DllManager:
                 RpfManager, HeightmapFile, GTA5Keys,
                 RpfFile, RpfFileEntry, GameFileCache,
                 YtdFile, YmapFile, YdrFile,
-                WatermapFile, YnvFile, YndFile
+                YtypFile,
+                WatermapFile, YnvFile, YndFile,
+                CacheDatFile,
             )
             from CodeWalker.World import (
                 Heightmaps, Entity, Space, Water,
@@ -122,9 +176,11 @@ class DllManager:
             self.YtdFile = YtdFile
             self.YmapFile = YmapFile
             self.YdrFile = YdrFile
+            self.YtypFile = YtypFile
             self.WatermapFile = WatermapFile
             self.YnvFile = YnvFile
             self.YndFile = YndFile
+            self.CacheDatFile = CacheDatFile
 
             # Utility helpers
             # DDSIO is used to decode CodeWalker texture objects into RGBA pixel buffers.
@@ -157,7 +213,77 @@ class DllManager:
             
             # Initialize components in correct order
             # 1. Initialize GTA5Keys first - this sets up all encryption keys
-            self.GTA5Keys.LoadFromPath(str(self.game_path))
+            #
+            # IMPORTANT (Linux):
+            # Some CodeWalker builds construct exe paths using Windows separators, e.g.:
+            #   folder + "\\gta5.exe"
+            # which becomes "/data/.../gta5\\gta5.exe" and fails on POSIX file APIs.
+            # Work around this by ALWAYS calling LoadFromPath with a POSIX-safe trailing "/" folder path.
+            #
+            # Additionally, if we can locate an actual GTA5*.exe file, attempt UseMagicData first as a best-effort
+            # (some CodeWalker builds accept it and it avoids the folder+"\\gta5.exe" construction entirely).
+            exe_override = (os.getenv("GTA5_EXE_PATH") or os.getenv("GTA5_EXE") or "").strip().strip('"').strip("'")
+            exe_path: Optional[Path] = None
+            if exe_override:
+                exe_path = Path(exe_override)
+            else:
+                # Case-insensitive scan for an exe in the GTA root (Linux FS may preserve case).
+                try:
+                    for p in self.game_path.iterdir():
+                        if not p.is_file():
+                            continue
+                        name_l = p.name.lower()
+                        if name_l in ("gta5.exe", "gta5_enhanced.exe") or (name_l.startswith("gta5") and name_l.endswith(".exe")):
+                            exe_path = p
+                            break
+                except Exception:
+                    exe_path = None
+
+            # Decide Gen9 mode (Enhanced / g9ec content). This affects how CodeWalker interprets some archives.
+            def _infer_gtagen9() -> bool:
+                try:
+                    v = str(os.getenv("GTA5_GEN9", "") or os.getenv("GTA5_GTAGEN9", "") or "").strip().lower()
+                    if v in ("1", "true", "yes", "on"):
+                        return True
+                    if v in ("0", "false", "no", "off"):
+                        return False
+                except Exception:
+                    pass
+                # Heuristic 1: enhanced exe present.
+                try:
+                    for p in self.game_path.iterdir():
+                        if not p.is_file():
+                            continue
+                        nl = p.name.lower()
+                        if nl in ("gta5_enhanced.exe", "gta5enhanced.exe"):
+                            return True
+                except Exception:
+                    pass
+                # Heuristic 2: g9ec dlc packs exist.
+                try:
+                    dlc_dir = self.game_path / "update" / "x64" / "dlcpacks"
+                    if dlc_dir.exists():
+                        for p in dlc_dir.iterdir():
+                            if p.is_dir() and "g9ec" in p.name.lower():
+                                return True
+                except Exception:
+                    pass
+                return False
+
+            self._gtagen9 = bool(_infer_gtagen9())
+
+            if exe_path is not None and exe_path.exists():
+                try:
+                    # Signature (CodeWalker): UseMagicData(string path, bool gen9, string key)
+                    self.GTA5Keys.UseMagicData(str(exe_path), bool(self._gtagen9), "")
+                except Exception:
+                    # Ignore and fall back to LoadFromPath below.
+                    pass
+
+            # Always do the LoadFromPath call with a POSIX-safe folder string.
+            # On Linux, this makes CodeWalker attempt "<folder>/\\gta5.exe" (note the slash),
+            # which matches the common workaround symlink file name "\\gta5.exe" inside the GTA root.
+            self.GTA5Keys.LoadFromPath(str(self._game_path_for_keys))
             
             # 2. Initialize GameFileCache with required parameters
             # - size: 2GB cache size (2 * 1024 * 1024 * 1024)
@@ -171,7 +297,7 @@ class DllManager:
                 2 * 1024 * 1024 * 1024,  # 2GB cache size
                 3600,                     # 1 hour cache time
                 str(self.game_path),      # GTA5 folder
-                False,                    # gen9
+                bool(self._gtagen9),      # gen9
                 "",                       # dlc
                 False,                    # mods
                 ""                        # excludeFolders
@@ -185,7 +311,17 @@ class DllManager:
                 logger.info(f"RpfManager: {msg}")
                 
             def error_log(msg: str):
-                logger.error(f"RpfManager: {msg}")
+                m = str(msg or "")
+                # CodeWalker sometimes emits non-fatal scan errors for individual entries.
+                # These should not be treated as "pipeline failed", and logging them as ERROR
+                # is noisy in long-running export runs.
+                if "Error in RPF7 file entry" in m:
+                    logger.warning(f"RpfManager: (non-fatal) {m}")
+                    return
+                if "ytyp file was not in meta format" in m:
+                    logger.warning(f"RpfManager: (non-fatal) {m}")
+                    return
+                logger.error(f"RpfManager: {m}")
                 
             # Convert callbacks to .NET Action delegates
             update_status_action = Action[str](update_status)
@@ -195,7 +331,7 @@ class DllManager:
             self.rpf_manager = RpfManager()
             self.rpf_manager.Init(
                 str(self.game_path),  # folder path
-                False,                # gen9 (not needed for our use case)
+                bool(self._gtagen9),  # gen9
                 update_status_action, # status callback
                 error_log_action,     # error callback
                 False,                # rootOnly (we want all directories)
@@ -215,6 +351,150 @@ class DllManager:
             logger.error(f"Error loading DLL: {e}")
             return False
 
+    def _ensure_linux_backslash_compat_symlinks(self) -> None:
+        """
+        Best-effort creation of Linux symlinks that emulate CodeWalker's Windows-style path expectations.
+
+        Why:
+        - CodeWalker sometimes looks up files using paths like:
+            "<gta_root>\\gta5.exe"
+            "<gta_root>\\update\\update.rpf"
+          On Linux those are literal backslashes, not separators, so the filesystem lookup fails
+          unless those literal names exist.
+
+        This function creates:
+        - "<gta_root>\\gta5.exe" -> "<gta_root>/GTA5.exe" (or gta5.exe if present)
+        - (optional) "<gta_root>/update\\update.rpf" -> "<gta_root>/update/update.rpf"
+        - (optional) "<gta_root>/update.rpf" -> "<gta_root>/update/update.rpf" (some code paths probe this name)
+
+        If creation fails (permissions, existing file, etc.), it silently continues.
+        """
+        root = self.game_path
+        if not root.exists() or not root.is_dir():
+            return
+
+        def _safe_symlink(link_path: Path, target_path: Path) -> None:
+            try:
+                if link_path.exists() or link_path.is_symlink():
+                    return
+                # Ensure parent exists (for odd names like "update\\update.rpf" the parent is still root).
+                link_path.parent.mkdir(parents=True, exist_ok=True)
+                link_path.symlink_to(target_path)
+            except Exception:
+                return
+
+        def _safe_hardlink_or_symlink(link_path: Path, target_path: Path) -> None:
+            """
+            Prefer a hardlink (POSIX) when possible, falling back to a symlink.
+
+            Rationale:
+            - We have observed some CodeWalker+Mono builds behaving poorly when opening large RPFs via a symlink path
+              (spurious "Error in RPF7 file entry" during scan). A hardlink avoids the symlink code path entirely.
+            - Hardlinks require same filesystem and a regular file target.
+            """
+            try:
+                if link_path.exists() or link_path.is_symlink():
+                    # If it's a symlink, try to replace it with a hardlink (best-effort).
+                    try:
+                        if link_path.is_symlink():
+                            link_path.unlink()
+                        else:
+                            return
+                    except Exception:
+                        return
+
+                link_path.parent.mkdir(parents=True, exist_ok=True)
+                # Hardlink attempt first (only works for regular files on same FS).
+                try:
+                    if target_path.is_file():
+                        os.link(str(target_path), str(link_path))
+                        return
+                except Exception:
+                    pass
+                # Fallback: symlink.
+                try:
+                    link_path.symlink_to(target_path)
+                except Exception:
+                    return
+            except Exception:
+                return
+
+        # 1) \\gta5.exe symlink in the game root
+        try:
+            exe_target = None
+            for nm in ("gta5.exe", "GTA5.exe"):
+                p = root / nm
+                if p.exists():
+                    exe_target = p
+                    break
+            if exe_target is not None:
+                # Literal filename starting with backslash.
+                _safe_symlink(root / "\\gta5.exe", exe_target)
+        except Exception:
+            pass
+
+        # 2) update\\update.rpf symlink (literal backslash in filename) in the game root,
+        # pointing at the real update/update.rpf.
+        try:
+            # IMPORTANT (Linux):
+            # CodeWalker commonly probes "update\\update.rpf" (Windows separators). On POSIX, that is a *literal*
+            # backslash in the filename, so it won't resolve unless we provide an alias.
+            #
+            # In practice, creating these aliases can be harmful because CodeWalker scans `*.rpf` recursively.
+            # If a backslash-named alias exists in the game root, it will be scanned as an extra RPF and can
+            # produce noisy (and sometimes misleading) warnings like "Error in RPF7 file entry.".
+            #
+            # Therefore we default to NOT creating these aliases. If you hit a build that truly requires them
+            # (eg failing to load `update\\update.rpf\\common\\data\\dlclist.xml`), you can opt-in via env var.
+            enable_bslash = str(os.getenv("GTA5_ENABLE_BACKSLASH_UPDATE_RPF_ALIAS", "")).strip().lower() in ("1", "true", "yes", "on")
+            upd_real = root / "update" / "update.rpf"
+            upd2_real = root / "update" / "update2.rpf"
+            link1 = root / "update\\update.rpf"
+            link2 = root / "update\\update2.rpf"
+            if not enable_bslash:
+                # Best-effort cleanup: remove aliases if they exist (symlink OR hardlink file).
+                for lp in (link1, link2):
+                    try:
+                        if lp.exists() or lp.is_symlink():
+                            lp.unlink()
+                    except Exception:
+                        pass
+            else:
+                if upd_real.exists():
+                    _safe_hardlink_or_symlink(link1, upd_real)
+                if upd2_real.exists():
+                    _safe_hardlink_or_symlink(link2, upd2_real)
+        except Exception:
+            pass
+
+        # 3) update.rpf symlink in the game root (no backslashes).
+        #
+        # IMPORTANT (Linux):
+        # We have observed CodeWalker failing to parse the RPF header when opening the *symlink path*
+        # "<gta_root>/update.rpf" (even though "<gta_root>/update/update.rpf" succeeds).
+        # This manifests as:
+        #   "System.Exception: Error in RPF7 file entry."
+        #
+        # Because this can reduce exported-texture coverage (update pack content), we default to
+        # NOT creating "<gta_root>/update.rpf" on POSIX. If you need it for a particular build,
+        # set env var GTA5_CREATE_UPDATE_RPF_SYMLINK=1.
+        try:
+            want_link = str(os.getenv("GTA5_CREATE_UPDATE_RPF_SYMLINK", "")).strip() in ("1", "true", "yes", "on")
+            link_path = root / "update.rpf"
+            if not want_link:
+                # Best-effort cleanup of an existing symlink so CodeWalker won't scan it.
+                try:
+                    if link_path.is_symlink():
+                        link_path.unlink()
+                except Exception:
+                    pass
+            else:
+                upd_real = root / "update" / "update.rpf"
+                if upd_real.exists():
+                    _safe_symlink(link_path, upd_real)
+        except Exception:
+            pass
+
     def init_game_file_cache(
         self,
         load_vehicles: bool = False,
@@ -222,6 +502,7 @@ class DllManager:
         load_audio: bool = False,
         selected_dlc: Optional[str] = None,
         enable_mods: Optional[bool] = None,
+        force_all_dlc: bool = True,
     ) -> bool:
         """
         Initialize CodeWalker's GameFileCache.
@@ -236,12 +517,26 @@ class DllManager:
 
             # Apply DLC/mod selection BEFORE Init() so CodeWalker builds ActiveMapRpfFiles correctly.
             try:
+                # If the caller didn't specify a DLC level, default to "all DLC overlays" for maximal coverage.
+                # This avoids the easy-to-miss failure mode where code runs in "base-only" mode and silently
+                # under-exports archetypes/drawables (missing update+dlc content).
+                #
+                # Escape hatch:
+                # - pass selected_dlc="" and force_all_dlc=False to intentionally run base-only.
+                if (selected_dlc is None) and bool(force_all_dlc):
+                    selected_dlc = "__all__"
+
                 if selected_dlc is not None:
-                    self.game_file_cache.SelectedDlc = str(selected_dlc)
+                    sel = str(selected_dlc or "").strip()
+                    # Convenience: load all DLCs by using a sentinel that will never match a real dlc name.
+                    # CodeWalker stops loading DLCs when dlcname == SelectedDlc; if it never matches, it loads all.
+                    if sel.lower() in ("all", "*", "__all__", "latest"):
+                        sel = "__all__"
+                    self.game_file_cache.SelectedDlc = str(sel)
                     # CodeWalker sets EnableDlc based on SelectedDlc in the constructor, but if we mutate it
                     # afterwards, update the flag too.
                     try:
-                        self.game_file_cache.EnableDlc = bool(str(selected_dlc))
+                        self.game_file_cache.EnableDlc = bool(str(sel))
                     except Exception:
                         pass
             except Exception:
@@ -267,12 +562,39 @@ class DllManager:
                 logger.info(f"GameFileCache: {msg}")
 
             def error_log(msg: str):
-                logger.error(f"GameFileCache: {msg}")
+                m = str(msg or "")
+                # Same rationale as above: these are frequently non-fatal, but extremely loud.
+                if "Error in RPF7 file entry" in m:
+                    try:
+                        self.gfc_nonfatal_rpf7_entry_errors = int(self.gfc_nonfatal_rpf7_entry_errors or 0) + 1
+                    except Exception:
+                        self.gfc_nonfatal_rpf7_entry_errors = 0
+                    logger.warning(f"GameFileCache: (non-fatal) {m}")
+                    return
+                if "ytyp file was not in meta format" in m:
+                    # Capture the file path prefix if present: "<path>: ytyp file was not in meta format."
+                    try:
+                        prefix = m.split(": ytyp file was not in meta format.", 1)[0].strip()
+                        if prefix and (prefix not in self.gfc_nonmeta_ytyp_files) and (len(self.gfc_nonmeta_ytyp_files) < 5000):
+                            self.gfc_nonmeta_ytyp_files.append(prefix)
+                    except Exception:
+                        pass
+                    logger.warning(f"GameFileCache: (non-fatal) {m}")
+                    return
+                logger.error(f"GameFileCache: {m}")
 
             update_status_action = Action[str](update_status)
             error_log_action = Action[str](error_log)
 
             self.game_file_cache.Init(update_status_action, error_log_action)
+
+            # One-line summary (helps spot incomplete archetype coverage without wading through logs).
+            try:
+                nm = int(len(self.gfc_nonmeta_ytyp_files) or 0)
+                if nm > 0:
+                    logger.warning(f"GameFileCache: non-meta YTYP files encountered: {nm} (archetypes from those files may be missing)")
+            except Exception:
+                pass
 
             # IMPORTANT: after GameFileCache.Init, CodeWalker has built its own RpfManager (`GameFileCache.RpfMan`)
             # with DLC overlay/patch logic and the dictionaries that `GameFileCache` depends on.
@@ -290,9 +612,142 @@ class DllManager:
             logger.error(f"Error initializing GameFileCache: {e}")
             return False
 
+    def set_dlc_level(self, selected_dlc: str, enable: bool = True) -> bool:
+        """
+        Switch CodeWalker DLC level without reconstructing the entire GameFileCache.
+
+        Note: CodeWalker has a special-case that skips `patchday27ng` unless it is explicitly selected.
+        To cover that pack, run a separate pass with selected_dlc='patchday27ng'.
+        """
+        if not self.game_file_cache:
+            return False
+        sel = str(selected_dlc or "").strip()
+        if sel.lower() in ("all", "*", "__all__", "latest"):
+            sel = "__all__"
+        try:
+            if hasattr(self.game_file_cache, "SetDlcLevel"):
+                return bool(self.game_file_cache.SetDlcLevel(sel, bool(enable)))
+        except Exception:
+            return False
+        return False
+
     def get_game_file_cache(self):
         """Return the underlying CodeWalker.GameFiles.GameFileCache instance."""
         return self.game_file_cache
+
+    def get_nonmeta_ytyp_fallback_archetype(self, archetype_hash_u32: int):
+        """
+        Best-effort fallback for archetype lookup when CodeWalker failed to parse some YTYPs as Meta/PSO during Init().
+
+        This mitigates warnings like:
+          "<path>.ytyp: ytyp file was not in meta format."
+
+        CodeWalker (GameFileCache.AddYtypToDictionary) skips those YTYPs, so `GameFileCache.GetArchetype(hash)` won't
+        resolve archetypes that exist only in those files. We attempt to load those YTYP bytes as raw resources and
+        build a minimal archetype hash -> Archetype map.
+        """
+        try:
+            h = int(archetype_hash_u32) & 0xFFFFFFFF
+        except Exception:
+            return None
+        try:
+            if h in self._nonmeta_ytyp_archetypes_by_hash:
+                return self._nonmeta_ytyp_archetypes_by_hash.get(h)
+        except Exception:
+            pass
+
+        # Build once, lazily.
+        try:
+            if not self._nonmeta_ytyp_fallback_built:
+                self._build_nonmeta_ytyp_fallback()
+        except Exception:
+            pass
+        return self._nonmeta_ytyp_archetypes_by_hash.get(h)
+
+    def _build_nonmeta_ytyp_fallback(self) -> None:
+        if self._nonmeta_ytyp_fallback_built:
+            return
+        self._nonmeta_ytyp_fallback_built = True
+
+        paths = list(self.gfc_nonmeta_ytyp_files or [])
+        if not paths:
+            return
+
+        gfc = self.get_game_file_cache()
+        if gfc is None:
+            return
+        rpfman = getattr(gfc, "RpfMan", None) or self.get_rpf_manager()
+        if rpfman is None:
+            return
+
+        ytyp_cls = getattr(self, "YtypFile", None)
+        if ytyp_cls is None:
+            return
+
+        loaded_files = 0
+        loaded_arches = 0
+        failed = 0
+
+        for p in paths[:5000]:
+            try:
+                path = str(p or "").strip()
+                if not path:
+                    continue
+                try:
+                    data = rpfman.GetFileData(path)
+                except Exception:
+                    try:
+                        data = rpfman.GetFileData(path.replace("/", "\\"))
+                    except Exception:
+                        data = None
+                b = bytes(data) if data else b""
+                if not b:
+                    failed += 1
+                    continue
+
+                ytyp = ytyp_cls()
+                try:
+                    # Use raw resource load path even if the RPF entry was misclassified.
+                    ytyp.Load(b)
+                except Exception:
+                    failed += 1
+                    continue
+
+                arches = getattr(ytyp, "AllArchetypes", None)
+                if arches is None:
+                    failed += 1
+                    continue
+                cnt = 0
+                for arch in arches:
+                    try:
+                        ah = int(getattr(arch, "Hash", 0) or 0) & 0xFFFFFFFF
+                    except Exception:
+                        ah = 0
+                    if not ah:
+                        continue
+                    if ah not in self._nonmeta_ytyp_archetypes_by_hash:
+                        self._nonmeta_ytyp_archetypes_by_hash[int(ah)] = arch
+                    cnt += 1
+                if cnt > 0:
+                    loaded_files += 1
+                    loaded_arches += cnt
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+                continue
+
+        try:
+            if loaded_arches > 0:
+                logger.warning(
+                    f"GameFileCache: recovered archetypes from non-meta YTYP files: files={loaded_files} archetypes={loaded_arches} (failed={failed})"
+                )
+            else:
+                logger.warning(
+                    f"GameFileCache: non-meta YTYP fallback could not recover any archetypes (files={len(paths)} failed={failed})"
+                )
+        except Exception:
+            pass
             
     def _init_functions(self):
         """Initialize function signatures"""
@@ -383,7 +838,9 @@ class DllManager:
                     return False
 
             # Load waterheight.dat (same path CodeWalker.World.Watermaps uses).
-            wmf = self.game_file_cache.RpfMan.GetFile[self.WatermapFile]("common.rpf\\data\\levels\\gta5\\waterheight.dat")
+            wmf = self.game_file_cache.RpfMan.GetFile[self.WatermapFile](
+                canonicalize_cw_path("common.rpf\\data\\levels\\gta5\\waterheight.dat", keep_forward_slashes=False)
+            )
             if wmf is None:
                 logger.error("Failed to load waterheight.dat (WatermapFile is None)")
                 return False

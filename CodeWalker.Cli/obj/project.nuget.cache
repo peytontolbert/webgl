@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "Ex0858gM8YPk7LyVova2FZsZDW1rkxeZWiD4h+y4EBpmC7xgfsz7DlwWJbBHHZiHbnuMAUMdOjVUU5zFvKLx9g==",
+  "success": true,
+  "projectFilePath": "/data/webglgta/webgl-gta/CodeWalker.Cli/CodeWalker.Cli.csproj",
+  "expectedPackageFiles": [
+    "/home/peyton/.nuget/packages/sharpdx/4.2.0/sharpdx.4.2.0.nupkg.sha512",
+    "/home/peyton/.nuget/packages/sharpdx.mathematics/4.2.0/sharpdx.mathematics.4.2.0.nupkg.sha512"
+  ],
+  "logs": []
+}

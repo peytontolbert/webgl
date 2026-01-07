@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple, Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
 import json
 
-from .dll_manager import DllManager
+from .dll_manager import DllManager, canonicalize_cw_path
 from .rpf_reader import RpfReader
 from .terrain_chunk_manager import TerrainChunkManager
 from .space_extractor import SpaceExtractor
@@ -1266,7 +1266,7 @@ class TerrainSystem:
                 # Parity/provenance: hash the source YTD once per base texture (best effort).
                 try:
                     from .provenance_tools import sha1_hex
-                    data = self.rpf_manager.GetFileData(ytd_path)
+                    data = self.rpf_manager.GetFileData(canonicalize_cw_path(ytd_path, keep_forward_slashes=True))
                     b = bytes(data) if data else b""
                     self.parity_texture_sources.append({
                         "type": "ytd",

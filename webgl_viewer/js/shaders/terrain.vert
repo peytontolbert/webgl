@@ -81,9 +81,15 @@ void main() {
         worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
         worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
         
-        // Sample height from heightmap
-        vec2 heightmapCoord = vec2(gridPos.x, 1.0 - gridPos.y);
-        float height = texture(uHeightmap, heightmapCoord).r;
+        // Sample height from heightmap (exact texel fetch for 1:1 mapping).
+        // Our mesh gridPos is in "image space" where v increases downward (y=0 is top row),
+        // while texelFetch uses (0,0) as the *bottom* row, so we flip Y.
+        ivec2 ts = textureSize(uHeightmap, 0);
+        vec2 grid = max(vec2(ts), vec2(2.0, 2.0));
+        vec2 pix = gridPos * (grid - 1.0);
+        ivec2 ip = ivec2(clamp(floor(pix + vec2(0.5)), vec2(0.0), grid - 1.0));
+        ivec2 texel = ivec2(ip.x, (ts.y - 1) - ip.y);
+        float height = texelFetch(uHeightmap, texel, 0).r;
         
         // Heightmap is R8 normalized to 0..1, so scale directly by terrain Z extent.
         worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;

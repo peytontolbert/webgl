@@ -14,11 +14,13 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 import shutil
 
-from .dll_manager import DllManager
+from .dll_manager import DllManager, canonicalize_cw_path
 from .rpf_reader import RpfReader
 from .ymap_handler import YmapHandler
 from .terrain_system import TerrainSystem
 from .hash import jenkins_hash
+from .hash_utils import try_coerce_u32 as _try_coerce_u32
+from .codewalker_archetypes import get_archetype_best_effort
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -396,6 +398,24 @@ class BuildingSystem:
             exported_mlo_archetypes: set[int] = set()
             gfc = None  # CodeWalker.GameFiles.GameFileCache (pythonnet)
             gfc_ready = False
+            # Track YMAP enumeration + load success so we can verify export coverage later.
+            ymap_source = "unknown"
+            ymap_dict_count = 0
+            all_ymap_dict_count = 0
+            active_map_rpfs_count = 0
+            gfc_selected_dlc = ""
+            gfc_enable_dlc = None
+            # CodeWalker special-case: patchday27ng is skipped unless explicitly selected.
+            # Default to a best-effort "include everything" policy:
+            # - enumerate __all__ (max coverage)
+            # - additionally enumerate patchday27ng and union in any *new* YMAP keys (avoid double-counting overrides)
+            patchday27ng_extra_added = 0
+            patchday27ng_extra_total = 0
+            patchday27ng_restore_failed = False
+            ymaps_total_entries = 0
+            ymaps_loaded_ok = 0
+            ymaps_failed = 0
+            ymaps_failed_samples: list[str] = []
 
             if self.output_dir:
                 self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -439,8 +459,37 @@ class BuildingSystem:
                 # CRITICAL: prefer YmapDict (built from ActiveMapRpfFiles) to avoid “overlap”.
                 # AllYmapsDict is built from *AllRpfs* and can include obsolete ymaps that should not be active.
                 try:
-                    d = getattr(gfc, "YmapDict", None) or getattr(gfc, "AllYmapsDict", None)
+                    try:
+                        gfc_selected_dlc = str(getattr(gfc, "SelectedDlc", "") or "")
+                    except Exception:
+                        gfc_selected_dlc = ""
+                    try:
+                        gfc_enable_dlc = bool(getattr(gfc, "EnableDlc", False))
+                    except Exception:
+                        gfc_enable_dlc = None
+                    try:
+                        am = getattr(gfc, "ActiveMapRpfFiles", None)
+                        active_map_rpfs_count = int(getattr(am, "Count", 0) or 0) if am is not None else 0
+                    except Exception:
+                        active_map_rpfs_count = 0
+                    try:
+                        all_d = getattr(gfc, "AllYmapsDict", None)
+                        all_ymap_dict_count = int(getattr(all_d, "Count", 0) or 0) if all_d is not None else 0
+                    except Exception:
+                        all_ymap_dict_count = 0
+
+                    d = getattr(gfc, "YmapDict", None)
                     if d is not None:
+                        ymap_source = "GameFileCache.YmapDict"
+                    else:
+                        d = getattr(gfc, "AllYmapsDict", None)
+                        if d is not None:
+                            ymap_source = "GameFileCache.AllYmapsDict"
+                    if d is not None:
+                        try:
+                            ymap_dict_count = int(getattr(d, "Count", 0) or 0)
+                        except Exception:
+                            ymap_dict_count = 0
                         for kv in d:
                             try:
                                 entry = getattr(kv, "Value", None) or kv.Value
@@ -451,8 +500,79 @@ class BuildingSystem:
                 except Exception:
                     ymap_entries = []
 
+            # Best-effort include patchday27ng:
+            # CodeWalker skips it when SelectedDlc is not exactly "patchday27ng".
+            # We temporarily switch DLC level to patchday27ng, collect any new YMAP keys, then restore.
+            if gfc_ready:
+                try:
+                    # Only attempt if CodeWalker exposes SetDlcLevel (most builds do).
+                    if hasattr(gfc, "SetDlcLevel"):
+                        # Capture original selection so we can restore.
+                        try:
+                            _orig_sel = str(getattr(gfc, "SelectedDlc", "") or "")
+                        except Exception:
+                            _orig_sel = ""
+                        try:
+                            _orig_enable = bool(getattr(gfc, "EnableDlc", True))
+                        except Exception:
+                            _orig_enable = True
+
+                        # Track keys we already have to avoid double-counting.
+                        existing_keys: set[int] = set()
+                        try:
+                            # Prefer dict keys (ShortNameHash) when iterating KeyValuePairs.
+                            d0 = getattr(gfc, "YmapDict", None)
+                            if d0 is not None:
+                                for kv in d0:
+                                    try:
+                                        k = getattr(kv, "Key", None) or kv.Key
+                                        existing_keys.add(int(k) & 0xFFFFFFFF)
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            existing_keys = set()
+
+                        # Switch to patchday27ng and read its YMAP dict.
+                        try:
+                            if bool(gfc.SetDlcLevel("patchday27ng", True)):
+                                d27 = getattr(gfc, "YmapDict", None)
+                                if d27 is not None:
+                                    try:
+                                        patchday27ng_extra_total = int(getattr(d27, "Count", 0) or 0)
+                                    except Exception:
+                                        patchday27ng_extra_total = 0
+                                    for kv in d27:
+                                        try:
+                                            k = getattr(kv, "Key", None) or kv.Key
+                                            key_u32 = int(k) & 0xFFFFFFFF
+                                        except Exception:
+                                            continue
+                                        if key_u32 in existing_keys:
+                                            continue
+                                        try:
+                                            entry = getattr(kv, "Value", None) or kv.Value
+                                        except Exception:
+                                            entry = None
+                                        if entry is None:
+                                            continue
+                                        ymap_entries.append(entry)
+                                        existing_keys.add(key_u32)
+                                        patchday27ng_extra_added += 1
+                        except Exception:
+                            pass
+                        finally:
+                            # Restore original selection (best-effort).
+                            try:
+                                if hasattr(gfc, "SetDlcLevel"):
+                                    gfc.SetDlcLevel(_orig_sel, bool(_orig_enable))
+                            except Exception:
+                                patchday27ng_restore_failed = True
+                except Exception:
+                    pass
+
             if not ymap_entries:
                 # Fallback (scan-order dependent; keep only as a safety net)
+                ymap_source = "RpfManager.AllRpfs scan"
                 ymap_seen = set()
                 try:
                     for rpf in self.rpf_manager.AllRpfs:
@@ -474,7 +594,8 @@ class BuildingSystem:
                 except Exception:
                     ymap_entries = []
 
-            logger.info(f"Found {len(ymap_entries)} YMAP entries")
+            ymaps_total_entries = int(len(ymap_entries))
+            logger.info(f"Found {ymaps_total_entries} YMAP entries")
 
             # Keep a small sample for parity reporting (don’t store every YMAP).
             parity_samples_cap = 250
@@ -489,13 +610,17 @@ class BuildingSystem:
                     ymap = self.dll_manager.get_ymap_file(entry if entry is not None else ymap_path)
                     if not ymap:
                         logger.warning(f"Failed to load YMAP: {ymap_path}")
+                        ymaps_failed += 1
+                        if len(ymaps_failed_samples) < 40:
+                            ymaps_failed_samples.append(str(ymap_path))
                         continue
+                    ymaps_loaded_ok += 1
 
                     # Parity sample: record a hash + a few archetype hashes from the in-memory parse.
                     if len(self.parity_ymap_samples) < parity_samples_cap:
                         try:
                             rpfman = self.dll_manager.get_rpf_manager()
-                            data = rpfman.GetFileData(ymap_path)
+                            data = rpfman.GetFileData(canonicalize_cw_path(ymap_path, keep_forward_slashes=True))
                             b = bytes(data) if data else b""
                             from .provenance_tools import entry_source_info, sha1_hex  # local import to avoid cycles
                             sample = {
@@ -543,21 +668,10 @@ class BuildingSystem:
                             archetype_name = getattr(ced, "archetypeName", None) if ced is not None else None
 
                             def _as_u32(v) -> Optional[int]:
-                                try:
-                                    if v is None:
-                                        return None
-                                    # Common CodeWalker hash wrappers
-                                    for attr in ("Hash", "hash", "Value", "value"):
-                                        if hasattr(v, attr):
-                                            v = getattr(v, attr)
-                                    if isinstance(v, str):
-                                        s = v.strip()
-                                        if not s or not s.lstrip("-").isdigit():
-                                            return None
-                                        return int(s, 10) & 0xFFFFFFFF
-                                    return int(v) & 0xFFFFFFFF
-                                except Exception:
-                                    return None
+                                # Wrapper kept to preserve local semantics:
+                                # - returns Optional[int]
+                                # - decimal-only for strings (no "0x..." parsing)
+                                return _try_coerce_u32(v, allow_hex=False)
 
                             archetype_hash = _as_u32(archetype_name)
                             archetype_raw = str(archetype_name) if archetype_name is not None else "UNKNOWN"
@@ -612,6 +726,54 @@ class BuildingSystem:
                             except Exception:
                                 guid_u32 = 0
 
+                            # CodeWalker parity (YMAP/MLO):
+                            # - CMloInstanceDef carries instance-level fields that affect which interior entity sets
+                            #   are enabled by default and how portals/floors are grouped.
+                            # See CodeWalker.Core/GameFiles/MetaTypes/MetaTypes.cs: CMloInstanceDef
+                            #   groupId, floorId, defaultEntitySets, numExitPortals, MLOInstflags.
+                            mlo_group_id = 0
+                            mlo_floor_id = 0
+                            mlo_num_exit_portals = 0
+                            mlo_inst_flags = 0
+                            mlo_default_entity_sets: list[int] = []
+                            if is_mlo_instance:
+                                try:
+                                    mlo_inst = getattr(entity, "MloInstance", None)
+                                except Exception:
+                                    mlo_inst = None
+                                if mlo_inst is not None:
+                                    try:
+                                        inst_def = getattr(mlo_inst, "_Instance", None) or getattr(mlo_inst, "Instance", None)
+                                    except Exception:
+                                        inst_def = None
+                                    if inst_def is not None:
+                                        try:
+                                            mlo_group_id = int(getattr(inst_def, "groupId", 0) or 0) & 0xFFFFFFFF
+                                        except Exception:
+                                            mlo_group_id = 0
+                                        try:
+                                            mlo_floor_id = int(getattr(inst_def, "floorId", 0) or 0) & 0xFFFFFFFF
+                                        except Exception:
+                                            mlo_floor_id = 0
+                                        try:
+                                            mlo_num_exit_portals = int(getattr(inst_def, "numExitPortals", 0) or 0) & 0xFFFFFFFF
+                                        except Exception:
+                                            mlo_num_exit_portals = 0
+                                        try:
+                                            mlo_inst_flags = int(getattr(inst_def, "MLOInstflags", 0) or 0) & 0xFFFFFFFF
+                                        except Exception:
+                                            mlo_inst_flags = 0
+                                    # defaultEntitySets is exposed on MloInstanceData (uint[]), populated from CMloInstanceDef.defaultEntitySets.
+                                    try:
+                                        des = getattr(mlo_inst, "defaultEntitySets", None)
+                                    except Exception:
+                                        des = None
+                                    if des is not None:
+                                        try:
+                                            mlo_default_entity_sets = [int(x) & 0xFFFFFFFF for x in list(des)]
+                                        except Exception:
+                                            mlo_default_entity_sets = []
+
                             # Sample terrain at entity XY so the renderer can snap props/buildings to ground.
                             terrain_z, terrain_normal = self.terrain_system.sample_terrain_data(position)
                             dz = float(abs(float(position[2]) - float(terrain_z)))
@@ -647,6 +809,12 @@ class BuildingSystem:
                                 "mlo_parent_guid": "0",
                                 "mlo_entity_set_name": None,
                                 "mlo_entity_set_hash": "0",
+                                # MLO instance fields (parity-critical for entity set toggles)
+                                "mlo_group_id": int(mlo_group_id),
+                                "mlo_floor_id": int(mlo_floor_id),
+                                "mlo_num_exit_portals": int(mlo_num_exit_portals),
+                                "mlo_inst_flags": int(mlo_inst_flags),
+                                "mlo_default_entity_sets": [int(x) for x in (mlo_default_entity_sets or [])],
                             }
 
                             self.num_entities += 1
@@ -708,10 +876,11 @@ class BuildingSystem:
                                         raise RuntimeError("GameFileCache unavailable; skipping interior export")
 
                                     # Resolve MLO archetype and materialize interior entities.
-                                    try:
-                                        mlo_arch = gfc.GetArchetype(int(archetype_hash) & 0xFFFFFFFF)
-                                    except Exception:
-                                        mlo_arch = None
+                                    mlo_arch = get_archetype_best_effort(
+                                        gfc,
+                                        int(archetype_hash) & 0xFFFFFFFF,
+                                        dll_manager=self.dll_manager,
+                                    )
                                     try:
                                         entity.SetArchetype(mlo_arch)
                                     except Exception:
@@ -850,6 +1019,12 @@ class BuildingSystem:
                                                 "mlo_parent_guid": str(int(guid_u32)),
                                                 "mlo_entity_set_name": set_name,
                                                 "mlo_entity_set_hash": str(int(set_hash_u32 & 0xFFFFFFFF)),
+                                                # Whether this entity-set is enabled by default for this MLO instance.
+                                                # Base (non-set) children are always treated as default.
+                                                "mlo_entity_set_is_default": bool(
+                                                    (set_hash_u32 == 0)
+                                                    or (int(set_hash_u32 & 0xFFFFFFFF) in set(int(x) & 0xFFFFFFFF for x in (mlo_default_entity_sets or [])))
+                                                ),
                                             }
                                             chunk_writer.write(ent2)
                                             self.num_entities += 1
@@ -884,6 +1059,9 @@ class BuildingSystem:
                                     
                 except Exception as e:
                     logger.warning(f"Failed to process YMAP {ymap_path}: {e}")
+                    ymaps_failed += 1
+                    if len(ymaps_failed_samples) < 40:
+                        ymaps_failed_samples.append(str(ymap_path))
                     continue
             
             # Load water data
@@ -897,6 +1075,21 @@ class BuildingSystem:
                     "chunks_dir": "entities_chunks",
                     "total_entities": int(self.num_entities),
                     "bounds": chunk_writer.bounds,
+                    "ymap_stats": {
+                        "source": str(ymap_source or "unknown"),
+                        "total_entries": int(ymaps_total_entries),
+                        "loaded_ok": int(ymaps_loaded_ok),
+                        "failed": int(ymaps_failed),
+                        "failed_samples": list(ymaps_failed_samples),
+                        "gfc_selected_dlc": str(gfc_selected_dlc or ""),
+                        "gfc_enable_dlc": gfc_enable_dlc,
+                        "gfc_active_map_rpfs": int(active_map_rpfs_count),
+                        "gfc_ymapdict_count": int(ymap_dict_count),
+                        "gfc_all_ymapdict_count": int(all_ymap_dict_count),
+                        "patchday27ng_extra_total": int(patchday27ng_extra_total),
+                        "patchday27ng_extra_added": int(patchday27ng_extra_added),
+                        "patchday27ng_restore_failed": bool(patchday27ng_restore_failed),
+                    },
                     "chunks": {
                         k: {"count": int(v), "file": f"{k}.jsonl"}
                         for k, v in chunk_writer.chunk_counts.items()

@@ -13,7 +13,7 @@ import { glMatrix } from './glmatrix.js';
 export class OcclusionCuller {
     /**
      * @param {WebGL2RenderingContext} gl
-     * @param {{ width?: number, height?: number, readbackEveryNFrames?: number, depthEps?: number }} opts
+     * @param {{ width?: number, height?: number, readbackEveryNFrames?: number, depthEps?: number, preferDepthReadback?: boolean }} opts
      */
     constructor(gl, opts = {}) {
         this.gl = gl;
@@ -29,10 +29,22 @@ export class OcclusionCuller {
         this._frameIndex = 0;
         this._depthTex = null;
         this._fbo = null;
+        this._depthReadFbo = null; // alias for clarity (depth-only FBO)
+        this._rgbaFbo = null; // FBO with RGBA color attachment for fallback readback
+        this._rgbaTex = null;
+        this._depthToRgbaProgram = null;
+        this._depthToRgbaVAO = null;
+
         this._depthU32 = null;
         this._depthF32 = null;
         this._useFloatReadback = false;
-        this._readbackSupported = true;
+        this._readbackSupported = true; // true if ANY readback mode works
+        // Default to the most compatible readback path:
+        // - readPixels(RGBA, UNSIGNED_BYTE) is the only guaranteed combo across implementations.
+        // - depth readPixels frequently fails with INVALID_ENUM on some GPUs/drivers (as you've seen).
+        // You can opt back into trying depth readPixels via opts.preferDepthReadback.
+        this._readbackMode = (opts && opts.preferDepthReadback) ? 'depth' : 'rgba'; // 'depth' | 'rgba'
+        this._persistKey = 'webglgta.occlusion.readbackMode';
         this._warnedReadback = false;
 
         this._lastStats = {
@@ -44,6 +56,18 @@ export class OcclusionCuller {
         };
 
         this._tmpV4 = glMatrix.vec4.create();
+
+        // If a previous session already determined depth readPixels is rejected, start in RGBA mode
+        // to avoid re-triggering noisy "WebGL: INVALID_ENUM" console warnings every reload.
+        try {
+            const v = globalThis?.localStorage?.getItem?.(this._persistKey);
+            // Stored value overrides default unless user explicitly forced a mode via opts.
+            if (!(opts && opts.preferDepthReadback)) {
+                if (String(v) === 'rgba') this._readbackMode = 'rgba';
+                if (String(v) === 'depth') this._readbackMode = 'depth';
+            }
+        } catch { /* ignore */ }
+
         this._ensureResources();
     }
 
@@ -64,7 +88,7 @@ export class OcclusionCuller {
             height: this.height,
             enabled: !!this.enabled,
             readbackSupported: !!this._readbackSupported,
-            readbackMode: this._useFloatReadback ? 'float' : 'u16',
+            readbackMode: this._readbackMode,
         };
     }
 
@@ -223,6 +247,15 @@ export class OcclusionCuller {
             // DEPTH_COMPONENT + UNSIGNED_SHORT readPixels returns 0..65535 mapping to [0..1].
             return this._depthU32[idx] / 65535.0;
         }
+        if (this._depthRGBA) {
+            // Packed 24-bit depth in RGB: depth01 ≈ (r + g*256 + b*65536) / 16777215.
+            const off = idx * 4;
+            const r = this._depthRGBA[off] | 0;
+            const g = this._depthRGBA[off + 1] | 0;
+            const b = this._depthRGBA[off + 2] | 0;
+            const u24 = (r + (g << 8) + (b << 16)) >>> 0;
+            return u24 / 16777215.0;
+        }
         return NaN;
     }
 
@@ -254,6 +287,7 @@ export class OcclusionCuller {
         }
 
         this._fbo = gl.createFramebuffer();
+        this._depthReadFbo = this._fbo;
         this._depthTex = gl.createTexture();
 
         gl.bindTexture(gl.TEXTURE_2D, this._depthTex);
@@ -261,6 +295,8 @@ export class OcclusionCuller {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        // Ensure sampling returns raw depth values (not comparison results) for our RGBA fallback path.
+        try { gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.NONE); } catch { /* ignore */ }
         gl.texImage2D(
             gl.TEXTURE_2D,
             0,
@@ -295,8 +331,39 @@ export class OcclusionCuller {
         this._depthU32 = new Uint16Array(this.width * this.height);
         this._depthF32 = null;
         this._useFloatReadback = false; // legacy
+        this._depthRGBA = new Uint8Array(this.width * this.height * 4);
         this._lastStats.lastReadbackOk = false;
         this._readbackSupported = true;
+        // IMPORTANT: don't clobber an already-selected readback mode.
+        // - constructor may have loaded 'rgba' from localStorage
+        // - setSize() destroys/recreates resources; we want to keep using 'rgba' if already known-good
+        if (this._readbackMode !== 'rgba') this._readbackMode = 'depth';
+
+        // Prepare RGBA fallback FBO/texture (readPixels RGBA is broadly supported even when depth readPixels isn't).
+        this._rgbaFbo = gl.createFramebuffer();
+        this._rgbaTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this._rgbaTex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, this.width, this.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this._rgbaFbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._rgbaTex, 0);
+        try { gl.drawBuffers([gl.COLOR_ATTACHMENT0]); } catch { /* ignore */ }
+        const rgbaStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (rgbaStatus !== gl.FRAMEBUFFER_COMPLETE) {
+            // Still keep depth-only path; we'll mark fallback unavailable if needed.
+            try { console.warn('OcclusionCuller: RGBA fallback framebuffer incomplete', rgbaStatus); } catch { /* ignore */ }
+            try { gl.deleteFramebuffer(this._rgbaFbo); } catch { /* ignore */ }
+            try { gl.deleteTexture(this._rgbaTex); } catch { /* ignore */ }
+            this._rgbaFbo = null;
+            this._rgbaTex = null;
+        }
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindTexture(gl.TEXTURE_2D, null);
     }
 
     _readDepthPixels() {
@@ -306,56 +373,212 @@ export class OcclusionCuller {
 
         // Read from our depth FBO.
         const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING);
-        gl.bindFramebuffer(gl.FRAMEBUFFER, this._fbo);
 
-        // Many WebGL2 implementations are picky here; prefer the most compatible path:
-        // DEPTH_COMPONENT + UNSIGNED_SHORT from a DEPTH_COMPONENT16 attachment.
-        //
-        // If this fails (INVALID_ENUM on some GPUs/drivers), disable readback permanently and fail open.
-        let ok = false;
-        this._useFloatReadback = false;
+        // Mode 1: depth readPixels (fastest when supported).
+        if (this._readbackMode === 'depth') {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this._fbo);
+
+            // Many WebGL2 implementations are picky here; prefer the most compatible path:
+            // DEPTH_COMPONENT + UNSIGNED_SHORT from a DEPTH_COMPONENT16 attachment.
+            //
+            // If this fails (INVALID_ENUM on some GPUs/drivers), fall back to RGBA packing.
+            // NOTE: only one depth readPixels attempt is made; after that we won't retry (avoids console spam).
+            let ok = false;
+            try {
+                // Clear any prior error so we interpret the result of this call only.
+                try { gl.getError(); } catch { /* ignore */ }
+                gl.readPixels(0, 0, this.width, this.height, gl.DEPTH_COMPONENT, gl.UNSIGNED_SHORT, this._depthU32);
+                const e = gl.getError();
+                ok = (e === gl.NO_ERROR);
+            } catch {
+                ok = false;
+            }
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
+            if (ok) {
+                this._lastStats.lastReadbackOk = true;
+                try { globalThis?.localStorage?.setItem?.(this._persistKey, 'depth'); } catch { /* ignore */ }
+                return true;
+            }
+
+            // Switch permanently to fallback mode.
+            this._readbackMode = 'rgba';
+            try { globalThis?.localStorage?.setItem?.(this._persistKey, 'rgba'); } catch { /* ignore */ }
+            if (!this._warnedReadback) {
+                this._warnedReadback = true;
+                try {
+                    console.warn('OcclusionCuller: depth readPixels rejected by this GPU/browser; switching to RGBA-packed depth readback.');
+                } catch { /* ignore */ }
+            }
+        }
+
+        // Mode 2: RGBA-packed depth (works on many drivers that reject depth readPixels).
+        const ok2 = this._readDepthViaRgbaPacked();
+        this._lastStats.lastReadbackOk = !!ok2;
+        if (!ok2) {
+            this._readbackSupported = false;
+            try { globalThis?.localStorage?.setItem?.(this._persistKey, 'none'); } catch { /* ignore */ }
+            if (!this._warnedReadback) {
+                this._warnedReadback = true;
+                try {
+                    console.warn('OcclusionCuller: depth readback not supported on this GPU/browser; disabling occlusion readback.');
+                } catch { /* ignore */ }
+            }
+        }
+        return ok2;
+    }
+
+    _ensureDepthToRgbaProgram() {
+        const gl = this.gl;
+        if (!gl) return false;
+        if (this._depthToRgbaProgram && this._depthToRgbaVAO) return true;
+
+        const vs = `#version 300 es
+        precision highp float;
+        const vec2 POS[3] = vec2[3](
+            vec2(-1.0, -1.0),
+            vec2( 3.0, -1.0),
+            vec2(-1.0,  3.0)
+        );
+        void main() {
+            gl_Position = vec4(POS[gl_VertexID], 0.0, 1.0);
+        }`;
+
+        const fs = `#version 300 es
+        precision highp float;
+        uniform sampler2D uDepthTex;
+        out vec4 fragColor;
+
+        vec3 packDepth24(float depth01) {
+            float d = clamp(depth01, 0.0, 1.0);
+            float u = floor(d * 16777215.0 + 0.5); // 2^24 - 1
+            float r = mod(u, 256.0);
+            float g = mod(floor(u / 256.0), 256.0);
+            float b = mod(floor(u / 65536.0), 256.0);
+            return vec3(r, g, b) / 255.0;
+        }
+
+        void main() {
+            // gl_FragCoord.xy uses the same bottom-left origin as readPixels.
+            ivec2 ip = ivec2(gl_FragCoord.xy) - ivec2(0, 0);
+            float d = texelFetch(uDepthTex, ip, 0).r;
+            vec3 rgb = packDepth24(d);
+            fragColor = vec4(rgb, 1.0);
+        }`;
+
+        const compile = (type, src) => {
+            const sh = gl.createShader(type);
+            gl.shaderSource(sh, src);
+            gl.compileShader(sh);
+            if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+                const info = gl.getShaderInfoLog(sh) || '';
+                try { gl.deleteShader(sh); } catch { /* ignore */ }
+                throw new Error(info);
+            }
+            return sh;
+        };
+
         try {
-            // Clear any prior error so we interpret the result of this call only.
+            const vsh = compile(gl.VERTEX_SHADER, vs);
+            const fsh = compile(gl.FRAGMENT_SHADER, fs);
+            const prog = gl.createProgram();
+            gl.attachShader(prog, vsh);
+            gl.attachShader(prog, fsh);
+            gl.linkProgram(prog);
+            try { gl.deleteShader(vsh); } catch { /* ignore */ }
+            try { gl.deleteShader(fsh); } catch { /* ignore */ }
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+                const info = gl.getProgramInfoLog(prog) || '';
+                try { gl.deleteProgram(prog); } catch { /* ignore */ }
+                throw new Error(info);
+            }
+            this._depthToRgbaProgram = prog;
+        } catch (e) {
+            try { console.warn('OcclusionCuller: failed to build depth->RGBA fallback shader', e); } catch { /* ignore */ }
+            this._depthToRgbaProgram = null;
+            return false;
+        }
+
+        try {
+            this._depthToRgbaVAO = gl.createVertexArray();
+        } catch {
+            this._depthToRgbaVAO = null;
+        }
+        // WebGL2 requires a VAO bound for drawArrays, even when using gl_VertexID only.
+        if (!this._depthToRgbaVAO) {
+            try { if (this._depthToRgbaProgram) gl.deleteProgram(this._depthToRgbaProgram); } catch { /* ignore */ }
+            this._depthToRgbaProgram = null;
+            return false;
+        }
+        return true;
+    }
+
+    _readDepthViaRgbaPacked() {
+        const gl = this.gl;
+        if (!this._rgbaFbo || !this._rgbaTex || !this._depthTex || !this._depthRGBA) return false;
+        if (!this._ensureDepthToRgbaProgram()) return false;
+
+        const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+        const prevViewport = gl.getParameter(gl.VIEWPORT);
+        const prevProg = gl.getParameter(gl.CURRENT_PROGRAM);
+        const prevVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+        const prevActiveTex = gl.getParameter(gl.ACTIVE_TEXTURE);
+        let prevTex0 = null;
+        try {
+            gl.activeTexture(gl.TEXTURE0);
+            prevTex0 = gl.getParameter(gl.TEXTURE_BINDING_2D);
+        } catch {
+            prevTex0 = null;
+        }
+
+        let prevColorMask = null;
+        try { prevColorMask = gl.getParameter(gl.COLOR_WRITEMASK); } catch { prevColorMask = null; }
+
+        // Draw depth->RGBA into the color FBO.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this._rgbaFbo);
+        gl.viewport(0, 0, this.width, this.height);
+        gl.colorMask(true, true, true, true);
+        try { gl.disable(gl.DEPTH_TEST); } catch { /* ignore */ }
+        try { gl.disable(gl.BLEND); } catch { /* ignore */ }
+
+        gl.useProgram(this._depthToRgbaProgram);
+        try { gl.bindVertexArray(this._depthToRgbaVAO); } catch { /* ignore */ }
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this._depthTex);
+        const loc = gl.getUniformLocation(this._depthToRgbaProgram, 'uDepthTex');
+        if (loc) gl.uniform1i(loc, 0);
+
+        // Clear (optional) then draw full-screen triangle.
+        try { gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT); } catch { /* ignore */ }
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+        // Read pixels from RGBA color attachment (widely supported).
+        let ok = false;
+        try {
             try { gl.getError(); } catch { /* ignore */ }
-            gl.readPixels(0, 0, this.width, this.height, gl.DEPTH_COMPONENT, gl.UNSIGNED_SHORT, this._depthU32);
+            gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.UNSIGNED_BYTE, this._depthRGBA);
             const e = gl.getError();
             ok = (e === gl.NO_ERROR);
         } catch {
             ok = false;
         }
 
-        // Fallback: some ANGLE/GPU combos reject DEPTH_COMPONENT + UNSIGNED_SHORT with INVALID_ENUM.
-        // Try float readback (still normalized 0..1), which tends to be more broadly supported.
-        if (!ok) {
-            try {
-                if (!this._depthF32 || this._depthF32.length !== (this.width * this.height)) {
-                    this._depthF32 = new Float32Array(this.width * this.height);
-                }
-                try { gl.getError(); } catch { /* ignore */ }
-                gl.readPixels(0, 0, this.width, this.height, gl.DEPTH_COMPONENT, gl.FLOAT, this._depthF32);
-                const e2 = gl.getError();
-                ok = (e2 === gl.NO_ERROR);
-                this._useFloatReadback = ok;
-            } catch {
-                ok = false;
-                this._useFloatReadback = false;
-            }
-        } else {
-            // Successful u16 readback => ignore any float buffer.
-            this._depthF32 = null;
+        // Restore minimal state.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
+        gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+        try { gl.useProgram(prevProg); } catch { /* ignore */ }
+        try { gl.bindVertexArray(prevVao); } catch { /* ignore */ }
+        try { gl.activeTexture(prevActiveTex); } catch { /* ignore */ }
+        try {
+            gl.activeTexture(gl.TEXTURE0);
+            if (prevTex0) gl.bindTexture(gl.TEXTURE_2D, prevTex0);
+            gl.activeTexture(prevActiveTex);
+        } catch { /* ignore */ }
+        if (prevColorMask && prevColorMask.length >= 4) {
+            try { gl.colorMask(!!prevColorMask[0], !!prevColorMask[1], !!prevColorMask[2], !!prevColorMask[3]); } catch { /* ignore */ }
         }
 
-        gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
-        this._lastStats.lastReadbackOk = !!ok;
-        if (!ok) {
-            this._readbackSupported = false;
-            if (!this._warnedReadback) {
-                this._warnedReadback = true;
-                try {
-                    console.warn('OcclusionCuller: depth readPixels not supported on this GPU/browser; disabling occlusion readback.');
-                } catch { /* ignore */ }
-            }
-        }
         return ok;
     }
 
@@ -364,13 +587,25 @@ export class OcclusionCuller {
         if (gl) {
             try { if (this._depthTex) gl.deleteTexture(this._depthTex); } catch { /* ignore */ }
             try { if (this._fbo) gl.deleteFramebuffer(this._fbo); } catch { /* ignore */ }
+            try { if (this._rgbaTex) gl.deleteTexture(this._rgbaTex); } catch { /* ignore */ }
+            try { if (this._rgbaFbo) gl.deleteFramebuffer(this._rgbaFbo); } catch { /* ignore */ }
+            try { if (this._depthToRgbaProgram) gl.deleteProgram(this._depthToRgbaProgram); } catch { /* ignore */ }
+            try { if (this._depthToRgbaVAO) gl.deleteVertexArray(this._depthToRgbaVAO); } catch { /* ignore */ }
         }
         this._depthTex = null;
         this._fbo = null;
+        this._depthReadFbo = null;
+        this._rgbaTex = null;
+        this._rgbaFbo = null;
+        this._depthToRgbaProgram = null;
+        this._depthToRgbaVAO = null;
         this._depthU32 = null;
         this._depthF32 = null;
+        this._depthRGBA = null;
         this._useFloatReadback = false;
         this._lastStats.lastReadbackOk = false;
+        // Preserve _readbackMode across resizes/recreates; it is updated on success/failure paths.
+        this._readbackSupported = true;
     }
 }
 

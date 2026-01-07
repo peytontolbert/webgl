@@ -18,6 +18,7 @@ from .meta import Meta, MetaType, MetaName
 from .rpf_reader import RpfReader
 from .hash import jenkins_hash
 from .terrain_system import TerrainSystem
+from .dll_manager import canonicalize_cw_path
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ class YmapHandler:
                 return self.ymap_cache[ymap_hash]
                 
             # Get the file entry first
-            entry = self.rpf_manager.GetEntry(path)
+            entry = self.rpf_manager.GetEntry(canonicalize_cw_path(path, keep_forward_slashes=True))
             if not entry:
                 logger.warning(f"YMAP file entry not found: {path}")
                 return None

@@ -90,6 +90,12 @@ uniform bool uEnableVertexColour;
 uniform float uSpecularIntensity;
 uniform float uSpecularPower;
 
+// Terrain blend mode:
+// - 0: RGBA splat weights from uBlendMask (viewer heightmap terrain path)
+// - 1: CodeWalker-style blend (vertex colours + optional mask), matching TerrainPS_Deferred.hlsl
+uniform int uTerrainBlendMode;
+uniform float uBumpiness;
+
 // Helper function to sample texture with fallback
 vec4 SampleTexture(sampler2D tex, vec2 uv, bool enabled) {
     if (!enabled) return vec4(0.0);
@@ -101,6 +107,15 @@ vec4 BlendTextures(vec4 base, vec4 blend, float mask) {
     return mix(base, blend, mask);
 }
 
+// CodeWalker-like normal mapping:
+// TerrainPS.hlsl uses NormalMap(nv.xy, bumpiness, N, T, B) where nv.xy is in [0..1].
+vec3 NormalMapCW(vec2 nvXY, float bumpiness, vec3 n, vec3 t, vec3 b) {
+    vec2 xy = (nvXY * 2.0 - 1.0) * max(0.0, bumpiness);
+    float zz = max(0.0, 1.0 - dot(xy, xy));
+    float z = sqrt(zz);
+    return normalize(n * z + t * xy.x + b * xy.y);
+}
+
 void main() {
     // Initialize outputs
     vec4 diffuse = vec4(0.0);
@@ -108,28 +123,61 @@ void main() {
     vec4 specular = vec4(0.0);
     vec4 irradiance = vec4(0.0);
     
-    // Sample blend mask (match heightmap convention: v increases downward in vTexcoord0)
-    vec2 maskUv = vec2(vTexcoord0.x, 1.0 - vTexcoord0.y);
-    vec4 w = SampleTexture(uBlendMask, maskUv, uEnableTextureMask);
-    float sumW = w.r + w.g + w.b + w.a;
-    if (sumW <= 1e-5) {
-        w = vec4(1.0, 0.0, 0.0, 0.0);
+    // --- Texture sampling ---
+    // We support two blend conventions:
+    // - Viewer heightmap terrain: uBlendMask is RGBA weights sampled using vTexcoord0 (image-space, needs Y flip)
+    // - CodeWalker terrain family: mask uses Texcoord1; layers use Texcoord0 by default (see TerrainPS*.hlsl)
+
+    // Pre-sample all 4 layer diffuse maps. In CodeWalker naming these correspond to Colourmap1..4.
+    // Our binding uses uColorMap0..3 for layer1..4.
+    vec4 c1 = SampleTexture(uColorMap0, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture0);
+    vec4 c2 = SampleTexture(uColorMap1, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture1);
+    vec4 c3 = SampleTexture(uColorMap2, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture2);
+    vec4 c4 = SampleTexture(uColorMap3, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture3);
+
+    vec4 n1s = SampleTexture(uNormalMap0, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture0);
+    vec4 n2s = SampleTexture(uNormalMap1, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture1);
+    vec4 n3s = SampleTexture(uNormalMap2, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture2);
+    vec4 n4s = SampleTexture(uNormalMap3, (uTerrainBlendMode == 1) ? vTexcoord0 : vTexcoord1, uEnableTexture3);
+
+    if (uTerrainBlendMode == 1) {
+        // --- CodeWalker-style blend ---
+        vec4 vc0 = vColor0;
+        vec4 vc1 = vColor1;
+        vec4 m = (uEnableTextureMask) ? texture(uBlendMask, vTexcoord1) : vc1;
+        // TerrainPS: vc1 = m*(1 - vc0.a) + vc1*vc0.a
+        vc1 = m * (1.0 - vc0.a) + vc1 * vc0.a;
+
+        // TerrainPS: t1 = c1*(1-vc1.b) + c2*vc1.b; t2 = c3*(1-vc1.b) + c4*vc1.b; tv = t1*(1-vc1.g) + t2*vc1.g
+        vec4 t1 = mix(c1, c2, vc1.b);
+        vec4 t2 = mix(c3, c4, vc1.b);
+        diffuse = mix(t1, t2, vc1.g);
+
+        if (uEnableNormalMap) {
+            vec4 nn1 = mix(n1s, n2s, vc1.b);
+            vec4 nn2 = mix(n3s, n4s, vc1.b);
+            vec4 nv = mix(nn1, nn2, vc1.g);
+            // Use CodeWalker-like normal map decode: only XY is used, bumpiness scales tangent contribution.
+            normal = NormalMapCW(nv.xy, uBumpiness, normal, vTangent.xyz, vBitangent.xyz);
+        }
     } else {
-        w /= sumW;
-    }
+        // --- RGBA splat weights (heightmap terrain path) ---
+        // Sample blend mask (match heightmap convention: v increases downward in vTexcoord0)
+        vec2 maskUv = vec2(vTexcoord0.x, 1.0 - vTexcoord0.y);
+        vec4 w = SampleTexture(uBlendMask, maskUv, uEnableTextureMask);
+        float sumW = w.r + w.g + w.b + w.a;
+        if (sumW <= 1e-5) {
+            w = vec4(1.0, 0.0, 0.0, 0.0);
+        } else {
+            w /= sumW;
+        }
+        diffuse = (c1 * w.r) + (c2 * w.g) + (c3 * w.b) + (c4 * w.a);
 
-    // Sample and blend tiled layer textures (use vTexcoord1 for tiling)
-    vec4 tex0 = SampleTexture(uColorMap0, vTexcoord1, uEnableTexture0);
-    vec4 tex1 = SampleTexture(uColorMap1, vTexcoord1, uEnableTexture1);
-    vec4 tex2 = SampleTexture(uColorMap2, vTexcoord1, uEnableTexture2);
-    vec4 tex3 = SampleTexture(uColorMap3, vTexcoord1, uEnableTexture3);
-    vec4 tex4 = SampleTexture(uColorMap4, vTexcoord1, uEnableTexture4);
-
-    // 4-layer blend using the mask weights. (If uColorMap4 is unused, keep uEnableTexture4=false.)
-    diffuse = (tex0 * w.r) + (tex1 * w.g) + (tex2 * w.b) + (tex3 * w.a);
-    // Optional extra contribution slot (disabled by default)
-    if (uEnableTexture4) {
-        diffuse = BlendTextures(diffuse, tex4, 0.0);
+        if (uEnableNormalMap) {
+            vec4 nv = (n1s * w.r) + (n2s * w.g) + (n3s * w.b) + (n4s * w.a);
+            // Use generic normal map decode (XYZ+W) for this mode.
+            normal = NormalMap(normal, vTangent.xyz, vBitangent.xyz, nv);
+        }
     }
     
     // Apply tint if enabled
@@ -138,28 +186,9 @@ void main() {
         diffuse *= tint;
     }
     
-    // Apply vertex color if enabled
-    if (uEnableVertexColour) {
-        diffuse *= vColor1;
-    }
-    
-    // Sample normal maps if enabled
-    if (uEnableNormalMap) {
-        vec4 normal0 = SampleTexture(uNormalMap0, vTexcoord0, uEnableTexture0);
-        vec4 normal1 = SampleTexture(uNormalMap1, vTexcoord1, uEnableTexture1);
-        vec4 normal2 = SampleTexture(uNormalMap2, vTexcoord2, uEnableTexture2);
-        vec4 normal3 = SampleTexture(uNormalMap3, vTexcoord1, uEnableTexture3);
-        vec4 normal4 = SampleTexture(uNormalMap4, vTexcoord2, uEnableTexture4);
-        
-        // Blend normal maps
-        vec4 blendedNormal = BlendTextures(normal0, normal1, vColor0.r);
-        blendedNormal = BlendTextures(blendedNormal, normal2, vColor0.g);
-        blendedNormal = BlendTextures(blendedNormal, normal3, vColor0.b);
-        blendedNormal = BlendTextures(blendedNormal, normal4, vColor0.a);
-        
-        // Apply normal mapping
-        normal = NormalMap(normal, vTangent.xyz, vBitangent.xyz, blendedNormal);
-    }
+    // Vertex colour usage in CodeWalker TerrainPS is shader-variant dependent and not consistently applied.
+    // Keep it disabled by default; if enabled, apply as a simple multiplier for debugging.
+    if (uEnableVertexColour) diffuse *= vColor0;
     
     // Calculate lighting
     vec3 lightDir = normalize(uLightDir);
@@ -172,9 +201,9 @@ void main() {
     float specularTerm = pow(NdotH, uSpecularPower);
     specular = vec4(uSpecularIntensity * specularTerm);
     
-    // Calculate irradiance
-    // uLightColor is vec3; vec4(vec3) is not a valid constructor in GLSL ES 3.00.
-    irradiance = vec4(uLightColor * (NdotL + uAmbientIntensity), 1.0);
+    // Calculate irradiance (lighting, not tonemapped):
+    // IMPORTANT: don't multiply ambient by uLightColor (that blows out HDR).
+    irradiance = vec4(vec3(uAmbientIntensity) + (uLightColor * NdotL), 1.0);
     
     // Apply shadows
     float shadow = vShadows.x;

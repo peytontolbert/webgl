@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGL GTA - Compressed Texture Extension Probe</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 16px; }
+      pre { background: #111; color: #eee; padding: 12px; border-radius: 8px; overflow: auto; }
+      code { background: #f3f3f3; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <h2>Compressed texture extension probe</h2>
+    <p>
+      This checks whether your browser/GPU supports DDS uploads for GTA textures (BC7/BC6H/BC5/etc).
+      Open DevTools console for details.
+    </p>
+    <pre id="out">Running…</pre>
+    <script>
+      (function () {
+        const outEl = document.getElementById('out');
+        const lines = [];
+        const log = (k, v) => lines.push(`${k}: ${v}`);
+        try {
+          const canvas = document.createElement('canvas');
+          const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+          log('webgl2', !!gl);
+          if (!gl) {
+            outEl.textContent = lines.join('\n') + '\n\nWebGL2 is required for this viewer DDS path.';
+            return;
+          }
+          const exts = [
+            'WEBGL_compressed_texture_s3tc',
+            'WEBGL_compressed_texture_s3tc_srgb',
+            'EXT_texture_compression_rgtc',
+            'EXT_texture_compression_bptc',
+            'EXT_texture_filter_anisotropic',
+          ];
+          for (const n of exts) {
+            const e = gl.getExtension(n);
+            log(n, !!e);
+          }
+          log('MAX_TEXTURE_SIZE', gl.getParameter(gl.MAX_TEXTURE_SIZE));
+          log('RENDERER', gl.getParameter(gl.RENDERER));
+          log('VENDOR', gl.getParameter(gl.VENDOR));
+          log('VERSION', gl.getParameter(gl.VERSION));
+        } catch (e) {
+          log('error', String(e && (e.stack || e.message || e)));
+        }
+        outEl.textContent = lines.join('\n');
+        try { console.log('[probe_compressed_textures]', lines.join('\n')); } catch {}
+      })();
+    </script>
+  </body>
+</html>
+
+

@@ -28,6 +28,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -35,6 +36,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urlparse
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from gta5_modules.hash_utils import joaat as _joaat
+from gta5_modules.texture_naming import slugify_texture_name as _slugify_texture_name_shared
 
 
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
@@ -106,26 +114,12 @@ def joaat(input_str: str) -> int:
     GTA "joaat" (Jenkins one-at-a-time) hash.
     Matches `webgl/webgl_viewer/js/joaat.js`.
     """
-    s = str(input_str or "").lower()
-    h = 0
-    for ch in s:
-        h = (h + ord(ch)) & 0xFFFFFFFF
-        h = (h + ((h << 10) & 0xFFFFFFFF)) & 0xFFFFFFFF
-        h ^= (h >> 6)
-    h = (h + ((h << 3) & 0xFFFFFFFF)) & 0xFFFFFFFF
-    h ^= (h >> 11)
-    h = (h + ((h << 15) & 0xFFFFFFFF)) & 0xFFFFFFFF
-    return h & 0xFFFFFFFF
+    return int(_joaat(input_str, lower=True)) & 0xFFFFFFFF
 
 
 def slugify_texture_name(name: str) -> str:
-    s = str(name or "").strip().lower()
-    if not s:
-        return ""
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    s = re.sub(r"^_+", "", s)
-    s = re.sub(r"_+$", "", s)
-    return s
+    # Wrapper kept for legacy callers in this script.
+    return str(_slugify_texture_name_shared(name))
 
 
 def normalize_input_to_basename(s: str) -> str:
@@ -223,15 +217,44 @@ def iter_stage_dirs(viewer_root: Path) -> list[tuple[str, Path]]:
 
     # We include a few common export layouts; not all will exist.
     # (The repo has historically used both `models_textures/` and `models/models_textures/` naming.)
-    return [
+    out = [
         ("output (export)", out_dir / "models_textures"),
         ("output (export)", out_dir / "models" / "models_textures"),
         ("output (export)", out_dir / "models_textures_png"),
+        ("output (export)", out_dir / "models_textures_ktx2"),
+        ("output (export)", out_dir / "models" / "models_textures_ktx2"),
         ("viewer assets", viewer_root / "assets" / "models_textures"),
+        ("viewer assets", viewer_root / "assets" / "models_textures_ktx2"),
         ("viewer assets (legacy)", viewer_root / "assets" / "models" / "models_textures"),
         ("dist assets", viewer_root / "dist" / "assets" / "models_textures"),
+        ("dist assets", viewer_root / "dist" / "assets" / "models_textures_ktx2"),
         ("dist assets (legacy)", viewer_root / "dist" / "assets" / "models" / "models_textures"),
     ]
+    # Optional asset packs (base + DLC overlay). Add pack roots if configured.
+    try:
+        ap = viewer_root / "assets" / "asset_packs.json"
+        if ap.exists():
+            cfg = json.loads(ap.read_text(encoding="utf-8", errors="ignore"))
+            packs = cfg.get("packs") if isinstance(cfg, dict) else None
+            if isinstance(packs, list):
+                for p in packs:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("enabled") is False:
+                        continue
+                    rr = str(p.get("rootRel") or p.get("root") or "").strip().strip("/").lstrip("/")
+                    if not rr:
+                        pid = str(p.get("id") or "").strip()
+                        if not pid:
+                            continue
+                        rr = f"packs/{pid}"
+                    out.append(("viewer pack", viewer_root / "assets" / rr / "models_textures"))
+                    out.append(("viewer pack", viewer_root / "assets" / rr / "models_textures_ktx2"))
+                    out.append(("dist pack", viewer_root / "dist" / "assets" / rr / "models_textures"))
+                    out.append(("dist pack", viewer_root / "dist" / "assets" / rr / "models_textures_ktx2"))
+    except Exception:
+        pass
+    return out
 
 
 def _fmt_size(n: int) -> str:
@@ -431,7 +454,15 @@ def _trace_source_ytd_best_effort(
 
     # Import lazily so this script still runs without pythonnet/CodeWalker present.
     try:
-        sys.path.insert(0, str(repo_root / "webgl"))
+        # Repo layouts differ:
+        # - legacy: repo_root/webgl/gta5_modules/...
+        # - current: repo_root/gta5_modules/...
+        #
+        # Support both so callers can run this tool from anywhere.
+        sys.path.insert(0, str(repo_root))
+        webgl_dir = repo_root / "webgl"
+        if webgl_dir.exists():
+            sys.path.insert(0, str(webgl_dir))
         from gta5_modules.dll_manager import DllManager  # type: ignore
         from gta5_modules.rpf_reader import RpfReader  # type: ignore
     except Exception as e:
@@ -444,19 +475,24 @@ def _trace_source_ytd_best_effort(
     print("  - want texture names:", ", ".join(want[:6]) + (" ..." if len(want) > 6 else ""))
 
     try:
-        # CodeWalker key loading expects gta5.exe (or gta5_enhanced.exe) to exist under game_path.
+        # NOTE (Linux / server installs):
+        # Many environments only have the GTA data files (x64/, update/, etc) and do NOT include
+        # gta5.exe. The rest of our pipeline (DllManager/RpfReader) can still work in these cases.
+        # So we treat missing exe as a warning, not a hard failure.
         gp = Path(game_path)
+        if not gp.exists() or not gp.is_dir():
+            print("  - FAILED: --game-path does not exist or is not a directory:", gp)
+            return
         exe = gp / "gta5.exe"
         exe_enh = gp / "gta5_enhanced.exe"
         if not exe.exists() and not exe_enh.exists():
-            print("  - FAILED: could not find gta5.exe under --game-path")
-            print("    Expected one of:")
-            print(f"      - {exe}")
-            print(f"      - {exe_enh}")
-            print("    Fix: pass your real GTA install folder (the one that contains gta5.exe).")
-            print("    Example:")
-            print('      --game-path "C:\\\\Program Files (x86)\\\\Steam\\\\steamapps\\\\common\\\\Grand Theft Auto V"')
-            return
+            # Soft warning only.
+            print("  - NOTE: gta5.exe not found under --game-path (ok on Linux/data-only installs).")
+            # Helpful sanity signals:
+            has_update = (gp / "update").exists()
+            has_x64 = (gp / "x64").exists()
+            print(f"    - has update/: {bool(has_update)}")
+            print(f"    - has x64/:    {bool(has_x64)}")
 
         dm = DllManager(game_path)
         if not getattr(dm, "initialized", False):
@@ -713,7 +749,9 @@ def main() -> int:
             if ytd_hint and len(ytd_hint) > 24:
                 ytd_hint = ytd_hint[:24]
 
-        repo_root = viewer_root.parent.parent.resolve()  # .../webglgta
+        # Repo root should be the directory containing `gta5_modules/`.
+        # If viewer_root is "<repo>/webgl_viewer", that is viewer_root.parent.
+        repo_root = viewer_root.parent.resolve()
         _trace_source_ytd_best_effort(
             repo_root=repo_root,
             game_path=game_path,
