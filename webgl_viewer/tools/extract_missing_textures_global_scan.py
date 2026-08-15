@@ -60,11 +60,13 @@ def _pixels_to_image_rgba(pixels: bytes, width: int, height: int) -> Image.Image
     exp_rgba = width * height * 4
     exp_rgb = width * height * 3
     if n == exp_rgba:
-        return Image.frombytes("RGBA", (width, height), pixels)
+        # CodeWalker's DDSIO.GetPixels returns Windows-style BGRA rows. Writing
+        # that byte order as RGBA makes neutral roads/paving render purple-blue.
+        return Image.frombytes("RGBA", (width, height), pixels, "raw", "BGRA")
     if n == exp_rgb:
-        return Image.frombytes("RGB", (width, height), pixels).convert("RGBA")
+        return Image.frombytes("RGB", (width, height), pixels, "raw", "BGR").convert("RGBA")
     if n > exp_rgba:
-        return Image.frombytes("RGBA", (width, height), pixels[:exp_rgba])
+        return Image.frombytes("RGBA", (width, height), pixels[:exp_rgba], "raw", "BGRA")
     raise ValueError(f"unexpected pixel buffer size={n} (expected {exp_rgb} or {exp_rgba})")
 
 
@@ -146,6 +148,11 @@ def main() -> int:
             "Can be provided multiple times."
         ),
     )
+    ap.add_argument(
+        "--base-only",
+        action="store_true",
+        help="Scan only base-game YTDs and skip update/DLC overlay passes.",
+    )
     ap.add_argument("--dump", required=True)
     ap.add_argument(
         "--out-dir",
@@ -169,8 +176,17 @@ def main() -> int:
         ),
     )
     ap.add_argument("--max-ytd", type=int, default=0, help="0 = no cap; otherwise stop after scanning N ytds")
+    ap.add_argument(
+        "--ytd-source-regex",
+        default="",
+        help=(
+            "Optional case-insensitive regex applied to YTD name/path before loading it. "
+            "Use this to target a bounded world area (for example '(dt1|downtown|road)')."
+        ),
+    )
     ap.add_argument("--ytd-load-loops", type=int, default=400, help="Max ContentThreadProc loops per YTD load attempt.")
     ap.add_argument("--ytd-load-retries", type=int, default=2, help="Retries per YTD if it doesn't load quickly.")
+    ap.add_argument("--overwrite", action="store_true", help="Replace existing hash and hash+slug outputs with freshly decoded textures.")
     ap.add_argument("--regen-index", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -247,8 +263,14 @@ def main() -> int:
             return "__all__"
         return t
 
-    sel0 = _resolve_selected_dlc(str(args.selected_dlc))
-    dm.init_game_file_cache(selected_dlc=sel0, load_vehicles=False, load_peds=False, load_audio=False)
+    sel0 = "" if args.base_only else _resolve_selected_dlc(str(args.selected_dlc))
+    dm.init_game_file_cache(
+        selected_dlc=sel0,
+        load_vehicles=False,
+        load_peds=False,
+        load_audio=False,
+        force_all_dlc=not bool(args.base_only),
+    )
     gfc = dm.get_game_cache()
     if gfc is None or not getattr(gfc, "IsInited", False):
         raise SystemExit("GameFileCache not inited.")
@@ -286,6 +308,31 @@ def main() -> int:
     extracted = 0
     failed = 0
     ytd_load_failed = 0
+    ytd_source_re = None
+    if str(args.ytd_source_regex or "").strip():
+        try:
+            ytd_source_re = re.compile(str(args.ytd_source_regex), re.IGNORECASE)
+        except re.error as e:
+            raise SystemExit(f"Invalid --ytd-source-regex: {e}")
+
+    def _matches_ytd_source_filter(ytd) -> bool:
+        if ytd_source_re is None:
+            return True
+        parts = []
+        for attr in ("Name", "NameLower", "Path"):
+            try:
+                value = str(getattr(ytd, attr, "") or "").strip()
+                if value:
+                    parts.append(value)
+            except Exception:
+                pass
+        try:
+            entry_path, _dlc = _get_gamefile_entry_path_and_dlc(ytd)
+            if entry_path:
+                parts.append(str(entry_path))
+        except Exception:
+            pass
+        return bool(ytd_source_re.search("\n".join(parts)))
 
     # Optional targeted mode: use a prebuilt hash->ytd mapping to avoid scanning all YTDs.
     # This turns the common case into: O(#missing hashes + #ytds containing them).
@@ -330,12 +377,12 @@ def main() -> int:
                 # Prefer PNG when decodable; else write DDS fallback (Gen9 BC7/BC6H, etc).
                 if img is not None:
                     out_hash = write_dir / f"{texhash}.png"
-                    if not out_hash.exists():
+                    if args.overwrite or not out_hash.exists():
                         img.save(out_hash)
                     slug = wanted.get(texhash, "")
                     if slug:
                         out_slug = write_dir / f"{texhash}_{slug}.png"
-                        if not out_slug.exists():
+                        if args.overwrite or not out_slug.exists():
                             img.save(out_slug)
                 else:
                     dds = _try_get_dds_bytes(ddsio, tex)
@@ -345,12 +392,12 @@ def main() -> int:
                         need.discard(texhash)
                         continue
                     out_hash = write_dir / f"{texhash}.dds"
-                    if not out_hash.exists():
+                    if args.overwrite or not out_hash.exists():
                         out_hash.write_bytes(dds)
                     slug = wanted.get(texhash, "")
                     if slug:
                         out_slug = write_dir / f"{texhash}_{slug}.dds"
-                        if not out_slug.exists():
+                        if args.overwrite or not out_slug.exists():
                             out_slug.write_bytes(dds)
                 local_extracted += 1
                 extracted += 1
@@ -484,6 +531,8 @@ def main() -> int:
                 continue
             if ytd is None:
                 continue
+            if not _matches_ytd_source_filter(ytd):
+                continue
             # Encourage direct load if the API exists (helps when the content queue is long).
             # Some pythonnet bindings can surface LoadFile as a non-bound method; treat failures as non-fatal.
             try:
@@ -560,12 +609,12 @@ def main() -> int:
                     # Write both hash-only and hash+slug if slug known.
                     if img is not None:
                         out_hash = write_dir / f"{texhash}.png"
-                        if not out_hash.exists():
+                        if args.overwrite or not out_hash.exists():
                             img.save(out_hash)
                         slug = wanted.get(texhash, "")
                         if slug:
                             out_slug = write_dir / f"{texhash}_{slug}.png"
-                            if not out_slug.exists():
+                            if args.overwrite or not out_slug.exists():
                                 img.save(out_slug)
                     else:
                         dds = _try_get_dds_bytes(ddsio, tex)
@@ -575,12 +624,12 @@ def main() -> int:
                             need.discard(texhash)
                             continue
                         out_hash = write_dir / f"{texhash}.dds"
-                        if not out_hash.exists():
+                        if args.overwrite or not out_hash.exists():
                             out_hash.write_bytes(dds)
                         slug = wanted.get(texhash, "")
                         if slug:
                             out_slug = write_dir / f"{texhash}_{slug}.dds"
-                            if not out_slug.exists():
+                            if args.overwrite or not out_slug.exists():
                                 out_slug.write_bytes(dds)
                     local_extracted += 1
                     extracted += 1
@@ -601,7 +650,7 @@ def main() -> int:
     _scan_one_pass(str(args.selected_dlc or ""))
 
     # Optional extra passes (useful for CodeWalker DLC special cases like patchday27ng).
-    for extra in list(args.also_scan_dlc or []):
+    for extra in ([] if args.base_only else list(args.also_scan_dlc or [])):
         if not need:
             break
         try:

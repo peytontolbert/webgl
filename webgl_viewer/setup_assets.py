@@ -28,7 +28,16 @@ _MAX_INST_BINS_CHUNKS = 0
 _SHOULD_BUILD_CHUNK_SHARD_INDEX = False
 _MAX_CHUNK_SHARD_INDEX_CHUNKS = 0
 
-def setup_assets():
+def _remove_file_if_exists(path: Path):
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+            print(f"Removed stale debug asset: {path.name}")
+    except Exception as e:
+        print(f"Warning: failed to remove stale debug asset {path}: {e}")
+
+
+def setup_assets(include_debug_objs: bool = False):
     """Set up assets for the WebGL viewer"""
     viewer_dir = Path(__file__).parent.resolve()
     webgl_dir = viewer_dir.parent.resolve()
@@ -63,13 +72,19 @@ def setup_assets():
         # Keep setup best-effort; missing ymap content is not fatal to the core viewer.
         pass
     
-    # Copy terrain.obj if it exists
-    terrain_obj = output_dir / 'terrain.obj'
-    if terrain_obj.exists():
-        shutil.copy2(terrain_obj, assets_dir / 'terrain.obj')
-        print("Copied terrain.obj")
+    # Monolithic OBJ files are debug/export artifacts, not client-like runtime assets.
+    # Keep them out of assets by default so stale files do not get copied to dist.
+    debug_asset_names = ('terrain.obj', 'entities.obj', 'buildings.obj', 'building_info.json')
+    if include_debug_objs:
+        terrain_obj = output_dir / 'terrain.obj'
+        if terrain_obj.exists():
+            shutil.copy2(terrain_obj, assets_dir / 'terrain.obj')
+            print("Copied terrain.obj")
+        else:
+            print("Warning: terrain.obj not found")
     else:
-        print("Warning: terrain.obj not found")
+        for name in debug_asset_names:
+            _remove_file_if_exists(assets_dir / name)
     
     # Copy terrain_info.json if it exists
     terrain_info = output_dir / 'terrain_info.json'
@@ -106,8 +121,15 @@ def setup_assets():
     hm16_bin = output_dir / 'heightmap_u16.bin'
 
     if hm16_bin_collision.exists() and hm16_json_collision.exists():
-        shutil.copy2(hm16_json_collision, assets_dir / 'heightmap_u16.json')
         shutil.copy2(hm16_bin_collision, assets_dir / 'heightmap_u16.bin')
+        # The viewer keeps a stable public filename even when the output source is collision-derived.
+        # Rewrite the sidecar after copy so it cannot reference the output-only collision filename.
+        try:
+            hm16_meta = json.loads(hm16_json_collision.read_text(encoding='utf-8'))
+            hm16_meta['file'] = 'heightmap_u16.bin'
+            (assets_dir / 'heightmap_u16.json').write_text(json.dumps(hm16_meta, indent=2), encoding='utf-8')
+        except Exception:
+            shutil.copy2(hm16_json_collision, assets_dir / 'heightmap_u16.json')
         print("Copied heightmap_collision_u16.(json|bin) -> assets/heightmap_u16.(json|bin)")
     elif hm16_bin.exists() and hm16_json.exists():
         shutil.copy2(hm16_json, assets_dir / 'heightmap_u16.json')
@@ -127,21 +149,22 @@ def setup_assets():
         shutil.copy2(lod_levels, assets_dir / 'lod_levels.png')
         print("Copied lod_levels.png")
 
-    # Optional: copy entities/buildings outputs for debugging/inspection
-    entities_obj = output_dir / 'entities.obj'
-    if entities_obj.exists():
-        shutil.copy2(entities_obj, assets_dir / 'entities.obj')
-        print("Copied entities.obj")
+    # Optional: copy entities/buildings outputs for debugging/inspection.
+    if include_debug_objs:
+        entities_obj = output_dir / 'entities.obj'
+        if entities_obj.exists():
+            shutil.copy2(entities_obj, assets_dir / 'entities.obj')
+            print("Copied entities.obj")
 
-    buildings_obj = output_dir / 'buildings.obj'
-    if buildings_obj.exists():
-        shutil.copy2(buildings_obj, assets_dir / 'buildings.obj')
-        print("Copied buildings.obj")
+        buildings_obj = output_dir / 'buildings.obj'
+        if buildings_obj.exists():
+            shutil.copy2(buildings_obj, assets_dir / 'buildings.obj')
+            print("Copied buildings.obj")
 
-    building_info = output_dir / 'building_info.json'
-    if building_info.exists():
-        shutil.copy2(building_info, assets_dir / 'building_info.json')
-        print("Copied building_info.json")
+        building_info = output_dir / 'building_info.json'
+        if building_info.exists():
+            shutil.copy2(building_info, assets_dir / 'building_info.json')
+            print("Copied building_info.json")
 
     # Client-like entity streaming assets
     entities_index = output_dir / 'entities_index.json'
@@ -375,7 +398,7 @@ def setup_assets():
     manifest = {
         'version': '1.0',
         'terrain': {
-            'obj_file': 'terrain.obj',
+            'obj_file': 'terrain.obj' if include_debug_objs else None,
             'info_file': 'terrain_info.json',
             'heightmap_file': 'heightmap.png',
             'textures_dir': 'textures'
@@ -1769,6 +1792,7 @@ if __name__ == '__main__':
     ap.add_argument("--max-inst-bins-chunks", type=int, default=0, help="Limit number of chunks converted to inst bins (0 = all)")
     ap.add_argument("--build-chunk-shard-index", action="store_true", help="Build assets/entities_chunk_shards.json (chunk -> models manifest shard IDs) for faster model-meta prefetch")
     ap.add_argument("--max-chunk-shard-index-chunks", type=int, default=0, help="Limit number of chunks scanned for entities_chunk_shards.json (0 = all)")
+    ap.add_argument("--include-debug-objs", action="store_true", help="Stage monolithic terrain/entities/buildings OBJ debug files into viewer assets")
     args = ap.parse_args()
 
     # module-global flag used inside setup_assets() without changing call sites
@@ -1778,4 +1802,4 @@ if __name__ == '__main__':
     _MAX_INST_BINS_CHUNKS = int(args.max_inst_bins_chunks or 0)
     _SHOULD_BUILD_CHUNK_SHARD_INDEX = bool(args.build_chunk_shard_index)
     _MAX_CHUNK_SHARD_INDEX_CHUNKS = int(args.max_chunk_shard_index_chunks or 0)
-    setup_assets()
+    setup_assets(include_debug_objs=bool(args.include_debug_objs))

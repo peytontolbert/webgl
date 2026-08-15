@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clothing Pack Curation</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background:#111315; color:#e7e9ea; }
+    * { box-sizing:border-box; letter-spacing:0; }
+    body { margin:0; min-height:100vh; background:#111315; }
+    button,input,select { font:inherit; }
+    header { height:58px; border-bottom:1px solid #30343a; display:flex; align-items:center; gap:18px; padding:0 22px; background:#17191c; position:sticky; top:0; z-index:5; }
+    h1 { font-size:17px; margin:0; font-weight:650; }
+    .summary { color:#9da3aa; font-size:13px; }
+    .spacer { flex:1; }
+    button { border:1px solid #424850; background:#25292e; color:#f3f4f5; padding:8px 12px; border-radius:5px; cursor:pointer; }
+    button.primary { background:#d8ef45; border-color:#d8ef45; color:#111315; font-weight:700; }
+    main { display:grid; grid-template-columns:260px minmax(0,1fr) 380px; min-height:calc(100vh - 58px); }
+    aside { padding:18px; border-right:1px solid #30343a; background:#15171a; }
+    aside.right { border-right:0; border-left:1px solid #30343a; }
+    label { display:block; color:#aeb3b8; font-size:12px; margin:0 0 6px; }
+    input,select { width:100%; background:#0f1113; border:1px solid #3a3f45; color:#f3f4f5; padding:9px 10px; border-radius:4px; margin-bottom:14px; }
+    .filters { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .filters button[aria-pressed="true"] { border-color:#d8ef45; color:#d8ef45; }
+    .content { padding:18px; overflow:hidden; }
+    .toolbar { display:flex; align-items:center; gap:12px; margin-bottom:14px; color:#9da3aa; font-size:13px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:10px; }
+    .item { min-height:214px; border:1px solid #30343a; background:#1a1d20; padding:0; text-align:left; overflow:hidden; border-radius:6px; }
+    .item.current { border-color:#d8ef45; box-shadow:inset 0 0 0 1px #d8ef45; }
+    .item.added .status { background:#58c879; box-shadow:0 0 0 3px rgba(88,200,121,.16); }
+    .preview { height:126px; display:grid; place-items:center; background:#0f1113; border-bottom:1px solid #30343a; position:relative; }
+    .garment { width:74px; height:88px; border:2px solid #6f7780; border-radius:6px 6px 16px 16px; display:grid; place-items:center; color:#aeb3b8; font-size:11px; font-weight:700; background:#20252a; }
+    .sex { position:absolute; top:8px; left:8px; font-size:10px; color:#9da3aa; text-transform:uppercase; }
+    .status { position:absolute; top:8px; right:8px; width:8px; height:8px; border-radius:50%; background:#e6a23c; }
+    .meta { padding:11px; }
+    .meta strong { display:block; font-size:13px; margin-bottom:5px; }
+    .meta small { color:#939aa2; display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .variants { display:flex; gap:4px; margin-top:9px; flex-wrap:wrap; }
+    .swatch { width:20px; height:20px; border:1px solid #59616a; border-radius:3px; display:grid; place-items:center; font-size:9px; color:#d8dde1; }
+    .selected-list { display:grid; gap:8px; margin-top:12px; max-height:calc(100vh - 210px); overflow:auto; }
+    .selected-row { border-bottom:1px solid #30343a; padding:0 0 9px; font-size:12px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:start; }
+    .selected-row-info { min-width:0; }
+    .selected-row strong { display:block; margin-bottom:3px; }
+    .selected-row span { display:block; color:#9299a0; margin-top:2px; }
+    .selected-row select { margin:4px 0 0; padding:5px; }
+    .selected-row button { padding:5px 8px; color:#c7ccd1; }
+    .empty { color:#818890; font-size:13px; line-height:1.5; }
+    .live-preview { width:100%; aspect-ratio:3 / 4; border:1px solid #30343a; background:#0f1113; margin:12px 0 14px; overflow:hidden; position:relative; }
+    .live-preview canvas { width:100%; height:100%; display:block; cursor:grab; }
+    .live-preview canvas:active { cursor:grabbing; }
+    .live-preview-placeholder { position:absolute; inset:0; display:grid; place-items:center; padding:24px; color:#8f969d; text-align:center; font-size:13px; line-height:1.45; }
+    .live-preview.ready .live-preview-placeholder { display:none; }
+    .review-title { display:block; font-size:15px; margin-bottom:3px; }
+    .review-detail { color:#9299a0; font-size:12px; min-height:18px; }
+    .review-texture { margin:10px 0 8px; }
+    .review-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:16px; }
+    .review-actions button { min-height:40px; }
+    .review-actions .accept { background:#d8ef45; border-color:#d8ef45; color:#111315; font-weight:700; }
+    .added-heading { display:block; border-top:1px solid #30343a; padding-top:14px; }
+    @media(max-width:900px){ main{grid-template-columns:1fr}.left,.right{border:0;border-bottom:1px solid #30343a}.right{border-top:1px solid #30343a}.grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))} }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>clothingpack5m curation</h1>
+    <span class="summary" id="packSummary">Loading catalog</span>
+    <span class="spacer"></span>
+    <button id="clearSelection">Clear added</button>
+    <button class="primary" id="exportSelection">Export selection</button>
+  </header>
+  <main>
+    <aside class="left">
+      <label for="search">Search</label><input id="search" type="search" placeholder="Component, collection, drawable">
+      <label for="component">Component</label><select id="component"><option value="">All components</option></select>
+      <label>Gender</label>
+      <div class="filters" id="sexFilters">
+        <button data-sex="" aria-pressed="true">All</button><button data-sex="male">Male</button><button data-sex="female">Female</button><button data-sex="unisex">Unisex</button>
+      </div>
+    </aside>
+    <section class="content">
+      <div class="toolbar"><span id="resultCount">0 items</span><span>Choose an item to load its automatic 3D preview</span></div>
+      <div class="grid" id="catalog"></div>
+    </section>
+    <aside class="right">
+      <strong class="review-title" id="reviewTitle">Review garment</strong>
+      <span class="review-detail" id="reviewDetail">Choose an item</span>
+      <p class="empty" id="queueStatus" role="status"></p>
+      <div class="live-preview" id="livePreview">
+        <canvas id="garmentPreviewCanvas" aria-label="Garment 3D preview"></canvas>
+        <span class="live-preview-placeholder" id="livePreviewPlaceholder">Select a garment to inspect it in 3D.</span>
+      </div>
+      <select class="review-texture" id="reviewTexture" aria-label="Preview texture" hidden></select>
+      <div class="review-actions">
+        <button id="skipGarment" type="button">Skip</button>
+        <button class="accept" id="addGarment" type="button">Add to demo</button>
+      </div>
+      <strong class="added-heading" id="addedHeading">Added to demo</strong>
+      <div class="selected-list" id="selectedList"></div>
+    </aside>
+  </main>
+  <script type="module" src="/js/clothing_selector.js"></script>
+</body>
+</html>

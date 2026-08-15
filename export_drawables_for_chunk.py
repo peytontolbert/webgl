@@ -30,6 +30,12 @@ import subprocess
 import numpy as np
 from PIL import Image
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
+
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.hash_utils import joaat as _joaat
 from gta5_modules.script_paths import auto_assets_dir
@@ -46,7 +52,7 @@ def _infer_dlc_name_from_entry_path(p: str) -> str:
 
 
 MESH_MAGIC = b"MSH0"
-MESH_VERSION = 7
+MESH_VERSION = 8
 FLAG_HAS_NORMALS = 1
 FLAG_HAS_UVS = 2
 FLAG_HAS_TANGENTS = 4
@@ -54,6 +60,41 @@ FLAG_HAS_COLOR0 = 8
 FLAG_HAS_UV1 = 16
 FLAG_HAS_UV2 = 32
 FLAG_HAS_COLOR1 = 64
+FLAG_HAS_BLEND_WEIGHTS = 128
+FLAG_HAS_BLEND_INDICES = 256
+
+
+def _remove_known_nonrenderable_geometry(
+    archetype_hash: int,
+    lod: str,
+    submesh_index: int,
+    indices: np.ndarray,
+    color0: np.ndarray | None,
+) -> np.ndarray:
+    """Remove verified helper geometry that GTA does not display in its color pass."""
+    if (
+        (int(archetype_hash) & 0xFFFFFFFF) != 1563936387
+        or str(lod).lower() not in ("high", "med")
+        or int(submesh_index) != 0
+        or color0 is None
+    ):
+        return indices
+
+    colors = np.asarray(color0, dtype=np.uint8).reshape((-1, 4))
+    triangles = np.asarray(indices, dtype=np.uint32).reshape((-1, 3))
+    proxy_vertices = (colors[:, 0] == 118) & (colors[:, 1] == 118)
+    proxy_triangles = np.all(proxy_vertices[triangles], axis=1)
+
+    # Both authored LODs contain one disconnected 43-vertex ellipsoid made of
+    # exactly 48 triangles. Keep the guard strict so a changed source asset is
+    # never modified based on vertex color alone.
+    if int(np.count_nonzero(proxy_triangles)) != 48:
+        return indices
+    proxy_indices = np.unique(triangles[proxy_triangles])
+    if int(proxy_indices.size) != 43:
+        return indices
+
+    return triangles[~proxy_triangles].reshape((-1,)).astype(np.uint32, copy=False)
 
 # Shader param hashes from CodeWalker.Core (ShaderParamNames enum).
 _SP_G_TEXCOORD_SCALE_OFFSET0 = 3099617970  # gTexCoordScaleOffset0
@@ -576,9 +617,34 @@ def _component_offset(vdecl, idx: int) -> int:
         return 0
 
 
+def _extract_u8x4_component(vb, vcount: int, stride: int, offset: int, type_name: str) -> np.ndarray | None:
+    """
+    Extract a 4-byte vertex component. GTA blend weights/indices are packed as u8x4
+    under the legacy declaration types, even when CodeWalker names the component Colour.
+    """
+    t = str(type_name or "")
+    if not any(k in t for k in ("UByte4", "Byte4", "Colour")):
+        return None
+    try:
+        return np.ndarray((vcount, 4), dtype=np.uint8, buffer=vb, offset=int(offset), strides=(int(stride), 1)).copy()
+    except Exception:
+        return None
+
+
 def _extract_geometry_positions_indices_uv0_uv1_color0(
     geom,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None] | None:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+] | None:
     """
     Extract positions + indices + UV0 (+ Color0 when present) from a CodeWalker drawable geometry.
 
@@ -655,6 +721,16 @@ def _extract_geometry_positions_indices_uv0_uv1_color0(
         except Exception:
             tan = None
 
+    # BlendWeights is semantic index 1 and BlendIndices is semantic index 2.
+    # These are the per-vertex skin influences used with DrawableGeometry.BoneIds.
+    blend_weights = None
+    blend_indices = None
+    if vdecl:
+        if _has_component(vdecl, 1):
+            blend_weights = _extract_u8x4_component(vb, vcount, stride, _component_offset(vdecl, 1), _component_type_name(vdecl, 1))
+        if _has_component(vdecl, 2):
+            blend_indices = _extract_u8x4_component(vb, vcount, stride, _component_offset(vdecl, 2), _component_type_name(vdecl, 2))
+
     # Color0 is semantic index 4; Color1 is semantic index 5.
     col0 = None
     col1 = None
@@ -703,6 +779,8 @@ def _extract_geometry_positions_indices_uv0_uv1_color0(
         (col0.astype(np.uint8) if col0 is not None else None),
         (col1.astype(np.uint8) if col1 is not None else None),
         (tan.astype(np.float32) if tan is not None else None),
+        (blend_weights.astype(np.uint8) if blend_weights is not None else None),
+        (blend_indices.astype(np.uint8) if blend_indices is not None else None),
     )
 
 
@@ -722,7 +800,18 @@ def _compute_planar_uvs_xy01(positions: np.ndarray) -> np.ndarray:
 
 def _merge_geometries(
     geoms,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None] | None:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+] | None:
     all_pos = []
     all_idx = []
     all_uv0 = []
@@ -731,6 +820,8 @@ def _merge_geometries(
     all_col0 = []
     all_col1 = []
     all_tan = []
+    all_blend_weights = []
+    all_blend_indices = []
     vbase = 0
     any_uv_missing = False
     any_uv1_missing = False
@@ -738,11 +829,13 @@ def _merge_geometries(
     any_col_missing = False
     any_col1_missing = False
     any_tan_missing = False
+    any_blend_weights_missing = False
+    any_blend_indices_missing = False
     for geom in geoms:
         res = _extract_geometry_positions_indices_uv0_uv1_color0(geom)
         if res is None:
             continue
-        pos, idx, uv0, uv1, uv2, col0, col1, tan = res
+        pos, idx, uv0, uv1, uv2, col0, col1, tan, blend_weights, blend_indices = res
         if pos.size == 0 or idx.size == 0:
             continue
         all_pos.append(pos)
@@ -771,6 +864,14 @@ def _merge_geometries(
             any_tan_missing = True
         else:
             all_tan.append(tan)
+        if blend_weights is None:
+            any_blend_weights_missing = True
+        else:
+            all_blend_weights.append(blend_weights)
+        if blend_indices is None:
+            any_blend_indices_missing = True
+        else:
+            all_blend_indices.append(blend_indices)
         vbase += pos.shape[0]
     if not all_pos or not all_idx:
         return None
@@ -782,6 +883,8 @@ def _merge_geometries(
     col0 = None
     col1 = None
     tan = None
+    blend_weights = None
+    blend_indices = None
     if (not any_uv_missing) and all_uv0 and len(all_uv0) == len(all_pos):
         uv0 = np.vstack(all_uv0).astype(np.float32)
     if (not any_uv1_missing) and all_uv1 and len(all_uv1) == len(all_pos):
@@ -794,7 +897,11 @@ def _merge_geometries(
         col1 = np.vstack(all_col1).astype(np.uint8)
     if (not any_tan_missing) and all_tan and len(all_tan) == len(all_pos):
         tan = np.vstack(all_tan).astype(np.float32)
-    return positions, indices, uv0, uv1, uv2, col0, col1, tan
+    if (not any_blend_weights_missing) and all_blend_weights and len(all_blend_weights) == len(all_pos):
+        blend_weights = np.vstack(all_blend_weights).astype(np.uint8)
+    if (not any_blend_indices_missing) and all_blend_indices and len(all_blend_indices) == len(all_pos):
+        blend_indices = np.vstack(all_blend_indices).astype(np.uint8)
+    return positions, indices, uv0, uv1, uv2, col0, col1, tan, blend_weights, blend_indices
 
 
 def _extract_drawable_lods(drawable) -> dict:
@@ -830,7 +937,7 @@ def _extract_drawable_lods(drawable) -> dict:
         merged = _merge_geometries(geoms)
         if merged is None:
             continue
-        pos, idx, uv0, _uv1, _uv2, _col0, _col1 = merged
+        pos, idx, uv0, _uv1, _uv2, _col0, _col1, _tan, _blend_weights, _blend_indices = merged
         nrm = _compute_vertex_normals(pos, idx)
         lods_out[lod] = (pos, idx, nrm, uv0)
     return {"lods": lods_out, "lodDistances": lod_distances}
@@ -847,6 +954,8 @@ def _write_mesh_bin(
     uvs1: np.ndarray | None = None,
     uvs2: np.ndarray | None = None,
     color1: np.ndarray | None = None,
+    blend_weights: np.ndarray | None = None,
+    blend_indices: np.ndarray | None = None,
 ):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     positions = np.asarray(positions, dtype=np.float32)
@@ -887,6 +996,16 @@ def _write_mesh_bin(
         if color1.shape[0] != positions.shape[0] or color1.shape[1] != 4:
             raise ValueError("color1 shape mismatch")
         flags |= FLAG_HAS_COLOR1
+    if blend_weights is not None:
+        blend_weights = np.asarray(blend_weights, dtype=np.uint8)
+        if blend_weights.shape[0] != positions.shape[0] or blend_weights.shape[1] != 4:
+            raise ValueError("blend_weights shape mismatch")
+        flags |= FLAG_HAS_BLEND_WEIGHTS
+    if blend_indices is not None:
+        blend_indices = np.asarray(blend_indices, dtype=np.uint8)
+        if blend_indices.shape[0] != positions.shape[0] or blend_indices.shape[1] != 4:
+            raise ValueError("blend_indices shape mismatch")
+        flags |= FLAG_HAS_BLEND_INDICES
 
     header = struct.pack(
         "<4sIIII",
@@ -914,6 +1033,10 @@ def _write_mesh_bin(
             f.write(color0.tobytes(order="C"))
         if flags & FLAG_HAS_COLOR1:
             f.write(color1.tobytes(order="C"))
+        if flags & FLAG_HAS_BLEND_WEIGHTS:
+            f.write(blend_weights.tobytes(order="C"))
+        if flags & FLAG_HAS_BLEND_INDICES:
+            f.write(blend_indices.tobytes(order="C"))
         f.write(indices.tobytes(order="C"))
 
 
@@ -2713,7 +2836,7 @@ def _safe_tex_name(s: str) -> str:
 def _extract_drawable_lod_submeshes(drawable, lod: str) -> list[dict]:
     """
     Return list of submesh dicts:
-      { positions, indices, normals, uv0, shader }
+      { positions, indices, normals, uv0, shader, blendWeights, blendIndices, boneIds }
     One entry per geometry.
     """
     out = []
@@ -2721,10 +2844,17 @@ def _extract_drawable_lod_submeshes(drawable, lod: str) -> list[dict]:
         res = _extract_geometry_positions_indices_uv0_uv1_color0(g)
         if res is None:
             continue
-        pos, idx, uv0, uv1, uv2, col0, col1, tan = res
+        pos, idx, uv0, uv1, uv2, col0, col1, tan, blend_weights, blend_indices = res
         if pos.size == 0 or idx.size == 0:
             continue
         nrm = _compute_vertex_normals(pos, idx)
+        bone_ids = None
+        try:
+            raw_bone_ids = getattr(g, "BoneIds", None)
+            if raw_bone_ids is not None:
+                bone_ids = [int(x) & 0xFFFF for x in list(raw_bone_ids)]
+        except Exception:
+            bone_ids = None
         out.append(
             {
                 "positions": pos,
@@ -2736,7 +2866,11 @@ def _extract_drawable_lod_submeshes(drawable, lod: str) -> list[dict]:
                 "color0": col0,
                 "color1": col1,
                 "tangents": tan,
+                "blendWeights": blend_weights,
+                "blendIndices": blend_indices,
+                "boneIds": bone_ids,
                 "shader": getattr(g, "Shader", None),
+                "shaderId": int(getattr(g, "ShaderID", 0) or 0),
             }
         )
     return out
@@ -2744,7 +2878,7 @@ def _extract_drawable_lod_submeshes(drawable, lod: str) -> list[dict]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
+    ap.add_argument("--game-path", default=(os.getenv("gta_location") or os.getenv("gta5_path") or ""), help="GTA5 install folder (or set gta_location/gta5_path)")
     ap.add_argument("--assets-dir", default="", help="WebGL viewer assets directory (auto if omitted)")
     ap.add_argument(
         "--selected-dlc",
@@ -2969,7 +3103,18 @@ def main():
                         uv1 = sub.get("uv1")
                         uv2 = sub.get("uv2")
                         col1 = sub.get("color1")
+                        blend_weights = sub.get("blendWeights")
+                        blend_indices = sub.get("blendIndices")
+                        bone_ids = sub.get("boneIds")
                         shader = sub.get("shader")
+
+                        indices = _remove_known_nonrenderable_geometry(
+                            h,
+                            lod,
+                            si,
+                            indices,
+                            col0,
+                        )
 
                         uvs = uv0 if (uv0 is not None and getattr(uv0, "size", 0)) else _compute_planar_uvs_xy01(positions)
                         uvs1 = uv1 if (uv1 is not None and getattr(uv1, "size", 0)) else uvs
@@ -2981,7 +3126,20 @@ def main():
                         # - Do NOT synthesize tangents from UVs (degenerate UVs are common; CW shaders
                         #   often just use a constant fallback tangent when the vertex format has none)
                         tangents = sub.get("tangents")
-                        _write_mesh_bin(out_bin, positions, indices, normals, uvs, tangents, color0=col0, uvs1=uvs1, uvs2=uvs2, color1=col1)
+                        _write_mesh_bin(
+                            out_bin,
+                            positions,
+                            indices,
+                            normals,
+                            uvs,
+                            tangents,
+                            color0=col0,
+                            uvs1=uvs1,
+                            uvs2=uvs2,
+                            color1=col1,
+                            blend_weights=blend_weights,
+                            blend_indices=blend_indices,
+                        )
 
                         mat = {}
                         # Coarse flags from shader name (alpha mode, double sided).
@@ -3478,6 +3636,11 @@ def main():
                                 "hasUvs": True,
                                 "hasTangents": bool(tangents is not None),
                                 "hasColor0": bool(col0 is not None),
+                                "hasColor1": bool(col1 is not None),
+                                "hasBlendWeights": bool(blend_weights is not None),
+                                "hasBlendIndices": bool(blend_indices is not None),
+                                "skinned": bool(blend_weights is not None and blend_indices is not None and bone_ids),
+                                "boneIds": bone_ids if bone_ids else [],
                                 "material": mat,
                             }
                         )

@@ -15,7 +15,7 @@ from .dll_manager import DllManager, canonicalize_cw_path
 from .rpf_reader import RpfReader
 from .terrain_chunk_manager import TerrainChunkManager
 from .space_extractor import SpaceExtractor
-from gta5_modules.heightmap import HeightmapFile
+from .heightmap import HeightmapFile
 
 if TYPE_CHECKING:
     from .ymap_handler import YmapHandler
@@ -959,7 +959,8 @@ class TerrainSystem:
 
                     height, width = hm.max_heights.shape
 
-                    # Convert quantized height bytes into world-space Z using bounds.
+                    # Preserve GTA's lower height-bounds envelope for the optional debug
+                    # visualization. It is not a render surface or gameplay collision.
                     zmin = float(hm.bounds.min_z)
                     zmax = float(hm.bounds.max_z)
                     zrange = max(1e-6, (zmax - zmin))
@@ -1004,14 +1005,30 @@ class TerrainSystem:
             # Heightmaps are already loaded in _init_terrain_components
             # Just process them further here
             
-            # Get the first heightmap's dimensions for the combined heightmap
-            first_heightmap = next(iter(self.heightmaps.values()))
-            self.width = first_heightmap.width
-            self.height = first_heightmap.height
-            
-            # Initialize combined heightmap data
-            self.heightmap_data = np.zeros((self.height, self.width), dtype=np.float32)
-            self.normal_data = np.zeros((self.height, self.width, 3), dtype=np.float32)
+            # The viewer renders one main-map heightfield. Heightmaps can cover different worlds
+            # (the island is separate), so copying every array at [0, 0] corrupts the main map.
+            # Prefer the update main-map raster when present, otherwise keep the base raster.
+            primary_path = next(iter(self.heightmaps))
+            for path in self.heightmaps:
+                low = path.lower()
+                if "update" in low and "heistisland" not in low:
+                    primary_path = path
+                    break
+            primary_heightmap = self.heightmaps[primary_path]
+            self.width = primary_heightmap.width
+            self.height = primary_heightmap.height
+            self.heightmap_data = primary_heightmap.data.astype(np.float32, copy=True)
+
+            sx = (primary_heightmap.bounds.max_x - primary_heightmap.bounds.min_x) / max(1, (self.width - 1))
+            sy = (primary_heightmap.bounds.max_y - primary_heightmap.bounds.min_y) / max(1, (self.height - 1))
+            dy, dx = np.gradient(self.heightmap_data, sy, sx)
+            z = np.ones_like(dx, dtype=np.float32)
+            norm = np.sqrt(dx**2 + dy**2 + z**2) + 1e-8
+            self.normal_data = np.stack((dx / norm, dy / norm, z / norm), axis=-1).astype(np.float32, copy=False)
+            self.terrain_info['render_heightmap_key'] = primary_path
+            self.terrain_info['render_surface'] = 'max_heights'
+            self.terrain_info['render_row_order'] = 'world_min_y_to_world_max_y'
+            self.terrain_info['render_role'] = 'debug_height_bounds_envelope'
             
             # Initialize global bounds
             min_x = float('inf')
@@ -1023,21 +1040,7 @@ class TerrainSystem:
             
             # Process each heightmap
             for path, heightmap in self.heightmaps.items():
-                # Copy world-space height data
                 h, w = heightmap.data.shape
-                self.heightmap_data[:h, :w] = heightmap.data
-                
-                # Calculate normals using world-space spacing
-                sx = (heightmap.bounds.max_x - heightmap.bounds.min_x) / max(1, (w - 1))
-                sy = (heightmap.bounds.max_y - heightmap.bounds.min_y) / max(1, (h - 1))
-                dy, dx = np.gradient(heightmap.data.astype(np.float32), sy, sx)
-                z = np.ones_like(dx, dtype=np.float32)
-                norm = np.sqrt(dx**2 + dy**2 + z**2) + 1e-8
-                
-                # Store normalized normal vectors
-                self.normal_data[:h, :w, 0] = dx / norm
-                self.normal_data[:h, :w, 1] = dy / norm
-                self.normal_data[:h, :w, 2] = z / norm
                 
                 # Update terrain info
                 self.terrain_info['dimensions'][path] = {

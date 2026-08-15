@@ -31,15 +31,36 @@ export class DrawableStreamer {
         this.lastLoadStats = null; // { key, totalLines, parsed, withArchetype, matchedMesh, instancedArchetypes }
         this.coverageStats = null; // aggregated over loaded chunks (rebuilt when dirty)
 
-        // Streaming window:
-        // - radiusChunks controls the "core" square around the camera.
-        // - extraFrontChunks extends the window in the camera-forward direction to reduce visible pop-in.
-        this.maxLoadedChunks = 64;
-        this.radiusChunks = 3;
-        this.extraFrontChunks = 2;
+        // Streaming window. The player-centered core is independent of camera direction, so looking
+        // around cannot replace chunks under the player. Any forward extension is prefetch-only.
+        this.maxLoadedChunks = 9;
+        this.radiusChunks = 1;
+        this.extraFrontChunks = 1;
+        this.residencyHysteresisChunks = 0.18;
+        this._residentCenterChunk = null;
+        // Optional data-space rectangle used by the spawn-district demo. Chunks that
+        // overlap it are parsed, then individual instances outside it are discarded.
+        this.worldBounds = null;
+        // /demo replaces a much larger source chunk with one prefiltered ENT1 tile.
+        // It is kept as a single resident key so player movement cannot trigger reloads.
+        this.demoBootstrap = null;
         this.enableFrustumCulling = true;
+        // Aggressive per-instance frustum culling is opt-in because it requires camera-coupled
+        // instance-buffer rebuilds. /demo enables it; full-map streaming keeps resident buffers stable.
+        this.enableWorkerFrustumCulling = false;
+        this.workerFrustumPadding = 16.0;
+        // WASM culling is for high-density non-demo rebuilds. It bulk-filters packed instance slices in
+        // the worker, then JS keeps the existing dedupe/selection/packing behavior.
+        this.enableWasmCulling = true;
+        this.wasmCullingMinInstances = 50000;
+        this.wasmCullingMinSliceInstances = 512;
+        // Optional WebGPU compute culler is available as a backend module, but stays
+        // opt-in because WebGPU upload/readback can lose to WASM below very high density.
+        this.enableWebGpuCulling = false;
+        this.webGpuCullingMinInstances = 100000;
+        this.webGpuCullingMinSliceInstances = 2048;
         // Avoid scheduling huge bursts of chunk work in a single frame.
-        this.maxNewLoadsPerUpdate = 10;
+        this.maxNewLoadsPerUpdate = 3;
 
         // Optional fast-path: binary ENT1 tiles in assets/entities_chunks_inst/*.bin.
         // If they aren't present, browsers will log noisy 404s. Auto-disable after first 404.
@@ -49,17 +70,21 @@ export class DrawableStreamer {
         // Whether to use CacheStorage for streamed chunk files (JSONL / ENT1 bins).
         // Default false because chunks can be very large; controlled by the UI.
         this.usePersistentCacheForChunks = false;
-        this.maxArchetypes = 250; // cap instanced archetypes to avoid loading thousands at once
+        this.maxArchetypes = 96; // cap instanced archetypes to avoid loading thousands at once
         // Distance-based selection: only instance archetypes whose nearest instance is within this distance.
         // Set to Infinity to disable distance cutoff.
         //
         // NOTE: 350 is far too small at GTA scale and looks like geometry is "cut off" in front of the camera.
-        this.maxModelDistance = 2000.0;
+        this.maxModelDistance = 320.0;
+        // Enforced before instance buffers reach the GPU.
+        this.maxVisibleInstances = 12000;
+        this.maxInstancesPerArchetype = 128;
+        this.maxBehindModelDistance = 180.0;
         this._dirty = true; // rebuild instances only when chunk set changes (not every frame)
 
-        // Cross-archetype instancing: group by (lod + meshFile + materialSignature) instead of per-archetype.
-        // This can reduce draw calls when many different hashes share the same exported mesh bins/materials.
-        this.enableCrossArchetypeInstancing = true;
+        // Cross-archetype instancing is only useful when the asset export shares mesh-bin files across
+        // archetypes. The current export emits one file namespace per archetype, so keep this opt-in.
+        this.enableCrossArchetypeInstancing = false;
 
         // Entity-level LOD traversal (CodeWalker-style parent-vs-children leaf selection).
         // NOTE: requires updated `entities_chunks/*.jsonl` that include:
@@ -98,12 +123,16 @@ export class DrawableStreamer {
         this._lastCamDataPos = [0, 0, 0];     // updated each frame (data-space)
         this._lastCamDataDir = [0, 0, -1];    // updated each frame (data-space, normalized)
 
-        // When the chunk set is stable, we still want the "nearby" area to feel responsive as you move.
-        // Rebuilding only re-sorts/re-caps instances from already-loaded chunks (no network), but can be heavy,
-        // so keep it throttled.
-        this.instanceRebuildMinMove = 35.0; // data-space units
-        this.instanceRebuildMinMs = 250;    // ms throttle
+        // Static world instance buffers stay resident while the chunk set is stable.  Re-selecting every
+        // few metres recreates large typed arrays and reuploads them, which looks like the city is resetting.
+        // This remains opt-in for diagnostics or a future fine-grained culling path; normal movement only
+        // updates the player and camera, while chunk/interior changes mark the stream dirty.
+        this.rebuildInstancesOnMove = false;
+        this.instanceRebuildMinMove = 512.0; // data-space units when explicitly enabled
+        this.instanceRebuildMinMs = 1000;    // ms throttle when explicitly enabled
+        this.instanceRebuildMinDirDot = 0.985; // rebuild when camera turns by ~10 degrees (if enabled)
         this._lastInstanceRebuildCam = null; // [x,y,z] data-space
+        this._lastInstanceRebuildDir = null; // [x,y,z] data-space
         this._lastInstanceRebuildMs = 0;
 
         // Prefer keeping/rendering archetypes that are in front of the camera when capped.
@@ -132,6 +161,11 @@ export class DrawableStreamer {
         this._tmpVec4Out = glMatrix.vec4.create();
         this._tmpVpData = glMatrix.mat4.create();
         this._tmpFrustumPlanes = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+        this._tmpFrustumPlanesFlat = new Float32Array(24);
+        this._lastFrustumPlanesData = null;
+        this._lastFrustumStats = { enabled: false, tested: 0, culled: 0 };
+        this._lastWasmStats = { enabled: false, tested: 0, kept: 0, rejected: 0 };
+        this._lastWebGpuStats = { enabled: false, requested: false, reason: '', tested: 0, kept: 0, rejected: 0 };
         this._tmpWantedKeys = [];
         this._tmpWantedScored = [];
         this._tmpInFrustumSet = new Set();
@@ -145,7 +179,6 @@ export class DrawableStreamer {
         this.enableWorkerRebuild = true;
         this._workerStoredChunks = new Set(); // chunkKeys stored in worker
         this._rebuildWorkerReqInFlight = false;
-        this._rebuildWorkerPending = false;
         this._rebuildWorkerLastReqId = 0;
 
         // Adaptive load budget (based on frame time)
@@ -390,7 +423,7 @@ export class DrawableStreamer {
         }
     }
 
-    async _parseChunkNDJSONInWorker(url, camData, priority, { storeKey = null, storeOnly = false, signal = undefined, onReqId = null } = {}) {
+    async _parseChunkNDJSONInWorker(url, camData, priority, { storeKey = null, storeOnly = false, worldBounds = null, signal = undefined, onReqId = null } = {}) {
         const w = this._getChunkWorker();
         if (!w) return null;
         const reqId = (this._chunkWorkerNextReqId++ >>> 0);
@@ -400,7 +433,7 @@ export class DrawableStreamer {
         });
 
         try {
-            w.postMessage({ type: 'begin_ndjson', reqId, camData, storeKey, storeOnly });
+            w.postMessage({ type: 'begin_ndjson', reqId, camData, storeKey, storeOnly, worldBounds });
             await fetchStreamBytes(url, {
                 usePersistentCache: this.usePersistentCacheForChunks,
                 priority,
@@ -426,7 +459,7 @@ export class DrawableStreamer {
         }
     }
 
-    async _parseENT1InWorker(buffer, camData, { storeKey = null, storeOnly = false, onReqId = null } = {}) {
+    async _parseENT1InWorker(buffer, camData, { storeKey = null, storeOnly = false, worldBounds = null, onReqId = null } = {}) {
         const w = this._getChunkWorker();
         if (!w) return null;
         const reqId = (this._chunkWorkerNextReqId++ >>> 0);
@@ -435,7 +468,7 @@ export class DrawableStreamer {
             this._chunkWorkerPending.set(reqId, { resolve, reject });
         });
         try {
-            w.postMessage({ type: 'parse_ent1', reqId, camData, buffer, storeKey, storeOnly }, [buffer]);
+            w.postMessage({ type: 'parse_ent1', reqId, camData, buffer, storeKey, storeOnly, worldBounds }, [buffer]);
             return await p;
         } catch (e) {
             try { w.postMessage({ type: 'cancel', reqId }); } catch { /* ignore */ }
@@ -450,12 +483,8 @@ export class DrawableStreamer {
         if (!w) return false;
         if (this.enableEntityLodTraversal) return false; // keep entity LOD path as-is for now
 
-        if (this._rebuildWorkerReqInFlight) {
-            this._rebuildWorkerPending = true;
-            return true;
-        }
+        if (this._rebuildWorkerReqInFlight) return false;
         this._rebuildWorkerReqInFlight = true;
-        this._rebuildWorkerPending = false;
 
         const reqId = (this._chunkWorkerNextReqId++ >>> 0);
         this._rebuildWorkerLastReqId = reqId;
@@ -469,6 +498,12 @@ export class DrawableStreamer {
             const maxCandidates = Math.max(1, (this.maxArchetypes | 0) > 0 ? (this.maxArchetypes | 0) * 4 : 1200);
             const behindPenalty = Number.isFinite(Number(this.cameraBehindPenalty)) ? Math.max(1.0, Number(this.cameraBehindPenalty)) : 1.6;
             const keys = Array.from(this._workerStoredChunks);
+            const frustumPlanes = (this.enableFrustumCulling && this.enableWorkerFrustumCulling && this._lastFrustumPlanesData)
+                ? this._lastFrustumPlanesData
+                : null;
+            this._lastFrustumStats = { enabled: !!frustumPlanes, tested: 0, culled: 0 };
+            this._lastWasmStats = { enabled: false, tested: 0, kept: 0, rejected: 0 };
+            this._lastWebGpuStats = { enabled: false, requested: false, reason: '', tested: 0, kept: 0, rejected: 0 };
             w.postMessage({
                 type: 'rebuild_stored',
                 reqId,
@@ -478,10 +513,44 @@ export class DrawableStreamer {
                 maxCandidates,
                 maxModelDistance: this.maxModelDistance,
                 behindPenalty,
+                maxVisibleInstances: this.maxVisibleInstances,
+                maxInstancesPerArchetype: this.maxInstancesPerArchetype,
+                maxBehindModelDistance: this.maxBehindModelDistance,
+                nonRenderableHashes: this.modelManager?.getNonRenderableHashes?.() ?? [],
+                frustumPlanes,
+                frustumPadding: this.workerFrustumPadding,
+                cullRadiusEntries: frustumPlanes ? this._buildFrustumCullRadiusEntries() : [],
+                enableWasmCulling: !!(this.enableWasmCulling && !this.demoBootstrap),
+                wasmCullingMinInstances: this.wasmCullingMinInstances,
+                wasmCullingMinSliceInstances: this.wasmCullingMinSliceInstances,
+                // Keep WASM disabled for the fixed demo bootstrap, but allow the
+                // explicit WebGPU toggle so /demo can exercise the compute backend.
+                enableWebGpuCulling: !!this.enableWebGpuCulling,
+                webGpuCullingMinInstances: this.webGpuCullingMinInstances,
+                webGpuCullingMinSliceInstances: this.webGpuCullingMinSliceInstances,
             });
 
             const res = await p;
             if (!res || !res.ok) return false;
+            this._lastFrustumStats = {
+                enabled: !!res.frustumEnabled,
+                tested: Math.max(0, Math.floor(Number(res.frustumTested) || 0)),
+                culled: Math.max(0, Math.floor(Number(res.frustumCulled) || 0)),
+            };
+            this._lastWasmStats = {
+                enabled: !!res.wasmCullingEnabled,
+                tested: Math.max(0, Math.floor(Number(res.wasmCullingTested) || 0)),
+                kept: Math.max(0, Math.floor(Number(res.wasmCullingKept) || 0)),
+                rejected: Math.max(0, Math.floor(Number(res.wasmCullingRejected) || 0)),
+            };
+            this._lastWebGpuStats = {
+                enabled: !!res.webGpuCullingEnabled,
+                requested: !!res.webGpuCullingRequested,
+                reason: String(res.webGpuCullingReason || ''),
+                tested: Math.max(0, Math.floor(Number(res.webGpuCullingTested) || 0)),
+                kept: Math.max(0, Math.floor(Number(res.webGpuCullingKept) || 0)),
+                rejected: Math.max(0, Math.floor(Number(res.webGpuCullingRejected) || 0)),
+            };
 
             // Convert packed response to entries compatible with existing apply pipeline.
             const buf = res.matsBuffer;
@@ -513,7 +582,10 @@ export class DrawableStreamer {
 
             // Apply interior gating + sorting + renderer updates using existing logic by temporarily
             // swapping in a lightweight agg map.
-            this._applyRebuiltEntries(entries);
+            this._applyRebuiltEntries(entries, {
+                sourceInstanceCount: Number(res.sourceInstances),
+                duplicateInstancesDropped: Number(res.duplicateInstancesDropped),
+            });
 
             return true;
         } catch {
@@ -521,11 +593,6 @@ export class DrawableStreamer {
         } finally {
             this._chunkWorkerPending.delete(reqId);
             this._rebuildWorkerReqInFlight = false;
-            if (this._rebuildWorkerPending) {
-                // Coalesce: run one more rebuild after the current completes.
-                this._rebuildWorkerPending = false;
-                void this._rebuildAllInstancesInWorker();
-            }
         }
     }
 
@@ -667,8 +734,78 @@ export class DrawableStreamer {
         };
     }
 
+    setWorldBounds(bounds = null) {
+        const minX = Number(bounds?.minX);
+        const minY = Number(bounds?.minY);
+        const maxX = Number(bounds?.maxX);
+        const maxY = Number(bounds?.maxY);
+        this.worldBounds = [minX, minY, maxX, maxY].every(Number.isFinite) && maxX > minX && maxY > minY
+            ? { minX, minY, maxX, maxY }
+            : null;
+        this._residentCenterChunk = null;
+        this._dirty = true;
+    }
+
+    setDemoBootstrap(config = null) {
+        const instanceFile = String(config?.instanceFile || '').replace(/^assets\//i, '').replace(/^\/+/, '');
+        if (!instanceFile) {
+            this.demoBootstrap = null;
+            this._residentCenterChunk = null;
+            this._dirty = true;
+            return;
+        }
+        this.demoBootstrap = {
+            key: String(config?.key || '__demo_spawn_district__'),
+            instanceFile,
+        };
+        this._residentCenterChunk = null;
+        this._dirty = true;
+    }
+
+    _isDataPositionInWorldBounds(x, y) {
+        const b = this.worldBounds;
+        if (!b) return true;
+        return x >= b.minX && x <= b.maxX && y >= b.minY && y <= b.maxY;
+    }
+
+    _isChunkInWorldBounds(key) {
+        const b = this.worldBounds;
+        if (!b) return true;
+        const aabb = this._chunkAABBDataSpace(key);
+        if (!aabb) return false;
+        return aabb.max[0] > b.minX && aabb.min[0] < b.maxX &&
+            aabb.max[1] > b.minY && aabb.min[1] < b.maxY;
+    }
+
+    _resolveResidentCenterChunk(p, chunkSize) {
+        const x = Number(p?.[0]);
+        const y = Number(p?.[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !(chunkSize > 0)) return null;
+
+        const nextX = Math.floor(x / chunkSize);
+        const nextY = Math.floor(y / chunkSize);
+        const previous = this._residentCenterChunk;
+        if (!previous || !Number.isFinite(previous.x) || !Number.isFinite(previous.y)) {
+            this._residentCenterChunk = { x: nextX, y: nextY };
+            return this._residentCenterChunk;
+        }
+
+        // Avoid stream ping-pong when a character jitters around a chunk boundary.
+        const margin = Math.max(0, Math.min(0.45, Number(this.residencyHysteresisChunks) || 0)) * chunkSize;
+        if (
+            x >= previous.x * chunkSize - margin &&
+            x < (previous.x + 1) * chunkSize + margin &&
+            y >= previous.y * chunkSize - margin &&
+            y < (previous.y + 1) * chunkSize + margin
+        ) return previous;
+
+        this._residentCenterChunk = { x: nextX, y: nextY };
+        return this._residentCenterChunk;
+    }
+
     _wantedKeysForCamera(camera, centerDataPos = null) {
         if (!this.index) return [];
+        if (this.demoBootstrap) return [this.demoBootstrap.key];
         const chunkSize = this.index.chunk_size;
         const p = centerDataPos
             ? (() => {
@@ -677,92 +814,61 @@ export class DrawableStreamer {
                 return v;
             })()
             : this._cameraToDataSpace(camera.position, this._tmpVec4Out);
-        const cx = Math.floor(p[0] / chunkSize);
-        const cy = Math.floor(p[1] / chunkSize);
+        const anchor = this._resolveResidentCenterChunk(p, chunkSize);
+        if (!anchor) return [];
+        const cx = anchor.x;
+        const cy = anchor.y;
 
         const keys = this._tmpWantedKeys;
         keys.length = 0;
-        const inFrustumSet = this._tmpInFrustumSet;
-        inFrustumSet.clear();
-        // IMPORTANT: chunk AABBs are in *data space*, so extract frustum planes in data space too.
-        // Clip = cameraVP * (modelMatrix * dataPos) => use (cameraVP * modelMatrix).
-        const planes = this.enableFrustumCulling
-            ? (() => {
-                const vpData = this._tmpVpData;
-                glMatrix.mat4.multiply(vpData, camera.viewProjectionMatrix, this.modelMatrix);
-                return extractFrustumPlanes(vpData, this._tmpFrustumPlanes);
-            })()
-            : null;
-        // Include a larger window in the camera-forward direction so the world doesn't "cut off" when moving.
         const r = Math.max(0, Math.floor(this.radiusChunks));
+        const maxWanted = Math.max(1, Math.floor(Number(this.maxLoadedChunks) || 1));
+
+        // The core is the resident gameplay bubble: nearest-first, always player-centered, never frustum
+        // or direction filtered. With the default r=1 / max=9 this is exactly a stable 3x3 block.
+        const core = this._tmpWantedScored;
+        let coreCount = 0;
+        for (let dy = -r; dy <= r; dy++) {
+            for (let dx = -r; dx <= r; dx++) {
+                const key = `${cx + dx}_${cy + dy}`;
+                if (!this._isChunkInWorldBounds(key)) continue;
+                if (coreCount >= core.length) core.push({ k: '', score: 0 });
+                core[coreCount].k = key;
+                core[coreCount].score = dx * dx + dy * dy;
+                coreCount++;
+            }
+        }
+        core.length = coreCount;
+        core.sort((a, b) => a.score - b.score || (a.k < b.k ? -1 : 1));
+        for (let i = 0; i < core.length && keys.length < maxWanted; i++) keys.push(core[i].k);
+        if (keys.length >= maxWanted) return keys;
+
+        // Larger custom budgets can retain a forward prefetch ring. The resident core above remains intact
+        // when the camera turns, so this can improve travel look-ahead without causing local resets.
         const extra = Math.max(0, Math.floor(this.extraFrontChunks || 0));
+        if (extra <= 0) return keys;
         const fwd2 = this._cameraDirToDataSpace(camera.direction || [0, 0, -1]);
-        // Chunking is on X/Y (data space). Ignore Z for forward window decisions.
         const fxyLen2 = Math.hypot(fwd2[0], fwd2[1]) || 1.0;
         const fx2 = fwd2[0] / fxyLen2, fy2 = fwd2[1] / fxyLen2;
-
+        const seen = this._tmpInFrustumSet;
+        seen.clear();
+        for (const k of keys) seen.add(k);
+        const prefetch = [];
         for (let dy = -(r + extra); dy <= (r + extra); dy++) {
             for (let dx = -(r + extra); dx <= (r + extra); dx++) {
-                // If the chunk offset is behind the camera direction, keep the tighter radius.
-                // If it's in front, allow the extended radius.
+                if (Math.abs(dx) <= r && Math.abs(dy) <= r) continue;
                 const dot2 = dx * fx2 + dy * fy2;
                 const allow = (dot2 >= 0)
                     ? (Math.abs(dx) <= (r + extra) && Math.abs(dy) <= (r + extra))
                     : (Math.abs(dx) <= r && Math.abs(dy) <= r);
                 if (!allow) continue;
                 const k = `${cx + dx}_${cy + dy}`;
-                if (planes) {
-                    const aabb = this._chunkAABBDataSpace(k);
-                    // Missing AABB => treat as visible so we don't accidentally starve it.
-                    const inFrustum = !aabb || aabbIntersectsFrustum(planes, aabb.min, aabb.max);
-                    if (inFrustum) inFrustumSet.add(k);
-                } else {
-                    inFrustumSet.add(k);
-                }
-                keys.push(k);
+                if (!this._isChunkInWorldBounds(k)) continue;
+                if (!seen.has(k)) prefetch.push({ k, score: (dx * dx + dy * dy) - (dot2 * 0.12) });
             }
         }
-
-        // Sort near-first with a slight "in front of camera" bias for faster look-around.
-        if (keys.length <= 1) return keys;
-        const fwd = this._cameraDirToDataSpace(camera.direction || [0, 0, -1]);
-        const fwdLen = Math.hypot(fwd[0], fwd[1], fwd[2]) || 1.0;
-        const fx = fwd[0] / fwdLen, fy = fwd[1] / fwdLen, fz = fwd[2] / fwdLen;
-
-        const scored = this._tmpWantedScored;
-        // Ensure we have enough entries to reuse (avoid churn).
-        if (scored.length < keys.length) {
-            for (let i = scored.length; i < keys.length; i++) scored.push({ k: '', score: 1e30 });
-        }
-        for (let i = 0; i < keys.length; i++) {
-            const k = keys[i];
-            const j = k.indexOf('_');
-            const sx = (j >= 0) ? parseInt(k.slice(0, j), 10) : NaN;
-            const sy = (j >= 0) ? parseInt(k.slice(j + 1), 10) : NaN;
-            if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
-                scored[i].k = k;
-                scored[i].score = 1e30;
-                continue;
-            }
-            const ccx = (sx + 0.5) * chunkSize;
-            const ccy = (sy + 0.5) * chunkSize;
-            const dx = ccx - p[0];
-            const dy = ccy - p[1];
-            const dz = 0.0 - p[2];
-            const dist2 = dx * dx + dy * dy + dz * dz;
-            const dot = dx * fx + dy * fy + dz * fz;
-            const behindPenalty = (dot >= 0) ? 1.0 : 1.6;
-            let score = dist2 * behindPenalty;
-            // Game-like preload: frustum culling acts as PRIORITY, not inclusion.
-            if (this.enableFrustumCulling && inFrustumSet && !inFrustumSet.has(k)) {
-                score *= 1.9;
-            }
-            scored[i].k = k;
-            scored[i].score = score;
-        }
-        scored.length = keys.length;
-        scored.sort((a, b) => a.score - b.score);
-        for (let i = 0; i < scored.length; i++) keys[i] = scored[i].k;
+        prefetch.sort((a, b) => a.score - b.score || (a.k < b.k ? -1 : 1));
+        for (let i = 0; i < prefetch.length && keys.length < maxWanted; i++) keys.push(prefetch[i].k);
         return keys;
     }
 
@@ -900,6 +1006,22 @@ export class DrawableStreamer {
         if ((n % 21) === 0) return 21;
         if ((n % 17) === 0) return 17;
         return 16;
+    }
+
+    _instanceTransformSignature(mats, offset, stride) {
+        // Match the worker-side duplicate key. Repeated YMAP records have the
+        // same drawable transform and otherwise waste upload/draw budget.
+        const q = (index, scale) => {
+            const n = Number(mats[offset + index]);
+            return Number.isFinite(n) ? Math.round(n * scale) : 0;
+        };
+        return [
+            q(0, 10000), q(1, 10000), q(2, 10000),
+            q(4, 10000), q(5, 10000), q(6, 10000),
+            q(8, 10000), q(9, 10000), q(10, 10000),
+            q(12, 1000), q(13, 1000), q(14, 1000),
+            stride >= 17 ? q(16, 1) : 0,
+        ].join(',');
     }
 
     async _ensureMloDefLoaded(archHash) {
@@ -1264,6 +1386,61 @@ export class DrawableStreamer {
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
+    _updateFrustumPlanesData(camera) {
+        if (!this.enableFrustumCulling || !this.enableWorkerFrustumCulling || !camera?.viewProjectionMatrix) {
+            this._lastFrustumPlanesData = null;
+            return null;
+        }
+        try {
+            // Extract planes in data space: clip = VP * modelMatrix * dataPosition.
+            glMatrix.mat4.multiply(this._tmpVpData, camera.viewProjectionMatrix, this.modelMatrix);
+            const planes = extractFrustumPlanes(this._tmpVpData, this._tmpFrustumPlanes);
+            const flat = this._tmpFrustumPlanesFlat;
+            for (let i = 0; i < 6; i++) {
+                const p = planes[i];
+                flat[i * 4 + 0] = Number(p?.[0]) || 0;
+                flat[i * 4 + 1] = Number(p?.[1]) || 0;
+                flat[i * 4 + 2] = Number(p?.[2]) || 0;
+                flat[i * 4 + 3] = Number(p?.[3]) || 0;
+            }
+            this._lastFrustumPlanesData = flat.slice(0);
+            return this._lastFrustumPlanesData;
+        } catch {
+            this._lastFrustumPlanesData = null;
+            return null;
+        }
+    }
+
+    _sphereIntersectsDataFrustum(x, y, z, radius) {
+        const planes = this._lastFrustumPlanesData;
+        if (!planes || planes.length < 24) return true;
+        const r = Math.max(0.0, Number(radius) || 0.0);
+        for (let i = 0; i < 6; i++) {
+            const o = i * 4;
+            if ((planes[o] * x + planes[o + 1] * y + planes[o + 2] * z + planes[o + 3]) < -r) return false;
+        }
+        return true;
+    }
+
+    _instanceMaxScale(arr, offset) {
+        const sx = Math.hypot(Number(arr[offset + 0]) || 0, Number(arr[offset + 1]) || 0, Number(arr[offset + 2]) || 0);
+        const sy = Math.hypot(Number(arr[offset + 4]) || 0, Number(arr[offset + 5]) || 0, Number(arr[offset + 6]) || 0);
+        const sz = Math.hypot(Number(arr[offset + 8]) || 0, Number(arr[offset + 9]) || 0, Number(arr[offset + 10]) || 0);
+        const s = Math.max(sx, sy, sz);
+        return Number.isFinite(s) && s > 0 ? s : 1.0;
+    }
+
+    _buildFrustumCullRadiusEntries() {
+        if (!this.enableFrustumCulling || !this.enableWorkerFrustumCulling) return [];
+        const maxArch = Math.max(1, Math.floor(Number(this.maxArchetypes) || 512));
+        const limit = Math.max(1024, Math.min(12000, maxArch * 16));
+        try {
+            return this.modelManager?.getApproxRadiusEntries?.({ limit }) ?? [];
+        } catch {
+            return [];
+        }
+    }
+
     _entityKeyFromObj(obj) {
         const ymap = String(obj?.ymap || '').trim();
         // Prefer the canonical (ymap, ymap_entity_index) key (matches CodeWalker entity indices).
@@ -1358,7 +1535,8 @@ export class DrawableStreamer {
 
     async _loadChunk(key, { priority = 'high' } = {}) {
         if (!this.index) return;
-        const meta = (this.index.chunks || {})[key];
+        const isDemoBootstrap = !!this.demoBootstrap && key === this.demoBootstrap.key;
+        const meta = isDemoBootstrap ? { file: this.demoBootstrap.instanceFile } : (this.index.chunks || {})[key];
         if (!meta) return;
 
         if (this.loaded.has(key) || this.loading.has(key)) return;
@@ -1370,11 +1548,11 @@ export class DrawableStreamer {
 
         try {
             const bust = this._chunkCacheBust ? `?v=${encodeURIComponent(this._chunkCacheBust)}` : '';
-            const jsonlPath = `assets/${this.index.chunks_dir}/${meta.file}${bust}`;
+            const jsonlPath = isDemoBootstrap ? '' : `assets/${this.index.chunks_dir}/${meta.file}${bust}`;
 
             // Entity-level LOD traversal needs hierarchy fields (not present in ENT1 bins),
             // so we always parse JSONL in this mode.
-            if (this.enableEntityLodTraversal) {
+            if (this.enableEntityLodTraversal && !isDemoBootstrap) {
                 const camData = this._cameraToDataSpace(window.__appCameraPosForDrawableStreamer || [0, 0, 0]);
                 const cx = this._safeNum(camData?.[0], 0.0);
                 const cy = this._safeNum(camData?.[1], 0.0);
@@ -1397,6 +1575,8 @@ export class DrawableStreamer {
                         totalLines++;
                         if (!obj) return;
                         parsed++;
+                        const pos0 = obj?.position || obj?.pos || [0, 0, 0];
+                        if (!this._isDataPositionInWorldBounds(Number(pos0[0]), Number(pos0[1]))) return;
 
                         const a = obj?.archetype;
                         if (a === undefined || a === null) return;
@@ -1596,10 +1776,10 @@ export class DrawableStreamer {
             // - v2 <I3f4f3fI> adds u32 tintIndex after scale (stride=48).
             // - v3 <I3f4f3f5I> adds u32 tintIndex + guid + mloParentGuid + mloEntitySetHash + flags (stride=64).
             let usedBinary = false;
-            if (this.preferBinary) {
+            if (this.preferBinary || isDemoBootstrap) {
                 try {
                     const binFile = String(meta.file || '').replace(/\.jsonl$/i, '.bin');
-                    const binPath = `assets/entities_chunks_inst/${binFile}`;
+                    const binPath = isDemoBootstrap ? `assets/${binFile}` : `assets/entities_chunks_inst/${binFile}`;
                     const buf = await fetchArrayBufferWithPriority(binPath, { priority, usePersistentCache: this.usePersistentCacheForChunks, signal });
                     const dv = new DataView(buf);
                     if (dv.byteLength >= 8) {
@@ -1625,6 +1805,7 @@ export class DrawableStreamer {
                                         {
                                             storeKey: key,
                                             storeOnly: !!this.enableWorkerRebuild,
+                                            worldBounds: this.worldBounds,
                                             onReqId: (rid) => {
                                                 const live = this._chunkLoadReqs.get(key);
                                                 if (live && live.token === token) live.workerReqId = (Number(rid) >>> 0);
@@ -1654,6 +1835,7 @@ export class DrawableStreamer {
                                         const px = dv.getFloat32(off + 4, true);
                                         const py = dv.getFloat32(off + 8, true);
                                         const pz = dv.getFloat32(off + 12, true);
+                                        if (!this._isDataPositionInWorldBounds(px, py)) continue;
 
                                         const qx = dv.getFloat32(off + 16, true);
                                         const qy = dv.getFloat32(off + 20, true);
@@ -1706,6 +1888,7 @@ export class DrawableStreamer {
                         }
                     }
                 } catch (e) {
+                    if (isDemoBootstrap) throw e;
                     // If the directory isn't present, disable the binary fast-path to avoid spamming 404s.
                     const msg = String(e?.message || e || '');
                     if (msg.includes('status=404')) this.preferBinary = false;
@@ -1731,6 +1914,7 @@ export class DrawableStreamer {
                         {
                             storeKey: key,
                             storeOnly: !!this.enableWorkerRebuild,
+                            worldBounds: this.worldBounds,
                             signal,
                             onReqId: (rid) => {
                                 const live = this._chunkLoadReqs.get(key);
@@ -1780,6 +1964,8 @@ export class DrawableStreamer {
                                 obj?.archetypeHash32 ??
                                 null;
                             if (a === undefined || a === null) return;
+                            const pp = obj.position || obj.pos || [0, 0, 0];
+                            if (!this._isDataPositionInWorldBounds(Number(pp[0]), Number(pp[1]))) return;
                             withArchetype++;
                             const hash = this.modelManager.normalizeId(a);
                             if (!hash) {
@@ -1793,7 +1979,6 @@ export class DrawableStreamer {
                             archetypeCounts.set(hash, (archetypeCounts.get(hash) ?? 0) + 1);
 
                             // Distance (data-space) for prioritization / cutoff.
-                            const pp = obj.position || [0, 0, 0];
                             const dx = pp[0] - camData[0];
                             const dy = pp[1] - camData[1];
                             const dz = pp[2] - camData[2];
@@ -1980,11 +2165,12 @@ export class DrawableStreamer {
         }
     }
 
-    _computeCoverageStats({ keptArchetypes = null, droppedArchetypes = null, totalMeshArchetypes = null, keptInstances = null, totalMeshInstances = null, keptRealArchetypes = null, keptPlaceholderArchetypes = null } = {}) {
+    _computeCoverageStats({ keptArchetypes = null, droppedArchetypes = null, totalMeshArchetypes = null, keptInstances = null, totalMeshInstances = null, keptRealArchetypes = null, keptPlaceholderArchetypes = null, duplicateInstancesDropped = 0 } = {}) {
         // Aggregate unexported archetypes + totals across loaded chunks.
         let entitiesWithArchetype = 0;
         const allArchetypes = new Set();
         const missingAgg = new Map(); // hash -> count (known missing)
+        const nonRenderableAgg = new Map(); // hash -> count (valid, intentionally drawable-less)
         const unknownAgg = new Map(); // hash -> count (manifest shard not loaded yet)
         for (const key of this.loaded) {
             const cmap = this.chunkArchetypeCounts.get(key);
@@ -1995,6 +2181,8 @@ export class DrawableStreamer {
                     const shardKnown = this.modelManager?.isShardLoadedForHash?.(hash) ?? true;
                     if (!shardKnown) {
                         unknownAgg.set(hash, (unknownAgg.get(hash) ?? 0) + (cnt ?? 0));
+                    } else if (this.modelManager?.isNonRenderable?.(hash)) {
+                        nonRenderableAgg.set(hash, (nonRenderableAgg.get(hash) ?? 0) + (cnt ?? 0));
                     } else if (!(this.modelManager?.hasRealMesh?.(hash) ?? true)) {
                         missingAgg.set(hash, (missingAgg.get(hash) ?? 0) + (cnt ?? 0));
                     }
@@ -2007,6 +2195,9 @@ export class DrawableStreamer {
             .map(([hash, count]) => ({ hash, count }))
             .sort((a, b) => (b.count - a.count) || (a.hash < b.hash ? -1 : 1));
         const unknownTop = Array.from(unknownAgg.entries())
+            .map(([hash, count]) => ({ hash, count }))
+            .sort((a, b) => (b.count - a.count) || (a.hash < b.hash ? -1 : 1));
+        const nonRenderableTop = Array.from(nonRenderableAgg.entries())
             .map(([hash, count]) => ({ hash, count }))
             .sort((a, b) => (b.count - a.count) || (a.hash < b.hash ? -1 : 1));
 
@@ -2025,6 +2216,9 @@ export class DrawableStreamer {
             unexportedEntities,
             unexportedArchetypes: missingAgg.size,
             unexportedTop,
+            nonRenderableEntities: nonRenderableTop.reduce((acc, e) => acc + (e.count ?? 0), 0),
+            nonRenderableArchetypes: nonRenderableAgg.size,
+            nonRenderableTop: nonRenderableTop.slice(0, 50),
             // Sharded-manifest visibility: how many entities are "unknown" because we haven't loaded their shard yet.
             unknownMetaEntities: unknownTop.reduce((acc, e) => acc + (e.count ?? 0), 0),
             unknownMetaArchetypes: unknownAgg.size,
@@ -2038,8 +2232,23 @@ export class DrawableStreamer {
             totalMeshInstances,
             keptInstances,
             droppedInstances: (Number.isFinite(totalMeshInstances) && Number.isFinite(keptInstances)) ? Math.max(0, totalMeshInstances - keptInstances) : null,
+            duplicateInstancesDropped: Math.max(0, Math.floor(Number(duplicateInstancesDropped) || 0)),
+            frustumCullingEnabled: !!this._lastFrustumStats?.enabled,
+            frustumTestedInstances: Math.max(0, Math.floor(Number(this._lastFrustumStats?.tested) || 0)),
+            frustumCulledInstances: Math.max(0, Math.floor(Number(this._lastFrustumStats?.culled) || 0)),
+            wasmCullingEnabled: !!this._lastWasmStats?.enabled,
+            wasmCullingTestedInstances: Math.max(0, Math.floor(Number(this._lastWasmStats?.tested) || 0)),
+            wasmCullingKeptInstances: Math.max(0, Math.floor(Number(this._lastWasmStats?.kept) || 0)),
+            wasmCullingRejectedInstances: Math.max(0, Math.floor(Number(this._lastWasmStats?.rejected) || 0)),
+            webGpuCullingEnabled: !!this._lastWebGpuStats?.enabled,
+            webGpuCullingRequested: !!this._lastWebGpuStats?.requested,
+            webGpuCullingReason: String(this._lastWebGpuStats?.reason || ''),
+            webGpuCullingTestedInstances: Math.max(0, Math.floor(Number(this._lastWebGpuStats?.tested) || 0)),
+            webGpuCullingKeptInstances: Math.max(0, Math.floor(Number(this._lastWebGpuStats?.kept) || 0)),
+            webGpuCullingRejectedInstances: Math.max(0, Math.floor(Number(this._lastWebGpuStats?.rejected) || 0)),
             entitiesWithMeshInManifest,
         };
+
     }
 
     getCoverageStats() {
@@ -2059,12 +2268,19 @@ export class DrawableStreamer {
         const minD = new Map(); // hash -> number (from current camera)
         const bestDot = new Map(); // hash -> dot(camForward, toClosestInstance)
         const bestDist2 = new Map(); // hash -> number
+        const seenTransformsByHash = new Map(); // hash -> Set<quantized transform>
+        let sourceInstanceCount = 0;
+        let duplicateInstancesDropped = 0;
 
         const cam = this._lastCamDataPos || [0, 0, 0];
         const fwd0 = this._lastCamDataDir || [0, 0, -1];
         const fwdLen = Math.hypot(fwd0[0], fwd0[1], fwd0[2]) || 1.0;
         const fx = fwd0[0] / fwdLen, fy = fwd0[1] / fwdLen, fz = fwd0[2] / fwdLen;
         const behindPenalty = Number.isFinite(Number(this.cameraBehindPenalty)) ? Math.max(1.0, Number(this.cameraBehindPenalty)) : 1.6;
+        const useFrustum = !!(this.enableFrustumCulling && this.enableWorkerFrustumCulling && this._lastFrustumPlanesData);
+        const frustumPadding = Math.max(0.0, Number(this.workerFrustumPadding) || 0.0);
+        let frustumTested = 0;
+        let frustumCulled = 0;
 
         for (const key of this.loaded) {
             const cmap = this.chunkInstances.get(key);
@@ -2076,15 +2292,38 @@ export class DrawableStreamer {
                     agg.set(hash, arr);
                 }
                 const stride = this._instanceStrideFloatsForLen(mats.length ?? 0);
+                const radiusRaw = useFrustum ? Number(this.modelManager?.getApproxRadiusForHash?.(hash, null, null)) : NaN;
+                const hasFrustumRadius = Number.isFinite(radiusRaw) && radiusRaw > 0;
+                const baseRadius = hasFrustumRadius ? Math.max(0.5, radiusRaw) : 0.0;
                 for (let i = 0; i + (stride - 1) < mats.length; i += stride) {
                     // Time/weather ymap gating is evaluated per-instance (fail-open if unknown).
                     if (stride >= 22) {
                         const ymapHash = Number(mats[i + (stride - 1)] ?? 0) >>> 0;
                         if (!this._isYmapAvailableHash(ymapHash)) continue;
                     }
+                    sourceInstanceCount++;
                     const tx = Number(mats[i + 12] ?? 0);
                     const ty = Number(mats[i + 13] ?? 0);
                     const tz = Number(mats[i + 14] ?? 0);
+                    if (hasFrustumRadius) {
+                        frustumTested++;
+                        const radius = baseRadius * Math.max(1.0, this._instanceMaxScale(mats, i)) + frustumPadding;
+                        if (!this._sphereIntersectsDataFrustum(tx, ty, tz, radius)) {
+                            frustumCulled++;
+                            continue;
+                        }
+                    }
+                    let seenTransforms = seenTransformsByHash.get(hash);
+                    if (!seenTransforms) {
+                        seenTransforms = new Set();
+                        seenTransformsByHash.set(hash, seenTransforms);
+                    }
+                    const transformKey = this._instanceTransformSignature(mats, i, stride);
+                    if (seenTransforms.has(transformKey)) {
+                        duplicateInstancesDropped++;
+                        continue;
+                    }
+                    seenTransforms.add(transformKey);
                     const dx = tx - Number(cam[0] ?? 0);
                     const dy = ty - Number(cam[1] ?? 0);
                     const dz = tz - Number(cam[2] ?? 0);
@@ -2101,6 +2340,9 @@ export class DrawableStreamer {
                 }
             }
         }
+        this._lastFrustumStats = { enabled: useFrustum, tested: frustumTested, culled: frustumCulled };
+        this._lastWasmStats = { enabled: false, tested: 0, kept: 0, rejected: 0 };
+        this._lastWebGpuStats = { enabled: false, requested: false, reason: '', tested: 0, kept: 0, rejected: 0 };
 
         // Distance-first selection (closest archetypes first), but prefer REAL meshes over placeholders
         // so placeholders don't crowd out real geometry under maxArchetypes.
@@ -2114,14 +2356,87 @@ export class DrawableStreamer {
             isPlaceholder: !(this.modelManager?.hasRealMesh?.(hash) ?? true),
         }));
 
-        this._applyRebuiltEntries(entries, { behindPenalty });
+        this._applyRebuiltEntries(entries, { behindPenalty, sourceInstanceCount, duplicateInstancesDropped });
     }
 
-    _applyRebuiltEntries(entriesIn, { behindPenalty = 1.6 } = {}) {
+    _limitInstancesForRendering(entriesIn) {
+        const entries = Array.isArray(entriesIn) ? entriesIn : [];
+        const cam = this._lastCamDataPos || [0, 0, 0];
+        const fwd0 = this._lastCamDataDir || [0, 0, -1];
+        const fwdLen = Math.hypot(fwd0[0], fwd0[1], fwd0[2]) || 1.0;
+        const fx = fwd0[0] / fwdLen, fy = fwd0[1] / fwdLen, fz = fwd0[2] / fwdLen;
+        const maxDist = Number.isFinite(this.maxModelDistance) ? Math.max(0, this.maxModelDistance) : Infinity;
+        const maxVisible = Math.max(1, Math.floor(Number(this.maxVisibleInstances) || 12000));
+        const maxPerArch = Math.max(1, Math.floor(Number(this.maxInstancesPerArchetype) || 128));
+        const maxBehind = Math.min(maxDist, Math.max(24.0, Number(this.maxBehindModelDistance) || (maxDist * 0.55)));
+        let remaining = maxVisible;
+        const out = [];
+
+        for (const entry of entries) {
+            if (remaining <= 0) break;
+            const mats = entry?.mats;
+            const stride = this._instanceStrideFloatsForLen(mats?.length ?? 0);
+            if (!mats || stride < 16) continue;
+            const desiredCount = Math.min(maxPerArch, remaining);
+            const nearest = []; // max-heap: farthest retained item at index 0
+            const isWorse = (a, b) => (a.dist > b.dist) || (a.dist === b.dist && a.offset > b.offset);
+            const pushNearest = (candidate) => {
+                if (desiredCount <= 0) return;
+                if (nearest.length < desiredCount) {
+                    let child = nearest.length;
+                    nearest.push(candidate);
+                    while (child > 0) {
+                        const parent = (child - 1) >> 1;
+                        if (!isWorse(nearest[child], nearest[parent])) break;
+                        [nearest[child], nearest[parent]] = [nearest[parent], nearest[child]];
+                        child = parent;
+                    }
+                    return;
+                }
+                if (!isWorse(nearest[0], candidate)) return;
+                nearest[0] = candidate;
+                let parent = 0;
+                while (true) {
+                    const left = parent * 2 + 1;
+                    const right = left + 1;
+                    let worst = parent;
+                    if (left < nearest.length && isWorse(nearest[left], nearest[worst])) worst = left;
+                    if (right < nearest.length && isWorse(nearest[right], nearest[worst])) worst = right;
+                    if (worst === parent) break;
+                    [nearest[parent], nearest[worst]] = [nearest[worst], nearest[parent]];
+                    parent = worst;
+                }
+            };
+            for (let i = 0; i + (stride - 1) < mats.length; i += stride) {
+                const dx = Number(mats[i + 12] ?? 0) - Number(cam[0] ?? 0);
+                const dy = Number(mats[i + 13] ?? 0) - Number(cam[1] ?? 0);
+                const dz = Number(mats[i + 14] ?? 0) - Number(cam[2] ?? 0);
+                const dist = Math.hypot(dx, dy, dz);
+                if (dist > maxDist) continue;
+                const dot = dx * fx + dy * fy + dz * fz;
+                if (dot < 0.0 && dist > maxBehind) continue;
+                pushNearest({ offset: i, dist });
+            }
+            nearest.sort((a, b) => (a.dist - b.dist) || (a.offset - b.offset));
+            const selected = [];
+            for (const candidate of nearest) {
+                for (let k = 0; k < stride; k++) selected.push(mats[candidate.offset + k]);
+            }
+            const selectedCount = nearest.length;
+            remaining -= selectedCount;
+            if (selectedCount > 0) out.push({ ...entry, mats: new Float32Array(selected) });
+        }
+        return out;
+    }
+
+    _applyRebuiltEntries(entriesIn, { behindPenalty = 1.6, sourceInstanceCount = null, duplicateInstancesDropped = 0 } = {}) {
         let entries = Array.isArray(entriesIn) ? entriesIn : [];
 
         // Apply interior visibility gating (drops interior children unless camera is inside).
         entries = this._filterEntriesForActiveInterior(entries);
+        // Some valid YTYP archetypes intentionally have no drawable (collision/metadata/LOD helpers).
+        // They are classified by the exporter and must not consume a placeholder or a render budget.
+        entries = entries.filter((e) => !this.modelManager?.isNonRenderable?.(e?.hash));
         entries.sort((a, b) => {
             const pa = a.isPlaceholder ? 1 : 0;
             const pb = b.isPlaceholder ? 1 : 0;
@@ -2138,13 +2453,18 @@ export class DrawableStreamer {
         const maxD = Number.isFinite(this.maxModelDistance) ? Math.max(0, this.maxModelDistance) : 1e30;
         const within = entries.filter(e => Number(e.d) <= maxD);
         const maxArch = (this.maxArchetypes | 0);
-        const keep = (maxArch > 0) ? within.slice(0, maxArch) : within;
+        const archetypeKeep = (maxArch > 0) ? within.slice(0, maxArch) : within;
+        const keep = this._limitInstancesForRendering(archetypeKeep);
 
         // Stats (helps distinguish "missing meshes" vs "capped by maxArchetypes").
-        let totalMeshInstances = 0;
-        for (const e of entries) {
-            const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
-            totalMeshInstances += Math.floor((e.mats.length ?? 0) / stride);
+        let totalMeshInstances = Number.isFinite(sourceInstanceCount) && sourceInstanceCount >= 0
+            ? Math.floor(sourceInstanceCount)
+            : 0;
+        if (!Number.isFinite(sourceInstanceCount) || sourceInstanceCount < 0) {
+            for (const e of entries) {
+                const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
+                totalMeshInstances += Math.floor((e.mats.length ?? 0) / stride);
+            }
         }
         let keptInstances = 0;
         for (const e of keep) {
@@ -2212,11 +2532,12 @@ export class DrawableStreamer {
             this._computeCoverageStats({
                 totalMeshArchetypes: entries.length,
                 keptArchetypes: keep.length,
-                droppedArchetypes: Math.max(0, entries.length - keep.length),
+                droppedArchetypes: Math.max(0, entries.length - archetypeKeep.length),
                 keptRealArchetypes: keptReal,
                 keptPlaceholderArchetypes: keptPlaceholder,
                 totalMeshInstances,
                 keptInstances,
+                duplicateInstancesDropped,
             });
             return;
         }
@@ -2253,6 +2574,7 @@ export class DrawableStreamer {
             keptPlaceholderArchetypes: keptPlaceholder,
             totalMeshInstances,
             keptInstances,
+            duplicateInstancesDropped,
         });
     }
 
@@ -2507,6 +2829,12 @@ export class DrawableStreamer {
             this.chunkInstances.delete(key);
             this.chunkMinDist.delete(key);
             this.chunkArchetypeCounts.delete(key);
+            if (this._workerStoredChunks?.delete(key)) {
+                try {
+                    const w = this._getChunkWorker();
+                    if (w) w.postMessage({ type: 'drop_stored', reqId: (this._chunkWorkerNextReqId++ >>> 0), keys: [key] });
+                } catch { /* ignore */ }
+            }
             changed = true;
         }
         if (changed) this._dirty = true;
@@ -2519,13 +2847,44 @@ export class DrawableStreamer {
         }
     }
 
+    clear() {
+        for (const key of Array.from(this.loading)) {
+            this._cancelChunkLoad(key, 'clear');
+        }
+        for (const key of Array.from(this._chunkLoadReqs.keys())) {
+            this._cancelChunkLoad(key, 'clear');
+        }
+        this.loading.clear();
+        this.loaded.clear();
+        this.chunkInstances.clear();
+        this.chunkMinDist.clear();
+        this.chunkArchetypeCounts.clear();
+        this.coverageStats = null;
+        this.lastLoadStats = null;
+        this._prevDesiredInstanceKeys.clear();
+        this._residentCenterChunk = null;
+        this._entityNodesByKey.clear();
+        this._chunkEntityKeys.clear();
+        this._pendingChildrenByParentKey.clear();
+        const workerKeys = Array.from(this._workerStoredChunks || []);
+        this._workerStoredChunks.clear();
+        try {
+            if (workerKeys.length) {
+                const w = this._getChunkWorker?.();
+                if (w) w.postMessage({ type: 'drop_stored', reqId: (this._chunkWorkerNextReqId++ >>> 0), keys: workerKeys });
+            }
+        } catch { /* ignore */ }
+        this._dirty = true;
+        this._dirtyEntityLod = true;
+    }
+
     update(camera, centerDataPos = null) {
         if (!this.ready) return;
         // Expose camera position for distance computations inside chunk load (async).
         // (We avoid capturing camera object into async closures.)
         window.__appCameraPosForDrawableStreamer = [camera.position[0], camera.position[1], camera.position[2]];
         try {
-            const c = this._cameraToDataSpace(camera.position, this._tmpVec4Out);
+            const c = centerDataPos || this._cameraToDataSpace(camera.position, this._tmpVec4Out);
             this._lastCamDataPos[0] = c[0]; this._lastCamDataPos[1] = c[1]; this._lastCamDataPos[2] = c[2];
         } catch {
             this._lastCamDataPos[0] = 0; this._lastCamDataPos[1] = 0; this._lastCamDataPos[2] = 0;
@@ -2537,6 +2896,7 @@ export class DrawableStreamer {
         } catch {
             this._lastCamDataDir[0] = 0; this._lastCamDataDir[1] = 0; this._lastCamDataDir[2] = -1;
         }
+        this._updateFrustumPlanesData(camera);
 
         const wanted = this._wantedKeysForCamera(camera, centerDataPos);
         const wantedSet = this._tmpWantedSet;
@@ -2566,7 +2926,8 @@ export class DrawableStreamer {
                 this._rebuildInstancesFromEntityLeaves(leaves);
             }
         } else {
-            // Keep instance selection responsive even when chunk set is stable (throttled).
+            // An optional diagnostic path can rebuild from resident chunks as the focus moves.  It is
+            // deliberately disabled for gameplay: the static city must not churn GPU buffers on walking.
             try {
                 const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
                 const cam = this._lastCamDataPos || [0, 0, 0];
@@ -2574,7 +2935,23 @@ export class DrawableStreamer {
                 const moved = last ? this._dist3(cam[0], cam[1], cam[2], last[0], last[1], last[2]) : 1e30;
                 const moveOk = moved >= (Number(this.instanceRebuildMinMove) || 0.0);
                 const timeOk = (now - (Number(this._lastInstanceRebuildMs) || 0)) >= (Number(this.instanceRebuildMinMs) || 0);
-                if (moveOk && timeOk) this._dirty = true;
+                let dirOk = false;
+                if (this.enableWorkerFrustumCulling) {
+                    const dir = this._lastCamDataDir || [0, 0, -1];
+                    const lastDir = this._lastInstanceRebuildDir;
+                    if (!lastDir) {
+                        dirOk = true;
+                    } else {
+                        const dot = (Number(dir[0]) || 0) * (Number(lastDir[0]) || 0)
+                            + (Number(dir[1]) || 0) * (Number(lastDir[1]) || 0)
+                            + (Number(dir[2]) || 0) * (Number(lastDir[2]) || 0);
+                        const minDot = Number.isFinite(Number(this.instanceRebuildMinDirDot))
+                            ? Math.max(-1.0, Math.min(1.0, Number(this.instanceRebuildMinDirDot)))
+                            : 0.985;
+                        dirOk = dot < minDot;
+                    }
+                }
+                if (this.rebuildInstancesOnMove && timeOk && (moveOk || dirOk)) this._dirty = true;
             } catch { /* ignore */ }
 
             // Interior visibility can change as the camera moves (enter/exit rooms), even when chunk set is stable.
@@ -2587,10 +2964,14 @@ export class DrawableStreamer {
                 // If we have worker-stored chunk data, rebuild off-main-thread for smoother frames.
                 const didWorker = (this.enableWorkerRebuild && this._workerStoredChunks && this._workerStoredChunks.size > 0);
                 if (didWorker) {
-                    // keep dirty flag until the async worker rebuild applies results
-                    void this._rebuildAllInstancesInWorker().then((ok) => {
-                        if (ok) this._dirty = false;
-                    });
+                    // Keep drawing the last complete buffer set while one structural rebuild is in flight.
+                    // Chunk loads/drops that happen meanwhile set `_dirty` again and schedule one follow-up.
+                    if (!this._rebuildWorkerReqInFlight) {
+                        this._dirty = false;
+                        void this._rebuildAllInstancesInWorker().then((ok) => {
+                            if (!ok) this._dirty = true;
+                        });
+                    }
                 } else {
                     this._dirty = false;
                     this._rebuildAllInstances();
@@ -2598,7 +2979,9 @@ export class DrawableStreamer {
                 try {
                     const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
                     const cam = this._lastCamDataPos || [0, 0, 0];
+                    const dir = this._lastCamDataDir || [0, 0, -1];
                     this._lastInstanceRebuildCam = [cam[0], cam[1], cam[2]];
+                    this._lastInstanceRebuildDir = [dir[0], dir[1], dir[2]];
                     this._lastInstanceRebuildMs = now;
                 } catch { /* ignore */ }
             }

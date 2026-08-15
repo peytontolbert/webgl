@@ -147,7 +147,7 @@ def _pixels_to_image_rgba(pixels: bytes, width: int, height: int) -> Image.Image
     """
     Convert CodeWalker DDSIO.GetPixels output into a PIL Image.
 
-    DDSIO.GetPixels typically returns a tightly packed pixel buffer in RGB or RGBA.
+    DDSIO.GetPixels returns tightly packed Windows-style BGR/BGRA rows.
     """
     if not pixels:
         raise ValueError("empty pixels")
@@ -155,13 +155,13 @@ def _pixels_to_image_rgba(pixels: bytes, width: int, height: int) -> Image.Image
     exp_rgba = width * height * 4
     exp_rgb = width * height * 3
     if n == exp_rgba:
-        return Image.frombytes("RGBA", (width, height), pixels)
+        return Image.frombytes("RGBA", (width, height), pixels, "raw", "BGRA")
     if n == exp_rgb:
-        img = Image.frombytes("RGB", (width, height), pixels)
+        img = Image.frombytes("RGB", (width, height), pixels, "raw", "BGR")
         return img.convert("RGBA")
     # Best-effort: if buffer is larger, try truncating to expected RGBA.
     if n > exp_rgba:
-        return Image.frombytes("RGBA", (width, height), pixels[:exp_rgba])
+        return Image.frombytes("RGBA", (width, height), pixels[:exp_rgba], "raw", "BGRA")
     raise ValueError(f"unexpected pixel buffer size={n} (expected {exp_rgb} or {exp_rgba})")
 
 

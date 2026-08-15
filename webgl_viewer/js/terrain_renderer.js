@@ -49,34 +49,40 @@ const vsSource = `#version 300 es
             worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
             worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
             
-            // Sample height from heightmap (exact texel fetch for 1:1 mapping).
-            // Our mesh gridPos is in "image space" where v increases downward (y=0 is top row),
-            // while texelFetch uses (0,0) as the *bottom* row, so we flip Y.
+            // Heightmap samples represent grid vertices, not square plateaus. Interpolate them
+            // so this coarse backdrop has continuous slopes between source samples.
             ivec2 ts = textureSize(uHeightmap, 0);
-            vec2 grid = max(vec2(ts), vec2(2.0, 2.0));
-            vec2 pix = gridPos * (grid - 1.0);
-            ivec2 ip = ivec2(clamp(floor(pix + vec2(0.5)), vec2(0.0), grid - 1.0));
-            ivec2 texel = ivec2(ip.x, (ts.y - 1) - ip.y);
-            float height = texelFetch(uHeightmap, texel, 0).r;
+            vec2 grid = max(vec2(ts), vec2(2.0));
+            vec2 pix = clamp(gridPos, vec2(0.0), vec2(1.0)) * (grid - 1.0);
+            ivec2 ip = ivec2(floor(pix));
+            ivec2 ip1 = min(ip + ivec2(1), ts - ivec2(1));
+            vec2 frac = fract(pix);
+            float h00 = texelFetch(uHeightmap, ip, 0).r;
+            float h10 = texelFetch(uHeightmap, ivec2(ip1.x, ip.y), 0).r;
+            float h01 = texelFetch(uHeightmap, ivec2(ip.x, ip1.y), 0).r;
+            float h11 = texelFetch(uHeightmap, ip1, 0).r;
+            float height = mix(mix(h00, h10, frac.x), mix(h01, h11, frac.x), frac.y);
             vHeight01 = height;
             
             // Scale height to match the terrain bounds (height is already 0..1 from R8 texture)
             worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
             
-            // Calculate normal from heightmap (exact neighbor texels).
-            ivec2 ipL = ivec2(max(ip.x - 1, 0), ip.y);
-            ivec2 ipR = ivec2(min(ip.x + 1, ts.x - 1), ip.y);
-            ivec2 ipT = ivec2(ip.x, max(ip.y - 1, 0));
-            ivec2 ipB = ivec2(ip.x, min(ip.y + 1, ts.y - 1));
-            float left = texelFetch(uHeightmap, ivec2(ipL.x, (ts.y - 1) - ipL.y), 0).r;
-            float right = texelFetch(uHeightmap, ivec2(ipR.x, (ts.y - 1) - ipR.y), 0).r;
-            float top = texelFetch(uHeightmap, ivec2(ipT.x, (ts.y - 1) - ipT.y), 0).r;
-            float bottom = texelFetch(uHeightmap, ivec2(ipB.x, (ts.y - 1) - ipB.y), 0).r;
-            
-            // Calculate normal using central differences
+            vec2 oneTexel = 1.0 / max(grid - 1.0, vec2(1.0));
+            vec2 uvL = clamp(gridPos - vec2(oneTexel.x, 0.0), vec2(0.0), vec2(1.0));
+            vec2 uvR = clamp(gridPos + vec2(oneTexel.x, 0.0), vec2(0.0), vec2(1.0));
+            vec2 uvT = clamp(gridPos - vec2(0.0, oneTexel.y), vec2(0.0), vec2(1.0));
+            vec2 uvB = clamp(gridPos + vec2(0.0, oneTexel.y), vec2(0.0), vec2(1.0));
+            vec2 pL = uvL * (grid - 1.0); ivec2 iL = ivec2(floor(pL)); ivec2 iL1 = min(iL + ivec2(1), ts - ivec2(1)); vec2 fL = fract(pL);
+            vec2 pR = uvR * (grid - 1.0); ivec2 iR = ivec2(floor(pR)); ivec2 iR1 = min(iR + ivec2(1), ts - ivec2(1)); vec2 fR = fract(pR);
+            vec2 pT = uvT * (grid - 1.0); ivec2 iT = ivec2(floor(pT)); ivec2 iT1 = min(iT + ivec2(1), ts - ivec2(1)); vec2 fT = fract(pT);
+            vec2 pB = uvB * (grid - 1.0); ivec2 iB = ivec2(floor(pB)); ivec2 iB1 = min(iB + ivec2(1), ts - ivec2(1)); vec2 fB = fract(pB);
+            float left = mix(mix(texelFetch(uHeightmap, iL, 0).r, texelFetch(uHeightmap, ivec2(iL1.x, iL.y), 0).r, fL.x), mix(texelFetch(uHeightmap, ivec2(iL.x, iL1.y), 0).r, texelFetch(uHeightmap, iL1, 0).r, fL.x), fL.y);
+            float right = mix(mix(texelFetch(uHeightmap, iR, 0).r, texelFetch(uHeightmap, ivec2(iR1.x, iR.y), 0).r, fR.x), mix(texelFetch(uHeightmap, ivec2(iR.x, iR1.y), 0).r, texelFetch(uHeightmap, iR1, 0).r, fR.x), fR.y);
+            float top = mix(mix(texelFetch(uHeightmap, iT, 0).r, texelFetch(uHeightmap, ivec2(iT1.x, iT.y), 0).r, fT.x), mix(texelFetch(uHeightmap, ivec2(iT.x, iT1.y), 0).r, texelFetch(uHeightmap, iT1, 0).r, fT.x), fT.y);
+            float bottom = mix(mix(texelFetch(uHeightmap, iB, 0).r, texelFetch(uHeightmap, ivec2(iB1.x, iB.y), 0).r, fB.x), mix(texelFetch(uHeightmap, ivec2(iB.x, iB1.y), 0).r, texelFetch(uHeightmap, iB1, 0).r, fB.x), fB.y);
             vec3 normal = normalize(vec3(
-                (left - right) * uTerrainSize.z,
-                (top - bottom) * uTerrainSize.z,
+                (left - right) * uTerrainSize.z / max(2.0 * oneTexel.x * uTerrainSize.x, 0.001),
+                (top - bottom) * uTerrainSize.z / max(2.0 * oneTexel.y * uTerrainSize.y, 0.001),
                 1.0
             ));
             
@@ -133,6 +139,8 @@ const fsSource = `#version 300 es
     uniform vec3 uFogColor;
     uniform float uFogStart;
     uniform float uFogEnd;
+    uniform bool uWireframe;
+    uniform vec3 uWireframeColor;
     
     out vec4 fragColor;
 
@@ -165,6 +173,19 @@ const fsSource = `#version 300 es
     }
     
     void main() {
+        if (uWireframe) {
+            vec3 normal = normalize(vNormal);
+            float diff = max(dot(normal, uLightDir), 0.0);
+            vec3 finalColor = uWireframeColor * (uAmbientIntensity + diff * 0.35);
+            if (uFogEnabled) {
+                float dist = length(vPosition - uCameraPos);
+                float fogF = smoothstep(uFogStart, uFogEnd, dist);
+                finalColor = mix(finalColor, uFogColor, fogF);
+            }
+            fragColor = vec4(encodeSrgb(finalColor), 1.0);
+            return;
+        }
+
         // vTexcoord0 is in "image space" (v increases downward). Heightmap sampling uses (u, 1-v),
         // so match that convention for the blend mask too.
         vec2 maskUv = vec2(vTexcoord0.x, 1.0 - vTexcoord0.y);
@@ -242,14 +263,19 @@ export class TerrainRenderer {
         // - If loaded from PNG via canvas: `data` is Uint8ClampedArray RGBA (we use .r).
         // - If loaded from u16 raw: `dataU16` is Uint16Array (single-channel).
         this.heightmapPixels = null; // { width, height, data?: Uint8ClampedArray, dataU16?: Uint16Array }
+        this.coverageMaskPixels = null; // { width, height, data: Uint8Array } for valid compressed terrain cells
         this.terrainBounds = [0, 0, 0];
         this.terrainSize = [0, 0, 0];
+        // Debug-render transform only. Raw height sampling remains unchanged.
+        this.visualZOffset = 0.0;
         // Used by shaders for heightmap sampling/normal reconstruction; must match heightmap texture resolution.
         this.terrainGrid = [1, 1];
         // Geometry tessellation grid (can be higher than the heightmap resolution for smoother silhouettes).
         this.meshGrid = [1, 1];
         // Soft cap to avoid blowing up the vertex count on large maps.
-        this.maxTerrainVertices = 220000;
+        // The shipped GTA heightfield is 183 x 249 samples. Rendering four times as
+        // many vertices only repeats interpolated data and competes with streamed city meshes.
+        this.maxTerrainVertices = 60000;
         this.sceneBoundsView = { min: [0, 0, 0], max: [0, 0, 0] };
         this.modelMatrix = glMatrix.mat4.create();
         this.normalMatrix = glMatrix.mat3.create();
@@ -497,6 +523,8 @@ export class TerrainRenderer {
                 uFogColor: this.gl.getUniformLocation(this.program.program, 'uFogColor'),
                 uFogStart: this.gl.getUniformLocation(this.program.program, 'uFogStart'),
                 uFogEnd: this.gl.getUniformLocation(this.program.program, 'uFogEnd'),
+                uWireframe: this.gl.getUniformLocation(this.program.program, 'uWireframe'),
+                uWireframeColor: this.gl.getUniformLocation(this.program.program, 'uWireframeColor'),
 
                 uDecodeSrgb: this.gl.getUniformLocation(this.program.program, 'uDecodeSrgb'),
                 uOutputSrgb: this.gl.getUniformLocation(this.program.program, 'uOutputSrgb'),
@@ -570,11 +598,16 @@ void main() {
         worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
         worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
         ivec2 ts = textureSize(uHeightmap, 0);
-        vec2 grid = max(vec2(ts), vec2(2.0, 2.0));
-        vec2 pix = gridPos * (grid - 1.0);
-        ivec2 ip = ivec2(clamp(floor(pix + vec2(0.5)), vec2(0.0), grid - 1.0));
-        ivec2 texel = ivec2(ip.x, (ts.y - 1) - ip.y);
-        float height = texelFetch(uHeightmap, texel, 0).r;
+        vec2 grid = max(vec2(ts), vec2(2.0));
+        vec2 pix = clamp(gridPos, vec2(0.0), vec2(1.0)) * (grid - 1.0);
+        ivec2 ip = ivec2(floor(pix));
+        ivec2 ip1 = min(ip + ivec2(1), ts - ivec2(1));
+        vec2 frac = fract(pix);
+        float h00 = texelFetch(uHeightmap, ip, 0).r;
+        float h10 = texelFetch(uHeightmap, ivec2(ip1.x, ip.y), 0).r;
+        float h01 = texelFetch(uHeightmap, ivec2(ip.x, ip1.y), 0).r;
+        float h11 = texelFetch(uHeightmap, ip1, 0).r;
+        float height = mix(mix(h00, h10, frac.x), mix(h01, h11, frac.x), frac.y);
         worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
     } else {
         worldPos = aPosition;
@@ -643,7 +676,7 @@ void main() {
         const U = this._depthOnlyUniforms;
         if (U.uViewProjectionMatrix) gl.uniformMatrix4fv(U.uViewProjectionMatrix, false, viewProjectionMatrix);
         if (U.uModelMatrix) gl.uniformMatrix4fv(U.uModelMatrix, false, this.modelMatrix);
-        if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.terrainBounds);
+        if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.getVisualTerrainBounds());
         if (U.uTerrainSize) gl.uniform3fv(U.uTerrainSize, this.terrainSize);
         if (U.uTerrainGrid) gl.uniform2fv(U.uTerrainGrid, this.terrainGrid);
 
@@ -695,7 +728,7 @@ void main() {
             const U = this._depthOnlyUniforms;
             if (U.uViewProjectionMatrix) gl.uniformMatrix4fv(U.uViewProjectionMatrix, false, viewProjectionMatrix);
             if (U.uModelMatrix) gl.uniformMatrix4fv(U.uModelMatrix, false, this.modelMatrix);
-            if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.terrainBounds);
+            if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.getVisualTerrainBounds());
             if (U.uTerrainSize) gl.uniform3fv(U.uTerrainSize, this.terrainSize);
             if (U.uTerrainGrid) gl.uniform2fv(U.uTerrainGrid, this.terrainGrid || [1, 1]);
 
@@ -727,7 +760,7 @@ void main() {
             this.program.use();
             if (this.uniforms?.uViewProjectionMatrix) gl.uniformMatrix4fv(this.uniforms.uViewProjectionMatrix, false, viewProjectionMatrix);
             if (this.uniforms?.uModelMatrix) gl.uniformMatrix4fv(this.uniforms.uModelMatrix, false, this.modelMatrix);
-            if (this.uniforms?.uTerrainBounds) gl.uniform3fv(this.uniforms.uTerrainBounds, this.terrainBounds);
+            if (this.uniforms?.uTerrainBounds) gl.uniform3fv(this.uniforms.uTerrainBounds, this.getVisualTerrainBounds());
             if (this.uniforms?.uTerrainSize) gl.uniform3fv(this.uniforms.uTerrainSize, this.terrainSize);
             if (this.uniforms?.uTerrainGrid) gl.uniform2fv(this.uniforms.uTerrainGrid, this.terrainGrid || [1, 1]);
 
@@ -898,11 +931,16 @@ void main() {
         worldPos.x = uTerrainBounds.x + gridPos.x * uTerrainSize.x;
         worldPos.y = uTerrainBounds.y + gridPos.y * uTerrainSize.y;
         ivec2 ts = textureSize(uHeightmap, 0);
-        vec2 grid = max(vec2(ts), vec2(2.0, 2.0));
-        vec2 pix = gridPos * (grid - 1.0);
-        ivec2 ip = ivec2(clamp(floor(pix + vec2(0.5)), vec2(0.0), grid - 1.0));
-        ivec2 texel = ivec2(ip.x, (ts.y - 1) - ip.y);
-        float height = texelFetch(uHeightmap, texel, 0).r;
+        vec2 grid = max(vec2(ts), vec2(2.0));
+        vec2 pix = clamp(gridPos, vec2(0.0), vec2(1.0)) * (grid - 1.0);
+        ivec2 ip = ivec2(floor(pix));
+        ivec2 ip1 = min(ip + ivec2(1), ts - ivec2(1));
+        vec2 frac = fract(pix);
+        float h00 = texelFetch(uHeightmap, ip, 0).r;
+        float h10 = texelFetch(uHeightmap, ivec2(ip1.x, ip.y), 0).r;
+        float h01 = texelFetch(uHeightmap, ivec2(ip.x, ip1.y), 0).r;
+        float h11 = texelFetch(uHeightmap, ip1, 0).r;
+        float height = mix(mix(h00, h10, frac.x), mix(h01, h11, frac.x), frac.y);
         worldPos.z = uTerrainBounds.z + height * uTerrainSize.z;
     } else {
         worldPos = aPosition;
@@ -941,7 +979,7 @@ void main() { }
         // - assets/heightmap_u16.json: { width, height, file: "heightmap_u16.bin", endian?: "little"|"big" }
         // - assets/heightmap_u16.bin: width*height uint16 samples, row-major, top-to-bottom.
         try {
-            const meta = await fetchJSON('assets/heightmap_u16.json', { priority: 'high' });
+            const meta = await fetchJSON('assets/heightmap_max_u16.json', { priority: 'high' });
             const w = Math.max(1, meta?.width | 0);
             const h = Math.max(1, meta?.height | 0);
             const file = (typeof meta?.file === 'string' && meta.file.length > 0) ? meta.file : 'heightmap_u16.bin';
@@ -968,6 +1006,25 @@ void main() { }
 
             return { width: w, height: h, dataU16 };
         } catch {
+            return null;
+        }
+    }
+
+    async _tryLoadCoverageMask(info) {
+        const spec = info?.render_coverage_mask;
+        if (!spec || typeof spec !== 'object') return null;
+        try {
+            const width = Math.max(1, Number(spec.width) | 0);
+            const height = Math.max(1, Number(spec.height) | 0);
+            const file = String(spec.file || '');
+            if (!width || !height || !file) throw new Error('invalid terrain coverage metadata');
+            const blob = await fetchBlob(`assets/${file}`, { priority: 'high' });
+            const buf = await blob.arrayBuffer();
+            const expectedBytes = width * height;
+            if (buf.byteLength < expectedBytes) throw new Error(`terrain coverage mask too small (${buf.byteLength} < ${expectedBytes})`);
+            return { width, height, data: new Uint8Array(buf, 0, expectedBytes) };
+        } catch (error) {
+            console.warn('Failed to load terrain coverage mask:', error);
             return null;
         }
     }
@@ -1079,8 +1136,12 @@ void main() { }
                 throw new Error('Invalid terrain info structure');
             }
             
-            // Get the first heightmap's bounds and dimensions
-            const firstHeightmapKey = Object.keys(info.dimensions)[0];
+            // A terrain export can include multiple maps. The exporter marks the one whose raster
+            // was written for this viewer; fall back to the first entry for older exports.
+            const requestedHeightmapKey = String(info.render_heightmap_key || '');
+            const firstHeightmapKey = (requestedHeightmapKey && info.dimensions[requestedHeightmapKey] && info.bounds[requestedHeightmapKey])
+                ? requestedHeightmapKey
+                : Object.keys(info.dimensions)[0];
             const firstHeightmap = info.dimensions[firstHeightmapKey];
             const bounds = info.bounds[firstHeightmapKey];
             
@@ -1100,6 +1161,10 @@ void main() { }
             // viewer's downsampled heightmap.png.
             this.terrainGrid = [hmW, hmH];
             this.meshGrid = this._chooseMeshGrid(hmW, hmH);
+            this.coverageMaskPixels = await this._tryLoadCoverageMask(info);
+            if (info.render_coverage_mask && !this.coverageMaskPixels) {
+                throw new Error('Terrain coverage metadata exists but its mask could not be loaded.');
+            }
 
             // Precompute scene AABB in *viewer space* for the camera (transform 8 corners).
             const corners = [
@@ -1132,7 +1197,8 @@ void main() { }
             this.mesh.createFromHeightmap(
                 this.meshGrid[0],
                 this.meshGrid[1],
-                bounds
+                bounds,
+                this.coverageMaskPixels
             );
             
             console.log('Terrain mesh loaded successfully');
@@ -1160,24 +1226,51 @@ void main() { }
         u = Math.max(0, Math.min(1, u));
         v = Math.max(0, Math.min(1, v));
 
-        // Shader samples at vec2(u, 1 - v)
+        // Heightmap rows are stored from world min_y to max_y, matching terrain mesh Y.
         const w = this.heightmapPixels.width;
         const h = this.heightmapPixels.height;
-        const px = Math.round(u * (w - 1));
-        const py = Math.round((1.0 - v) * (h - 1));
-        let height01 = 0.0;
-        if (this.heightmapPixels.dataU16) {
-            const idx = (py * w + px);
-            const v16 = this.heightmapPixels.dataU16[idx] ?? 0;
-            height01 = v16 / 65535.0;
-        } else if (this.heightmapPixels.data) {
-            const idx = (py * w + px) * 4;
-            const r = this.heightmapPixels.data[idx] ?? 0;
-            height01 = r / 255.0;
-        } else {
-            return null;
+        const fx = u * (w - 1);
+        const fy = v * (h - 1);
+        const x0 = Math.floor(fx);
+        const y0 = Math.floor(fy);
+        const x1 = Math.min(w - 1, x0 + 1);
+        const y1 = Math.min(h - 1, y0 + 1);
+        const tx = fx - x0;
+        const ty = fy - y0;
+        const coverage = this.coverageMaskPixels;
+        if (coverage?.data) {
+            const maskX = (sampleX) => Math.round((sampleX / Math.max(1, w - 1)) * (coverage.width - 1));
+            const maskY = (sampleY) => Math.round((sampleY / Math.max(1, h - 1)) * (coverage.height - 1));
+            const covered = (sampleX, sampleY) => (coverage.data[maskY(sampleY) * coverage.width + maskX(sampleX)] || 0) !== 0;
+            if (!covered(x0, y0) || !covered(x1, y0) || !covered(x0, y1) || !covered(x1, y1)) return null;
         }
+        const sample = (sx, sy) => {
+            if (this.heightmapPixels.dataU16) {
+                return (this.heightmapPixels.dataU16[sy * w + sx] ?? 0) / 65535.0;
+            }
+            if (this.heightmapPixels.data) {
+                return (this.heightmapPixels.data[(sy * w + sx) * 4] ?? 0) / 255.0;
+            }
+            return null;
+        };
+        const h00 = sample(x0, y0);
+        const h10 = sample(x1, y0);
+        const h01 = sample(x0, y1);
+        const h11 = sample(x1, y1);
+        if (![h00, h10, h01, h11].every(Number.isFinite)) return null;
+        const height01 = (h00 * (1 - tx) + h10 * tx) * (1 - ty)
+            + (h01 * (1 - tx) + h11 * tx) * ty;
         return minZ + height01 * sizeZ;
+    }
+
+    setVisualZOffset(offset) {
+        const z = Number(offset);
+        this.visualZOffset = Number.isFinite(z) ? z : 0.0;
+    }
+
+    getVisualTerrainBounds() {
+        const b = this.terrainBounds || [0, 0, 0];
+        return [b[0], b[1], (Number(b[2]) || 0.0) + (Number(this.visualZOffset) || 0.0)];
     }
     
     async loadHeightmapTexture() {
@@ -1415,9 +1508,10 @@ void main() { }
     
     render(viewProjectionMatrix, cameraPos = [0, 0, 0], fog = { enabled: false, color: [0.6, 0.7, 0.8], start: 1500, end: 9000 }) {
         if (!this.mesh) return;
+        const wireframe = !!fog?.wireframe;
 
         // Prefer deferred shader path when available (WebGL2 only); fall back to forward shader path.
-        if (this._deferredReady) {
+        if (this._deferredReady && !wireframe) {
             this._renderDeferred(viewProjectionMatrix, fog);
             return;
         }
@@ -1436,7 +1530,7 @@ void main() { }
         this.gl.uniformMatrix4fv(this.uniforms.uViewProjectionMatrix, false, viewProjectionMatrix);
         this.gl.uniformMatrix4fv(this.uniforms.uModelMatrix, false, this.modelMatrix);
         this.gl.uniformMatrix3fv(this.uniforms.uNormalMatrix, false, this.normalMatrix);
-        this.gl.uniform3fv(this.uniforms.uTerrainBounds, this.terrainBounds);
+        this.gl.uniform3fv(this.uniforms.uTerrainBounds, this.getVisualTerrainBounds());
         this.gl.uniform3fv(this.uniforms.uTerrainSize, this.terrainSize);
         if (this.uniforms.uTerrainGrid) {
             this.gl.uniform2fv(this.uniforms.uTerrainGrid, this.terrainGrid || [1, 1]);
@@ -1485,6 +1579,8 @@ void main() { }
         this.gl.uniform3fv(this.uniforms.uFogColor, fog?.color || [0.6, 0.7, 0.8]);
         this.gl.uniform1f(this.uniforms.uFogStart, Number(fog?.start ?? 1500));
         this.gl.uniform1f(this.uniforms.uFogEnd, Number(fog?.end ?? 9000));
+        this.gl.uniform1i(this.uniforms.uWireframe, wireframe ? 1 : 0);
+        this.gl.uniform3fv(this.uniforms.uWireframeColor, fog?.wireframeColor || [0.0, 1.0, 0.72]);
 
         // Output encoding: if outputSrgb is false, the shader outputs linear for a final post-process pass.
         try {
@@ -1528,10 +1624,15 @@ void main() { }
         // Render mesh
         // Depth-bias the terrain slightly so it doesn't z-fight with roads/buildings that sit near the ground.
         // This helps when using a coarse heightmap under detailed city meshes.
-        gl.enable(gl.POLYGON_OFFSET_FILL);
-        gl.polygonOffset(1.0, 1.0);
-        this.mesh.render(this.program);
-        gl.disable(gl.POLYGON_OFFSET_FILL);
+        if (wireframe) {
+            gl.disable(gl.POLYGON_OFFSET_FILL);
+            this.mesh.render(this.program, { wireframe: true });
+        } else {
+            gl.enable(gl.POLYGON_OFFSET_FILL);
+            gl.polygonOffset(1.0, 1.0);
+            this.mesh.render(this.program);
+            gl.disable(gl.POLYGON_OFFSET_FILL);
+        }
     }
 
     _ensureGBuffer(w, h) {
@@ -1647,7 +1748,7 @@ void main() { }
         glMatrix.vec3.set(ld, lightDir?.[0] ?? 0.5, lightDir?.[1] ?? 0.8, lightDir?.[2] ?? 0.3);
         glMatrix.vec3.normalize(ld, ld);
 
-        const b = this.terrainBounds || [0, 0, 0];
+        const b = this.getVisualTerrainBounds();
         const s = this.terrainSize || [0, 0, 0];
         const minW = [b[0], b[1], b[2]];
         const maxW = [b[0] + s[0], b[1] + s[1], b[2] + s[2]];
@@ -1733,7 +1834,7 @@ void main() { }
         if (U.uModelMatrix) gl.uniformMatrix4fv(U.uModelMatrix, false, this.modelMatrix);
         if (U.uLightViewMatrix) gl.uniformMatrix4fv(U.uLightViewMatrix, false, this._shadow.lightView);
         if (U.uLightProjMatrix) gl.uniformMatrix4fv(U.uLightProjMatrix, false, this._shadow.lightProj);
-        if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.terrainBounds);
+        if (U.uTerrainBounds) gl.uniform3fv(U.uTerrainBounds, this.getVisualTerrainBounds());
         if (U.uTerrainSize) gl.uniform3fv(U.uTerrainSize, this.terrainSize);
 
         // Heightmap on unit 0
@@ -1806,9 +1907,10 @@ void main() { }
             f32[36] = this.normalMatrix[3];  f32[37] = this.normalMatrix[4];  f32[38] = this.normalMatrix[5];  f32[39] = 0;
             f32[40] = this.normalMatrix[6];  f32[41] = this.normalMatrix[7];  f32[42] = this.normalMatrix[8];  f32[43] = 0;
             // vec3 uTerrainBounds (padded)
-            f32[44] = this.terrainBounds[0] ?? 0;
-            f32[45] = this.terrainBounds[1] ?? 0;
-            f32[46] = this.terrainBounds[2] ?? 0;
+            const visualBounds = this.getVisualTerrainBounds();
+            f32[44] = visualBounds[0] ?? 0;
+            f32[45] = visualBounds[1] ?? 0;
+            f32[46] = visualBounds[2] ?? 0;
             f32[47] = 0;
             // vec3 uTerrainSize (padded)
             f32[48] = this.terrainSize[0] ?? 0;
@@ -2060,4 +2162,4 @@ void main() { }
         try { if (this._shadow?.depthTex) this.gl.deleteTexture(this._shadow.depthTex); } catch { /* ignore */ }
         try { if (this._shadow?.fbo) this.gl.deleteFramebuffer(this._shadow.fbo); } catch { /* ignore */ }
     }
-} 
+}

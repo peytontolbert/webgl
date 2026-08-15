@@ -101,6 +101,12 @@ export class EntityRenderer {
         this.chunkBuffers.delete(key);
     }
 
+    clear() {
+        for (const key of Array.from(this.chunkBuffers.keys())) {
+            this.deleteChunk(key);
+        }
+    }
+
     render(viewProjectionMatrix, pointSize = 2.0) {
         if (!this.ready) return;
 

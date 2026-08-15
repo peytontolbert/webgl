@@ -1,6 +1,7 @@
 import { glMatrix } from './glmatrix.js';
 import { ShaderProgram } from './shader_program.js';
 import { fetchText } from './asset_fetcher.js';
+import { createWireframeIndices } from './wireframe_indices.js';
 
 const vsSource = `#version 300 es
 in vec3 aPosition;
@@ -48,6 +49,8 @@ uniform bool uFogEnabled;
 uniform vec3 uFogColor;
 uniform float uFogStart;
 uniform float uFogEnd;
+uniform bool uWireframe;
+uniform vec3 uWireframeColor;
 
 void main() {
     vec3 n = normalize(vNormal);
@@ -56,6 +59,18 @@ void main() {
     // Heuristic: the exported "water mesh" is a big planar grid at data-space Z=0.
     // Treat vertices near Z=0 as water. This avoids needing separate OBJ materials/groups.
     bool isWater = abs(vDataZ) <= uWaterEps;
+
+    if (uWireframe) {
+        vec3 c = isWater ? vec3(0.10, 0.55, 0.90) : uWireframeColor;
+        c *= 0.75 + diff * 0.25;
+        if (uFogEnabled) {
+            float dist = length(vWorldPos - uCameraPos);
+            float fogF = smoothstep(uFogStart, uFogEnd, dist);
+            c = mix(c, uFogColor, fogF);
+        }
+        fragColor = vec4(c, 1.0);
+        return;
+    }
 
     if (uWaterPass == 0) {
         if (isWater) discard;
@@ -138,7 +153,9 @@ export class BuildingRenderer {
         this.posBuffer = null;
         this.nrmBuffer = null;
         this.idxBuffer = null;
+        this.lineIdxBuffer = null;
         this.indexCount = 0;
+        this.lineIndexCount = 0;
 
         this.boundsData = { min: [0, 0, 0], max: [0, 0, 0] };
         this.boundsView = { min: [0, 0, 0], max: [0, 0, 0] };
@@ -163,6 +180,8 @@ export class BuildingRenderer {
             uFogColor: this.gl.getUniformLocation(this.program.program, 'uFogColor'),
             uFogStart: this.gl.getUniformLocation(this.program.program, 'uFogStart'),
             uFogEnd: this.gl.getUniformLocation(this.program.program, 'uFogEnd'),
+            uWireframe: this.gl.getUniformLocation(this.program.program, 'uWireframe'),
+            uWireframeColor: this.gl.getUniformLocation(this.program.program, 'uWireframeColor'),
         };
 
         this.vao = this.gl.createVertexArray();
@@ -214,6 +233,16 @@ export class BuildingRenderer {
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.idxBuffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, parsed.indices, gl.STATIC_DRAW);
 
+        if (this.lineIdxBuffer) {
+            try { gl.deleteBuffer(this.lineIdxBuffer); } catch { /* ignore */ }
+        }
+        const lineIndices = createWireframeIndices(parsed.indices, Uint32Array);
+        this.lineIdxBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.lineIdxBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lineIndices, gl.STATIC_DRAW);
+        this.lineIndexCount = lineIndices.length;
+
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.idxBuffer);
         gl.bindVertexArray(null);
 
         this.indexCount = parsed.indices.length;
@@ -347,7 +376,7 @@ export class BuildingRenderer {
         };
     }
 
-    render(viewProjectionMatrix, enabled = true, { showWater = true, waterAlpha = 0.35, waterEps = 0.05, fog = null, cameraPos = [0, 0, 0] } = {}) {
+    render(viewProjectionMatrix, enabled = true, { showWater = true, waterAlpha = 0.35, waterEps = 0.05, fog = null, cameraPos = [0, 0, 0], wireframe = false, wireframeColor = [0.72, 0.84, 1.0] } = {}) {
         if (!enabled || !this.ready || !this.vao || this.indexCount <= 0) return;
         const gl = this.gl;
         gl.useProgram(this.program.program);
@@ -370,12 +399,26 @@ export class BuildingRenderer {
         gl.uniform3fv(this.uniforms.uFogColor, fog?.color || [0.6, 0.7, 0.8]);
         gl.uniform1f(this.uniforms.uFogStart, Number(fog?.start ?? 1500));
         gl.uniform1f(this.uniforms.uFogEnd, Number(fog?.end ?? 9000));
+        gl.uniform1i(this.uniforms.uWireframe, wireframe ? 1 : 0);
+        gl.uniform3fv(this.uniforms.uWireframeColor, wireframeColor);
 
         gl.enable(gl.DEPTH_TEST);
 
         gl.bindVertexArray(this.vao);
 
+        if (wireframe && this.lineIdxBuffer && this.lineIndexCount > 0) {
+            gl.disable(gl.BLEND);
+            gl.depthMask(true);
+            gl.uniform1i(this.uniforms.uWaterPass, 0);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.lineIdxBuffer);
+            gl.drawElements(gl.LINES, this.lineIndexCount, gl.UNSIGNED_INT, 0);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.idxBuffer);
+            gl.bindVertexArray(null);
+            return;
+        }
+
         // Pass 0: non-water opaque (writes depth).
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.idxBuffer);
         gl.disable(gl.BLEND);
         gl.depthMask(true);
         gl.uniform1i(this.uniforms.uWaterPass, 0);

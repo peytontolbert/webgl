@@ -20,6 +20,13 @@ export class EntityStreamer {
         this.maxLoadedChunks = 25; // 5x5 around camera
         this.radiusChunks = 2;
         this.enableFrustumCulling = true;
+        this.residencyHysteresisChunks = 0.18;
+        this._residentCenterChunk = null;
+        // Optional data-space rectangle used by the spawn-district demo. This is applied
+        // to both chunk residency and the records kept from overlapping chunks.
+        this.worldBounds = null;
+        // Optional compact ENT0 tile used by /demo when entity dots are enabled.
+        this.demoBootstrap = null;
 
         // Avoid spamming hundreds of requests in a single frame; stream progressively.
         this.maxNewLoadsPerUpdate = 8;
@@ -53,6 +60,64 @@ export class EntityStreamer {
             failed: 0,
             lastError: '',
         };
+    }
+
+    setWorldBounds(bounds = null) {
+        const minX = Number(bounds?.minX);
+        const minY = Number(bounds?.minY);
+        const maxX = Number(bounds?.maxX);
+        const maxY = Number(bounds?.maxY);
+        this.worldBounds = [minX, minY, maxX, maxY].every(Number.isFinite) && maxX > minX && maxY > minY
+            ? { minX, minY, maxX, maxY }
+            : null;
+        this._residentCenterChunk = null;
+    }
+
+    setDemoBootstrap(config = null) {
+        const pointFile = String(config?.pointFile || '').replace(/^assets\//i, '').replace(/^\/+/, '');
+        if (!pointFile) {
+            this.demoBootstrap = null;
+            this._residentCenterChunk = null;
+            return;
+        }
+        this.demoBootstrap = {
+            key: String(config?.key || '__demo_spawn_district__'),
+            pointFile,
+        };
+        this._residentCenterChunk = null;
+    }
+
+    _isDataPositionInWorldBounds(x, y) {
+        const b = this.worldBounds;
+        if (!b) return true;
+        return x >= b.minX && x <= b.maxX && y >= b.minY && y <= b.maxY;
+    }
+
+    _isChunkInWorldBounds(key) {
+        const b = this.worldBounds;
+        if (!b) return true;
+        const aabb = this._chunkAABBDataSpace(key);
+        if (!aabb) return false;
+        return aabb.max[0] > b.minX && aabb.min[0] < b.maxX &&
+            aabb.max[1] > b.minY && aabb.min[1] < b.maxY;
+    }
+
+    _filterPositionsToWorldBounds(positions) {
+        if (!this.worldBounds || !positions?.length) return positions;
+        let kept = 0;
+        for (let i = 0; i + 2 < positions.length; i += 3) {
+            if (this._isDataPositionInWorldBounds(positions[i], positions[i + 1])) kept++;
+        }
+        if (kept * 3 === positions.length) return positions;
+        const filtered = new Float32Array(kept * 3);
+        let out = 0;
+        for (let i = 0; i + 2 < positions.length; i += 3) {
+            if (!this._isDataPositionInWorldBounds(positions[i], positions[i + 1])) continue;
+            filtered[out++] = positions[i];
+            filtered[out++] = positions[i + 1];
+            filtered[out++] = positions[i + 2];
+        }
+        return filtered;
     }
 
     setTimeWeather({ hour = null, weather = null } = {}) {
@@ -157,6 +222,24 @@ export class EntityStreamer {
         try { this.stats.aborted++; } catch { /* ignore */ }
     }
 
+    clear(entityRenderer = null) {
+        for (const key of Array.from(this.loading)) {
+            this._cancelChunkLoad(key, 'clear');
+        }
+        for (const key of Array.from(this._chunkLoadReqs.keys())) {
+            this._cancelChunkLoad(key, 'clear');
+        }
+        if (entityRenderer && typeof entityRenderer.deleteChunk === 'function') {
+            for (const key of Array.from(this.loaded)) {
+                try { entityRenderer.deleteChunk(key); } catch { /* ignore */ }
+            }
+        }
+        this.loading.clear();
+        this.loaded.clear();
+        this._chunkLoadReqs.clear();
+        this._residentCenterChunk = null;
+    }
+
     _cameraToDataSpace(cameraPosVec3) {
         // Convert camera position from viewer space back into data (GTA) space using inverse model matrix.
         const v = glMatrix.vec4.fromValues(cameraPosVec3[0], cameraPosVec3[1], cameraPosVec3[2], 1.0);
@@ -191,6 +274,28 @@ export class EntityStreamer {
         const [sx, sy] = key.split('_').map(v => parseInt(v, 10));
         if (!Number.isFinite(sx) || !Number.isFinite(sy)) return null;
         return [(sx + 0.5) * chunkSize, (sy + 0.5) * chunkSize, 0.0];
+    }
+
+    _resolveResidentCenterChunk(p, chunkSize) {
+        const x = Number(p?.[0]);
+        const y = Number(p?.[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !(chunkSize > 0)) return null;
+        const nextX = Math.floor(x / chunkSize);
+        const nextY = Math.floor(y / chunkSize);
+        const previous = this._residentCenterChunk;
+        if (!previous || !Number.isFinite(previous.x) || !Number.isFinite(previous.y)) {
+            this._residentCenterChunk = { x: nextX, y: nextY };
+            return this._residentCenterChunk;
+        }
+        const margin = Math.max(0, Math.min(0.45, Number(this.residencyHysteresisChunks) || 0)) * chunkSize;
+        if (
+            x >= previous.x * chunkSize - margin &&
+            x < (previous.x + 1) * chunkSize + margin &&
+            y >= previous.y * chunkSize - margin &&
+            y < (previous.y + 1) * chunkSize + margin
+        ) return previous;
+        this._residentCenterChunk = { x: nextX, y: nextY };
+        return this._residentCenterChunk;
     }
 
     _sortWantedKeys(keys, camera, centerDataPos = null, { inFrustumSet = null } = {}) {
@@ -230,37 +335,34 @@ export class EntityStreamer {
 
     _wantedKeysForCamera(camera, centerDataPos = null) {
         if (!this.index) return [];
+        if (this.demoBootstrap) return [this.demoBootstrap.key];
         const chunkSize = this.index.chunk_size;
         const p = centerDataPos ? glMatrix.vec4.fromValues(centerDataPos[0], centerDataPos[1], centerDataPos[2], 1.0) : this._cameraToDataSpace(camera.position);
-        const cx = Math.floor(p[0] / chunkSize);
-        const cy = Math.floor(p[1] / chunkSize);
+        const anchor = this._resolveResidentCenterChunk(p, chunkSize);
+        if (!anchor) return [];
+        const cx = anchor.x;
+        const cy = anchor.y;
 
         const keys = [];
-        const inFrustumSet = new Set();
-        // IMPORTANT: chunk AABBs are in *data space*, so we must extract frustum planes in data space too.
-        // Clip = cameraVP * (modelMatrix * dataPos) => use (cameraVP * modelMatrix) to get planes that match data-space AABBs.
-        const planes = this.enableFrustumCulling
-            ? (() => {
-                const vpData = glMatrix.mat4.create();
-                glMatrix.mat4.multiply(vpData, camera.viewProjectionMatrix, this.modelMatrix);
-                return extractFrustumPlanes(vpData);
-            })()
-            : null;
         for (let dy = -this.radiusChunks; dy <= this.radiusChunks; dy++) {
             for (let dx = -this.radiusChunks; dx <= this.radiusChunks; dx++) {
                 const k = `${cx + dx}_${cy + dy}`;
-                if (planes) {
-                    const aabb = this._chunkAABBDataSpace(k);
-                    // Missing AABB => treat as visible so we don't accidentally starve it.
-                    const inFrustum = !aabb || aabbIntersectsFrustum(planes, aabb.min, aabb.max);
-                    if (inFrustum) inFrustumSet.add(k);
-                } else {
-                    inFrustumSet.add(k);
-                }
+                if (!this._isChunkInWorldBounds(k)) continue;
                 keys.push(k);
             }
         }
-        return this._sortWantedKeys(keys, camera, centerDataPos, { inFrustumSet });
+        // Point/dot residency follows the same player core as drawables. Frustum direction can help draw
+        // calls, but it must not select a different chunk set when the player merely rotates the camera.
+        keys.sort((a, b) => {
+            const [ax, ay] = a.split('_').map(Number);
+            const [bx, by] = b.split('_').map(Number);
+            const da = (ax - cx) * (ax - cx) + (ay - cy) * (ay - cy);
+            const db = (bx - cx) * (bx - cx) + (by - cy) * (by - cy);
+            return da - db || (a < b ? -1 : 1);
+        });
+        const maxWanted = Math.max(1, Math.floor(Number(this.maxLoadedChunks) || 1));
+        if (keys.length > maxWanted) keys.length = maxWanted;
+        return keys;
     }
 
     /**
@@ -273,7 +375,8 @@ export class EntityStreamer {
 
     async _loadChunk(key, entityRenderer, { priority = 'high' } = {}) {
         if (!this.index) return;
-        const meta = (this.index.chunks || {})[key];
+        const isDemoBootstrap = !!this.demoBootstrap && key === this.demoBootstrap.key;
+        const meta = isDemoBootstrap ? { file: this.demoBootstrap.pointFile } : (this.index.chunks || {})[key];
         if (!meta) return; // chunk doesn't exist
 
         if (this.loaded.has(key) || this.loading.has(key)) return;
@@ -285,15 +388,15 @@ export class EntityStreamer {
         try { this.stats.started++; } catch { /* ignore */ }
 
         try {
-            const jsonlPath = `assets/${this.index.chunks_dir}/${meta.file}`;
+            const jsonlPath = isDemoBootstrap ? '' : `assets/${this.index.chunks_dir}/${meta.file}`;
 
             // Prefer binary positions chunk if present:
             // assets/entities_chunks_bin/<chunk>.bin with ENT0 header.
             let positions = null;
-            if (this.preferBinary) {
+            if (this.preferBinary || isDemoBootstrap) {
                 try {
                     const binFile = String(meta.file || '').replace(/\.jsonl$/i, '.bin');
-                    const binPath = `assets/entities_chunks_bin/${binFile}`;
+                    const binPath = isDemoBootstrap ? `assets/${binFile}` : `assets/entities_chunks_bin/${binFile}`;
                     const buf = await fetchArrayBufferWithPriority(binPath, { priority, usePersistentCache: this.usePersistentCacheForChunks, signal });
                     const dv = new DataView(buf);
                     if (dv.byteLength >= 8) {
@@ -314,6 +417,7 @@ export class EntityStreamer {
                     }
                     // If header wasn't recognized, fall through to JSONL.
                 } catch (e) {
+                    if (isDemoBootstrap) throw e;
                     // If the directory isn't present, disable the binary fast-path to avoid spamming 404s.
                     const msg = String(e?.message || e || '');
                     if (msg.includes('status=404')) this.preferBinary = false;
@@ -350,11 +454,14 @@ export class EntityStreamer {
                         const y = Number(pos[1]);
                         const z = Number(pos[2]);
                         if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+                        if (!this._isDataPositionInWorldBounds(x, y)) return;
                         push3(x, y, z);
                     },
                 });
                 positions = out.subarray(0, n);
             }
+
+            positions = this._filterPositionsToWorldBounds(positions);
 
             // Drop stale/aborted loads before mutating any renderer state.
             const live = this._chunkLoadReqs.get(key);

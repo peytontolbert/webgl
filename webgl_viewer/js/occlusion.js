@@ -4,7 +4,8 @@ import { glMatrix } from './glmatrix.js';
  * Minimal occlusion proxy (v1):
  * - Render occluders (terrain/buildings) into a small depth-only framebuffer.
  * - Read depth to CPU at a throttled cadence.
- * - Conservative visibility test for bounding spheres via a few projected sample points.
+ * - Build a CPU hierarchical-Z pyramid from the throttled readback.
+ * - Conservative visibility test for bounding spheres via HZB, with point-sample fallback.
  *
  * Notes:
  * - This is intentionally conservative: if anything looks uncertain, we return "visible".
@@ -13,7 +14,7 @@ import { glMatrix } from './glmatrix.js';
 export class OcclusionCuller {
     /**
      * @param {WebGL2RenderingContext} gl
-     * @param {{ width?: number, height?: number, readbackEveryNFrames?: number, depthEps?: number, preferDepthReadback?: boolean }} opts
+     * @param {{ width?: number, height?: number, readbackEveryNFrames?: number, depthEps?: number, preferDepthReadback?: boolean, enableSoftwareHzb?: boolean, hzbMinScreenPixels?: number, temporalKeepFrames?: number }} opts
      */
     constructor(gl, opts = {}) {
         this.gl = gl;
@@ -25,8 +26,16 @@ export class OcclusionCuller {
             ? Math.max(1, Math.min(16, opts.readbackEveryNFrames | 0))
             : 2;
         this.depthEps = Number.isFinite(opts.depthEps) ? Math.max(0.0, Math.min(0.02, Number(opts.depthEps))) : 0.0025;
+        this.enableSoftwareHzb = opts.enableSoftwareHzb !== false;
+        this.hzbMinScreenPixels = Number.isFinite(opts.hzbMinScreenPixels)
+            ? Math.max(1.0, Math.min(64.0, Number(opts.hzbMinScreenPixels)))
+            : 4.0;
+        this.temporalKeepFrames = Number.isFinite(opts.temporalKeepFrames)
+            ? Math.max(0, Math.min(8, opts.temporalKeepFrames | 0))
+            : 2;
 
         this._frameIndex = 0;
+        this._temporalFrame = 0;
         this._depthTex = null;
         this._fbo = null;
         this._depthReadFbo = null; // alias for clarity (depth-only FBO)
@@ -39,6 +48,9 @@ export class OcclusionCuller {
         this._depthF32 = null;
         this._useFloatReadback = false;
         this._readbackSupported = true; // true if ANY readback mode works
+        this._hzbLevels = [];
+        this._hzbBuilt = false;
+        this._temporalVisibility = new Map();
         // Default to the most compatible readback path:
         // - readPixels(RGBA, UNSIGNED_BYTE) is the only guaranteed combo across implementations.
         // - depth readPixels frequently fails with INVALID_ENUM on some GPUs/drivers (as you've seen).
@@ -53,6 +65,12 @@ export class OcclusionCuller {
             readbacks: 0,
             lastReadbackMs: 0,
             lastReadbackOk: false,
+            hzbBuilds: 0,
+            hzbTests: 0,
+            hzbCulled: 0,
+            hzbLevels: 0,
+            lastHzbBuildMs: 0,
+            temporalKeeps: 0,
         };
 
         this._tmpV4 = glMatrix.vec4.create();
@@ -89,6 +107,8 @@ export class OcclusionCuller {
             enabled: !!this.enabled,
             readbackSupported: !!this._readbackSupported,
             readbackMode: this._readbackMode,
+            hzbEnabled: !!this.enableSoftwareHzb,
+            hzbBuilt: !!this._hzbBuilt,
         };
     }
 
@@ -107,6 +127,8 @@ export class OcclusionCuller {
 
         const gl = this.gl;
         this._frameIndex++;
+        this._temporalFrame = (this._temporalFrame + 1) >>> 0;
+        if ((this._temporalFrame % 120) === 0) this._pruneTemporalVisibility();
 
         // Save a tiny bit of GL state we mutate.
         const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING);
@@ -147,6 +169,8 @@ export class OcclusionCuller {
             this._lastStats.readbacks += 1;
             this._lastStats.lastReadbackMs = (t1 - t0);
             this._lastStats.lastReadbackOk = !!ok;
+            if (ok) this._buildSoftwareHzb();
+            else this._hzbBuilt = false;
         }
 
         // Restore state.
@@ -167,14 +191,14 @@ export class OcclusionCuller {
      * Conservative visibility test for a bounding sphere in VIEWER space.
      * Returns true => keep drawing.
      *
-     * @param {{ center: number[], radius: number, viewProjectionMatrix: Float32Array, viewportWidth: number, viewportHeight: number }} args
+     * @param {{ center: number[], radius: number, viewProjectionMatrix: Float32Array, viewportWidth: number, viewportHeight: number, key?: string }} args
      */
-    isVisibleSphere({ center, radius, viewProjectionMatrix, viewportWidth, viewportHeight }) {
+    isVisibleSphere({ center, radius, viewProjectionMatrix, viewportWidth, viewportHeight, key = null }) {
         this._lastStats.occlusionTests += 1;
 
         // Fail open if disabled or no depth buffer.
         if (!this.enabled) return true;
-        if ((!this._depthU32 && !this._depthF32) || (!this._fbo)) return true;
+        if ((!this._depthU32 && !this._depthF32 && !this._depthRGBA) || (!this._fbo)) return true;
         if (!center || center.length < 3) return true;
         const r = Number(radius);
         if (!Number.isFinite(r) || r <= 0) return true;
@@ -183,6 +207,19 @@ export class OcclusionCuller {
 
         // If we don't have a recent readback, fail open.
         if (!this._lastStats.lastReadbackOk) return true;
+
+        const hzbVisible = this._isVisibleSphereHzb({
+            center,
+            radius: r,
+            viewProjectionMatrix,
+            viewportWidth,
+            viewportHeight,
+            key,
+        });
+        if (hzbVisible !== null) {
+            if (!hzbVisible) this._lastStats.culled += 1;
+            return !!hzbVisible;
+        }
 
         // Sample points on/near the sphere. If ANY sample can't be evaluated, fail open.
         const samples = [
@@ -225,19 +262,31 @@ export class OcclusionCuller {
 
             tested++;
             // If the occluder depth is NOT closer than our point by margin => visible.
-            if (!(d <= (depth01 - this.depthEps))) return true;
+            if (!(d <= (depth01 - this.depthEps))) {
+                this._markVisibleKey(key);
+                return true;
+            }
         }
 
         // If we didn't evaluate anything (shouldn't happen), fail open.
         if (tested <= 0) return true;
 
         // All samples were behind existing depth: treat as occluded.
+        if (this._shouldKeepVisibleTemporally(key)) return true;
         this._lastStats.culled += 1;
         return false;
     }
 
     _sampleDepth01(x, y) {
         const idx = (y * this.width + x);
+        if (this._readbackMode === 'rgba' && this._depthRGBA) {
+            const off = idx * 4;
+            const r = this._depthRGBA[off] | 0;
+            const g = this._depthRGBA[off + 1] | 0;
+            const b = this._depthRGBA[off + 2] | 0;
+            const u24 = (r + (g << 8) + (b << 16)) >>> 0;
+            return u24 / 16777215.0;
+        }
         if (this._depthF32) {
             // DEPTH_COMPONENT + FLOAT readPixels returns normalized depth in [0..1] (implementation may clamp).
             const d = this._depthF32[idx];
@@ -257,6 +306,222 @@ export class OcclusionCuller {
             return u24 / 16777215.0;
         }
         return NaN;
+    }
+
+    _buildSoftwareHzb() {
+        if (!this.enableSoftwareHzb) {
+            this._hzbBuilt = false;
+            this._hzbLevels = [];
+            this._lastStats.hzbLevels = 0;
+            this._lastStats.lastHzbBuildMs = 0;
+            return false;
+        }
+        const count = this.width * this.height;
+        if (count <= 0) return false;
+        const t0 = performance.now();
+        const base = new Float32Array(count);
+        if (!this._decodeDepthToFloat32(base)) {
+            this._hzbBuilt = false;
+            this._hzbLevels = [];
+            this._lastStats.hzbLevels = 0;
+            return false;
+        }
+
+        const levels = [{ width: this.width, height: this.height, depth: base }];
+        let prev = base;
+        let prevW = this.width;
+        let prevH = this.height;
+        while (prevW > 1 || prevH > 1) {
+            const w = Math.max(1, Math.ceil(prevW * 0.5));
+            const h = Math.max(1, Math.ceil(prevH * 0.5));
+            const depth = new Float32Array(w * h);
+            for (let y = 0; y < h; y++) {
+                const y0 = y * 2;
+                const y1 = Math.min(prevH - 1, y0 + 1);
+                for (let x = 0; x < w; x++) {
+                    const x0 = x * 2;
+                    const x1 = Math.min(prevW - 1, x0 + 1);
+                    let d = prev[y0 * prevW + x0];
+                    const d10 = prev[y0 * prevW + x1];
+                    const d01 = prev[y1 * prevW + x0];
+                    const d11 = prev[y1 * prevW + x1];
+                    if (!Number.isFinite(d)) d = 1.0;
+                    d = Math.max(d, Number.isFinite(d10) ? d10 : 1.0);
+                    d = Math.max(d, Number.isFinite(d01) ? d01 : 1.0);
+                    d = Math.max(d, Number.isFinite(d11) ? d11 : 1.0);
+                    depth[y * w + x] = Math.max(0.0, Math.min(1.0, d));
+                }
+            }
+            levels.push({ width: w, height: h, depth });
+            prev = depth;
+            prevW = w;
+            prevH = h;
+        }
+
+        this._hzbLevels = levels;
+        this._hzbBuilt = true;
+        this._lastStats.hzbBuilds += 1;
+        this._lastStats.hzbLevels = levels.length;
+        this._lastStats.lastHzbBuildMs = performance.now() - t0;
+        return true;
+    }
+
+    _decodeDepthToFloat32(out) {
+        if (!out || out.length < this.width * this.height) return false;
+        if (this._readbackMode === 'rgba' && this._depthRGBA) {
+            const src = this._depthRGBA;
+            for (let i = 0, j = 0; i < out.length; i++, j += 4) {
+                const r = src[j] | 0;
+                const g = src[j + 1] | 0;
+                const b = src[j + 2] | 0;
+                out[i] = ((r + (g << 8) + (b << 16)) >>> 0) / 16777215.0;
+            }
+            return true;
+        }
+        if (this._depthF32) {
+            for (let i = 0; i < out.length; i++) {
+                const d = this._depthF32[i];
+                out[i] = Number.isFinite(d) ? Math.max(0.0, Math.min(1.0, d)) : 1.0;
+            }
+            return true;
+        }
+        if (this._depthU32) {
+            for (let i = 0; i < out.length; i++) out[i] = this._depthU32[i] / 65535.0;
+            return true;
+        }
+        return false;
+    }
+
+    _isVisibleSphereHzb({ center, radius, viewProjectionMatrix, viewportWidth, viewportHeight, key = null }) {
+        if (!this.enableSoftwareHzb || !this._hzbBuilt || !this._hzbLevels.length) return null;
+        const rect = this._projectSphereToOcclusionRect(center, radius, viewProjectionMatrix, viewportWidth, viewportHeight);
+        if (!rect) return null;
+
+        this._lastStats.hzbTests += 1;
+        const levelIndex = this._chooseHzbLevel(rect);
+        const maxDepth = this._maxHzbDepthInRect(rect, levelIndex);
+        if (!(maxDepth >= 0 && maxDepth <= 1)) return null;
+
+        const occluded = maxDepth <= (rect.nearDepth - this.depthEps);
+        if (!occluded) {
+            this._markVisibleKey(key);
+            return true;
+        }
+
+        if (this._shouldKeepVisibleTemporally(key)) return true;
+        this._lastStats.hzbCulled += 1;
+        return false;
+    }
+
+    _projectSphereToOcclusionRect(center, radius, viewProjectionMatrix, viewportWidth, viewportHeight) {
+        const cx = Number(center?.[0]);
+        const cy = Number(center?.[1]);
+        const cz = Number(center?.[2]);
+        const r = Number(radius);
+        if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(cz) || !Number.isFinite(r) || r <= 0) return null;
+
+        const samples = [
+            [0, 0, 0],
+            [ r, 0, 0],
+            [-r, 0, 0],
+            [0,  r, 0],
+            [0, -r, 0],
+            [0, 0,  r],
+            [0, 0, -r],
+        ];
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        let nearDepth = Infinity;
+
+        for (const s of samples) {
+            const ok = this._projectToNdc(viewProjectionMatrix, cx + s[0], cy + s[1], cz + s[2], this._tmpV4);
+            if (!ok) return null;
+            const ndcX = this._tmpV4[0];
+            const ndcY = this._tmpV4[1];
+            const ndcZ = this._tmpV4[2];
+            if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) return null;
+            minX = Math.min(minX, ndcX);
+            minY = Math.min(minY, ndcY);
+            maxX = Math.max(maxX, ndcX);
+            maxY = Math.max(maxY, ndcY);
+            nearDepth = Math.min(nearDepth, ndcZ * 0.5 + 0.5);
+        }
+
+        if (!Number.isFinite(minX) || !Number.isFinite(nearDepth)) return null;
+        const screenW = Math.max(0, (maxX - minX) * 0.5 * viewportWidth);
+        const screenH = Math.max(0, (maxY - minY) * 0.5 * viewportHeight);
+        if (Math.max(screenW, screenH) < this.hzbMinScreenPixels) return null;
+
+        const x0 = Math.max(0, Math.min(this.width - 1, Math.floor((minX * 0.5 + 0.5) * this.width)));
+        const x1 = Math.max(0, Math.min(this.width - 1, Math.floor((maxX * 0.5 + 0.5) * this.width)));
+        const y0 = Math.max(0, Math.min(this.height - 1, Math.floor((minY * 0.5 + 0.5) * this.height)));
+        const y1 = Math.max(0, Math.min(this.height - 1, Math.floor((maxY * 0.5 + 0.5) * this.height)));
+        if (x1 < x0 || y1 < y0) return null;
+
+        return {
+            x0,
+            y0,
+            x1,
+            y1,
+            w: x1 - x0 + 1,
+            h: y1 - y0 + 1,
+            nearDepth: Math.max(0.0, Math.min(1.0, nearDepth - this.depthEps * 2.0)),
+        };
+    }
+
+    _chooseHzbLevel(rect) {
+        const maxDim = Math.max(1, Number(rect?.w) || 1, Number(rect?.h) || 1);
+        const level = Math.floor(Math.log2(maxDim));
+        return Math.max(0, Math.min(this._hzbLevels.length - 1, level));
+    }
+
+    _maxHzbDepthInRect(rect, levelIndex) {
+        const level = this._hzbLevels[levelIndex | 0];
+        if (!level || !level.depth || !(level.width > 0) || !(level.height > 0)) return NaN;
+        const sx = level.width / this.width;
+        const sy = level.height / this.height;
+        const x0 = Math.max(0, Math.min(level.width - 1, Math.floor(rect.x0 * sx)));
+        const x1 = Math.max(0, Math.min(level.width - 1, Math.floor(rect.x1 * sx)));
+        const y0 = Math.max(0, Math.min(level.height - 1, Math.floor(rect.y0 * sy)));
+        const y1 = Math.max(0, Math.min(level.height - 1, Math.floor(rect.y1 * sy)));
+        let maxDepth = -Infinity;
+        let samples = 0;
+        for (let y = y0; y <= y1; y++) {
+            const row = y * level.width;
+            for (let x = x0; x <= x1; x++) {
+                const d = level.depth[row + x];
+                if (!Number.isFinite(d)) return NaN;
+                if (d > maxDepth) maxDepth = d;
+                samples++;
+            }
+        }
+        return samples > 0 ? maxDepth : NaN;
+    }
+
+    _markVisibleKey(key) {
+        if (!key) return;
+        this._temporalVisibility.set(String(key), this._temporalFrame);
+    }
+
+    _shouldKeepVisibleTemporally(key) {
+        if (!key || !(this.temporalKeepFrames > 0)) return false;
+        const last = this._temporalVisibility.get(String(key));
+        if (!Number.isFinite(last)) return false;
+        if ((this._temporalFrame - last) <= this.temporalKeepFrames) {
+            this._lastStats.temporalKeeps += 1;
+            return true;
+        }
+        return false;
+    }
+
+    _pruneTemporalVisibility() {
+        if (!this._temporalVisibility.size) return;
+        const maxAge = Math.max(16, this.temporalKeepFrames + 60);
+        for (const [key, frame] of this._temporalVisibility.entries()) {
+            if ((this._temporalFrame - frame) > maxAge) this._temporalVisibility.delete(key);
+        }
     }
 
     _projectToNdc(m, x, y, z, outV4) {
@@ -603,6 +868,9 @@ export class OcclusionCuller {
         this._depthF32 = null;
         this._depthRGBA = null;
         this._useFloatReadback = false;
+        this._hzbLevels = [];
+        this._hzbBuilt = false;
+        this._lastStats.hzbLevels = 0;
         this._lastStats.lastReadbackOk = false;
         // Preserve _readbackMode across resizes/recreates; it is updated on success/failure paths.
         this._readbackSupported = true;

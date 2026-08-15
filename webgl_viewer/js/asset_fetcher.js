@@ -11,7 +11,10 @@
 
 // Bump this whenever we change asset generation or want to invalidate stale cached assets.
 // This fixes issues like "terrain_info.json still shows num_textures=0" after re-export.
-const CACHE_NAME = 'webglgta-assets-v3';
+// v5 invalidates heightmap assets exported before the row-order and coverage-mask fix.
+// v8 invalidates corrupt/zero texture responses replaced during the source restore.
+// Cache Storage is origin-scoped, so an older local port can otherwise keep rendering a stale raster.
+const CACHE_NAME = 'webglgta-assets-v9';
 const DEFAULT_CONCURRENCY = 24;
 const DEFAULT_HIGH_SHARE = 0.7; // reserve ~70% capacity for high-priority work when there is backlog
 
@@ -202,7 +205,13 @@ async function _fetchResponse(url, { usePersistentCache = true, priority = 'high
     // Match fetch() AbortError shape as closely as possible.
     throw new DOMException('Aborted', 'AbortError');
   }
-  const resp = await _scheduleWithPriority(() => fetch(u, signal ? { signal } : undefined), priority);
+  const fetchOptions = {};
+  if (signal) fetchOptions.signal = signal;
+  // When callers opt out of persistent CacheStorage, also bypass the browser's
+  // HTTP cache. This matters for regenerated local demo bundles: JSON metadata
+  // can be fresh while an older binary tile is still served from the browser.
+  if (!usePersistentCache) fetchOptions.cache = 'no-store';
+  const resp = await _scheduleWithPriority(() => fetch(u, fetchOptions), priority);
   if (!resp.ok) return resp;
 
   if (cache) {

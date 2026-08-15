@@ -60,6 +60,10 @@ export class TextureStreamer {
         // url -> { untilMs: number, count: number }
         this._missing404 = new Map();
         this._missing404TtlMs = 10 * 60 * 1000; // 10 minutes
+        // Some exporter gaps create real image files filled with placeholder tint
+        // colors. Treat those as unavailable so they cannot recolor assets.
+        this._rejectedTextures = new Map(); // url -> { untilMs: number, reason: string, count: number }
+        this._rejectedTextureTtlMs = 10 * 60 * 1000;
 
         // Distance -> tier thresholds (viewer-space units; tune as needed).
         // dist <= highDist => high, dist <= mediumDist => medium, else low.
@@ -105,6 +109,19 @@ export class TextureStreamer {
         return true;
     }
 
+    isRejected(url) {
+        const u = String(url || '');
+        if (!u) return false;
+        const info = this._rejectedTextures.get(u);
+        if (!info) return false;
+        const now = this._nowMs();
+        if (now >= (info.untilMs || 0)) {
+            try { this._rejectedTextures.delete(u); } catch { /* ignore */ }
+            return false;
+        }
+        return true;
+    }
+
     _markMissing404(url) {
         const u = String(url || '');
         if (!u) return;
@@ -112,6 +129,15 @@ export class TextureStreamer {
         const prev = this._missing404.get(u);
         const count = (prev?.count || 0) + 1;
         this._missing404.set(u, { untilMs: now + this._missing404TtlMs, count });
+    }
+
+    _markRejectedTexture(url, reason = 'rejected') {
+        const u = String(url || '');
+        if (!u) return;
+        const now = this._nowMs();
+        const prev = this._rejectedTextures.get(u);
+        const count = (prev?.count || 0) + 1;
+        this._rejectedTextures.set(u, { untilMs: now + this._rejectedTextureTtlMs, reason: String(reason || 'rejected'), count });
     }
 
     setQuality(q) {
@@ -166,17 +192,47 @@ export class TextureStreamer {
     endFrame() {
         this._lastFrameRequestCount = this._frameRequests.size;
         // Start a bounded number of new loads from this frame's request set.
-        // Prefer: high priority, then nearest distance, then stable URL order.
+        // Prefer: high priority, primary base-color maps, then nearest distance.
+        // A city material may request diffuse, normal, specular, detail, and masks
+        // together. Loading those alphabetically made nearby geometry look flat while
+        // nonessential maps occupied the bounded loader queue.
         try {
+            const kindRank = (kind) => {
+                switch (String(kind || 'diffuse').toLowerCase()) {
+                    case 'diffuse': return 0;
+                    case 'foliagediffuse': return 0;
+                    case 'diffuse2': return 1;
+                    case 'tintpalette': return 2;
+                    case 'alphamask': return 3;
+                    case 'normal': return 4;
+                    case 'spec': return 5;
+                    case 'detail':
+                    case 'ao':
+                    case 'height': return 6;
+                    default: return 7;
+                }
+            };
             const want = Array.from(this._frameRequests.entries())
                 .map(([key, r]) => ({ key, ...r }))
                 .sort((a, b) => {
                     const ap = (a.priority === 'high') ? 0 : 1;
                     const bp = (b.priority === 'high') ? 0 : 1;
                     if (ap !== bp) return ap - bp;
+                    const ak = kindRank(a.kind);
+                    const bk = kindRank(b.kind);
+                    if (ak !== bk) return ak - bk;
                     const ad = Number(a.distance ?? 0);
                     const bd = Number(b.distance ?? 0);
                     if (ad !== bd) return ad - bd;
+                    const tierRank = (tier) => {
+                        const t = String(tier || 'high').toLowerCase();
+                        if (t === 'low') return 0;
+                        if (t === 'medium') return 1;
+                        return 2;
+                    };
+                    const at = tierRank(a.tier);
+                    const bt = tierRank(b.tier);
+                    if (at !== bt) return at - bt;
                     return String(a.baseUrl || '').localeCompare(String(b.baseUrl || ''));
                 });
 
@@ -187,6 +243,7 @@ export class TextureStreamer {
                 const baseUrl = String(r.baseUrl || '');
                 if (!baseUrl) continue;
                 if (this.isMissing(baseUrl)) continue;
+                if (this.isRejected(baseUrl)) continue;
 
                 const kind = r.kind || 'diffuse';
                 const tier = r.tier || 'high';
@@ -249,9 +306,74 @@ export class TextureStreamer {
         return tex;
     }
 
+    _imageToRgbaPixels(img) {
+        const w = Math.max(1, Number(img?.width) || 0);
+        const h = Math.max(1, Number(img?.height) || 0);
+        let canvas = null;
+        if (typeof OffscreenCanvas !== 'undefined') {
+            canvas = new OffscreenCanvas(w, h);
+        } else if (typeof document !== 'undefined' && document.createElement) {
+            canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+        }
+        const ctx = canvas?.getContext?.('2d', { willReadFrequently: true });
+        if (!ctx) return null;
+        ctx.clearRect?.(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        const imageData = ctx.getImageData(0, 0, w, h);
+        const data = imageData?.data;
+        if (!data || data.length < w * h * 4) return null;
+
+        // Alpha-cut foliage must remain straight-alpha cutout data. Normalize tiny
+        // browser-resize fringes to transparent so leaf cards cannot become soft blobs.
+        for (let i = 3; i < data.length; i += 4) {
+            if (data[i] < 8) data[i] = 0;
+        }
+        return { width: w, height: h, data };
+    }
+
     _isPowerOfTwo(n) {
         const v = n | 0;
         return v > 0 && (v & (v - 1)) === 0;
+    }
+
+    _looksLikePlaceholderTintPaletteImage(img) {
+        try {
+            const iw = Math.max(0, Number(img?.width) || 0);
+            const ih = Math.max(0, Number(img?.height) || 0);
+            if (iw < 16 || ih < 1) return false;
+            const w = Math.min(256, iw);
+            const h = Math.min(16, ih);
+            let canvas = null;
+            if (typeof OffscreenCanvas !== 'undefined') {
+                canvas = new OffscreenCanvas(w, h);
+            } else if (typeof document !== 'undefined' && document.createElement) {
+                canvas = document.createElement('canvas');
+                canvas.width = w;
+                canvas.height = h;
+            }
+            const ctx = canvas?.getContext?.('2d', { willReadFrequently: true });
+            if (!ctx) return false;
+            ctx.clearRect?.(0, 0, w, h);
+            ctx.drawImage(img, 0, 0, w, h);
+            const data = ctx.getImageData(0, 0, w, h)?.data;
+            if (!data || data.length < 4) return false;
+            let count = 0;
+            let placeholderMagenta = 0;
+            for (let i = 0; i < data.length; i += 4) {
+                const r = data[i] | 0;
+                const g = data[i + 1] | 0;
+                const b = data[i + 2] | 0;
+                const a = data[i + 3] | 0;
+                if (a < 16) continue;
+                count++;
+                if (r >= 248 && b >= 248 && g >= 64 && g <= 180) placeholderMagenta++;
+            }
+            return count >= 32 && (placeholderMagenta / count) >= 0.75;
+        } catch {
+            return false;
+        }
     }
 
     _allowedTierMax() {
@@ -269,6 +391,17 @@ export class TextureStreamer {
         return (t === 'low' || t === 'medium' || t === 'high') ? t : 'high';
     }
 
+    _residentTierOrder(desiredTier) {
+        const desired = this._clampTierToAllowed(desiredTier);
+        const preferred = desired === 'high'
+            ? ['high', 'medium', 'low']
+            : (desired === 'medium' ? ['medium', 'low', 'high'] : ['low', 'medium', 'high']);
+        const maxTier = this._allowedTierMax();
+        return preferred.filter((tier) => (
+            maxTier === 'high' || (maxTier === 'medium' ? tier !== 'high' : tier === 'low')
+        ));
+    }
+
     _tierForDistance(distance, kind = 'diffuse') {
         // Conservative: keep normals/spec a tier lower at the same distance.
         const d0 = Number(distance);
@@ -279,7 +412,7 @@ export class TextureStreamer {
         else tier = 'low';
 
         const k = String(kind || 'diffuse').toLowerCase();
-        if (k === 'normal' || k === 'spec') {
+        if (this.quality !== 'high' && (k === 'normal' || k === 'spec')) {
             if (tier === 'high') tier = 'medium';
             else if (tier === 'medium') tier = 'low';
         }
@@ -299,6 +432,7 @@ export class TextureStreamer {
         // - tint palettes are color lookup textures
         if (
             k === 'diffuse' ||
+            k === 'foliagediffuse' ||
             k === 'diffuse2' ||
             k === 'emissive' ||
             k === 'env' ||
@@ -332,6 +466,12 @@ export class TextureStreamer {
 
         this._srgbSupport = { ok: false, internalFormat: gl.RGBA, format: gl.RGBA };
         return this._srgbSupport;
+    }
+
+    _cachePolicyForKind(kind) {
+        const k = String(kind || 'diffuse').toLowerCase();
+        if (k === 'foliagediffuse') return 'foliage';
+        return 'default';
     }
 
     _drainGlErrors(gl, max = 8) {
@@ -500,7 +640,8 @@ export class TextureStreamer {
         const u = String(baseUrl || '');
         const t = this._clampTierToAllowed(tier);
         const cs = this._colorSpaceForKind(kind);
-        return `${t}|${cs}|${u}`;
+        const policy = this._cachePolicyForKind(kind);
+        return `${t}|${cs}:${policy}|${u}`;
     }
 
     _parseKey(key) {
@@ -592,19 +733,31 @@ export class TextureStreamer {
         }
     }
 
+    clear({ keepMissing = true } = {}) {
+        for (const [, v] of this.cache.entries()) {
+            try { if (v?.tex) this.gl.deleteTexture(v.tex); } catch { /* ignore */ }
+        }
+        this.cache.clear();
+        this.totalBytes = 0;
+        this._frameRequests.clear();
+        this._lastFrameRequestCount = 0;
+        this._lastFrameTouchedCount = 0;
+        if (!keepMissing) {
+            this._missing404.clear();
+            this._rejectedTextures.clear();
+        }
+    }
+
     get(url, { distance = 0, kind = 'diffuse', tier = null } = {}) {
         const baseUrl = String(url || '');
         if (!baseUrl) return null;
         if (this.isMissing(baseUrl)) return null;
+        if (this.isRejected(baseUrl)) return null;
 
         const desired = this._clampTierToAllowed(tier ?? this._tierForDistance(distance, kind));
 
         // Only return textures within the globally-allowed tier cap.
-        const wantOrder = (desired === 'high')
-            ? ['high', 'medium', 'low']
-            : (desired === 'medium')
-                ? ['medium', 'low']
-                : ['low'];
+        const wantOrder = this._residentTierOrder(desired);
 
         for (const t of wantOrder) {
             const k = this._cacheKey(baseUrl, t, kind);
@@ -613,10 +766,8 @@ export class TextureStreamer {
                 e.lastUse = performance.now();
                 return e.tex;
             }
-            if (e?.loading) {
-                // Loading: return null so renderers can disable sampling cleanly.
-                return null;
-            }
+            // If a sharper tier is loading, keep searching lower tiers before falling
+            // back to shader-side base color. Otherwise tier upgrades visibly flicker.
         }
         return null;
     }
@@ -629,12 +780,9 @@ export class TextureStreamer {
         const baseUrl = String(url || '');
         if (!baseUrl) return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
         if (this.isMissing(baseUrl)) return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
+        if (this.isRejected(baseUrl)) return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
         const desired = this._clampTierToAllowed(tier ?? this._tierForDistance(distance, kind));
-        const wantOrder = (desired === 'high')
-            ? ['high', 'medium', 'low']
-            : (desired === 'medium')
-                ? ['medium', 'low']
-                : ['low'];
+        const wantOrder = this._residentTierOrder(desired);
         for (const t of wantOrder) {
             const k = this._cacheKey(baseUrl, t, kind);
             const e = this.cache.get(k);
@@ -642,9 +790,8 @@ export class TextureStreamer {
                 e.lastUse = performance.now();
                 return { tex: e.tex, isPlaceholder: false, uploadedAsSrgb: !!e.uploadedAsSrgb, needsUvFlipY: !!e.needsUvFlipY };
             }
-            if (e?.loading) {
-                return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
-            }
+            // If a sharper tier is loading, keep searching lower tiers before falling
+            // back to shader-side base color. Otherwise tier upgrades visibly flicker.
         }
         return { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
     }
@@ -662,6 +809,7 @@ export class TextureStreamer {
 
         // If we know this URL 404s, don't keep retrying every frame.
         if (this.isMissing(baseUrl)) return;
+        if (this.isRejected(baseUrl)) return;
 
         const desiredTier = this._clampTierToAllowed(tier ?? this._tierForDistance(distance, kind));
         const k = this._cacheKey(baseUrl, desiredTier, kind);
@@ -675,12 +823,40 @@ export class TextureStreamer {
             this._frameRequests.set(k, { baseUrl, tier: desiredTier, distance: dist, priority: pri, kind });
         }
 
-        // Mark the best currently-loaded tier as used so it isn't evicted mid-session.
-        // (If we haven't loaded any tier yet, this does nothing.)
+        // Seed a smaller fallback tier before the sharp request. getWithInfo()
+        // already searches lower tiers, but without this bootstrap a high-tier
+        // miss or eviction falls all the way back to material color.
+        const fallbackTier = desiredTier === 'high' ? 'medium' : (desiredTier === 'medium' ? 'low' : null);
+        if (fallbackTier) {
+            try {
+                const desiredEntry = this.cache.get(k);
+                const fallbackKey = this._cacheKey(baseUrl, fallbackTier, kind);
+                const fallbackEntry = this.cache.get(fallbackKey);
+                if (!desiredEntry?.tex && !fallbackEntry?.tex && !fallbackEntry?.loading) {
+                    const prevFallback = this._frameRequests.get(fallbackKey);
+                    if (!prevFallback || dist < (prevFallback.distance ?? 1e30)) {
+                        this._frameRequests.set(fallbackKey, {
+                            baseUrl,
+                            tier: fallbackTier,
+                            distance: dist,
+                            priority: pri,
+                            kind,
+                            fallbackForTier: desiredTier,
+                        });
+                    }
+                }
+            } catch { /* ignore */ }
+        }
+
+        // Mark resident candidate tiers as used so lower-tier fallbacks survive while
+        // sharper tiers are loading.
         try {
             const now = performance.now();
-            const existing = this.cache.get(k);
-            if (existing) existing.lastUse = now;
+            const wantOrder = this._residentTierOrder(desiredTier);
+            for (const t of wantOrder) {
+                const existing = this.cache.get(this._cacheKey(baseUrl, t, kind));
+                if (existing?.tex) existing.lastUse = now;
+            }
         } catch { /* ignore */ }
 
         // Start load if needed (fire-and-forget; de-duped by cache entry + asset_fetcher inflight).
@@ -694,6 +870,7 @@ export class TextureStreamer {
         if (!baseUrl) return null;
 
         if (this.isMissing(baseUrl)) return null;
+        if (this.isRejected(baseUrl)) return null;
 
         const t = this._clampTierToAllowed(tier ?? this.quality);
         const key = this._cacheKey(baseUrl, t, kind);
@@ -707,6 +884,7 @@ export class TextureStreamer {
 
         this.cache.set(key, { baseUrl, tier: t, tex: null, bytes: 0, lastUse: performance.now(), loading: true, uploadedAsSrgb: false, needsUvFlipY: false });
 
+        let restoreTextureState = null;
         try {
             // LOW priority: textures are important for quality, but should not starve chunk/mesh/meta loads.
             const pr = (priority === 'high') ? 'high' : 'low';
@@ -725,6 +903,20 @@ export class TextureStreamer {
 
             const gl = this.gl;
             this._drainGlErrors(gl, 16);
+            // Uploads finish asynchronously between render frames. Preserve the
+            // renderer's active unit and binding so an upload cannot leak into
+            // an unrelated material before that unit is explicitly rebound.
+            const captureTextureState = () => {
+                if (restoreTextureState) return;
+                try {
+                    const previousActiveTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
+                    const previousTexture2D = gl.getParameter(gl.TEXTURE_BINDING_2D);
+                    restoreTextureState = () => {
+                        gl.activeTexture(previousActiveTexture);
+                        gl.bindTexture(gl.TEXTURE_2D, previousTexture2D);
+                    };
+                } catch { /* ignore */ }
+            };
 
             // Quick sanity check: if the server returned HTML (SPA fallback) or some other non-image,
             // createImageBitmap will throw a vague "invalid format" / decode error.
@@ -790,6 +982,7 @@ export class TextureStreamer {
             // KTX2 path: decode/upload without ImageBitmap.
             if (sniffIsKtx2) {
                 const ab = await blob.arrayBuffer();
+                captureTextureState();
                 const out = this._uploadKtx2(ab, { kind, tier: t });
                 this.totalBytes += out.bytes;
                 // KTX2 path applies UNPACK_FLIP_Y_WEBGL during upload (like PNG).
@@ -801,6 +994,7 @@ export class TextureStreamer {
             // DDS path: upload compressed data without ImageBitmap.
             if (sniffIsDds) {
                 const ab = await blob.arrayBuffer();
+                captureTextureState();
                 const out = uploadDdsToTexture(gl, ab, { kind, tier: t });
                 this.totalBytes += out.bytes;
                 // IMPORTANT: UNPACK_FLIP_Y_WEBGL is not reliably honored for compressedTexImage2D.
@@ -839,17 +1033,20 @@ export class TextureStreamer {
                     }
                 })();
 
-                const qualityScale = (t === 'medium') ? 0.5 : (t === 'low' ? 0.25 : 1.0);
-                let targetW = Math.max(1, Math.floor(full.width * qualityScale));
-                let targetH = Math.max(1, Math.floor(full.height * qualityScale));
-
-                // Clamp to maxSize while preserving aspect ratio.
-                const tooBig = targetW > maxSize || targetH > maxSize;
-                if (tooBig) {
-                    const s = Math.min(maxSize / Math.max(1, targetW), maxSize / Math.max(1, targetH));
-                    targetW = Math.max(1, Math.floor(targetW * s));
-                    targetH = Math.max(1, Math.floor(targetH * s));
-                }
+                const kindLower = String(kind || 'diffuse').toLowerCase();
+                const isTintPalette = kindLower === 'tintpalette';
+                const isFoliageDiffuse = kindLower === 'foliagediffuse';
+                const qualityScale = (isTintPalette || isFoliageDiffuse) ? 1.0 : ((t === 'medium') ? 0.5 : (t === 'low' ? 0.25 : 1.0));
+                // A 4K source is appropriate at 1/4 resolution for low quality, but
+                // unusually large source maps still create costly GPU allocations. Keep
+                // each quality tier bounded so a few outliers cannot evict the nearby city.
+                const tierMaxSize = isTintPalette ? maxSize : ((t === 'low') ? 1024 : (t === 'medium' ? 2048 : maxSize));
+                const targetMaxSize = Math.max(1, Math.min(maxSize, tierMaxSize));
+                const sourceLargest = Math.max(1, Number(full.width) || 1, Number(full.height) || 1);
+                const sizeScale = Math.min(1.0, targetMaxSize / sourceLargest);
+                const finalScale = Math.min(qualityScale, sizeScale);
+                let targetW = Math.max(1, Math.floor(full.width * finalScale));
+                let targetH = Math.max(1, Math.floor(full.height * finalScale));
 
                 if (targetW !== full.width || targetH !== full.height) {
                     try {
@@ -891,6 +1088,15 @@ export class TextureStreamer {
                 });
             }
 
+            if (String(kind || '').toLowerCase() === 'tintpalette' && this._looksLikePlaceholderTintPaletteImage(img)) {
+                this._markRejectedTexture(baseUrl, 'placeholder tint palette');
+                this.cache.delete(key);
+                try { if (img && img !== full) img.close?.(); } catch { /* ignore */ }
+                try { full?.close?.(); } catch { /* ignore */ }
+                return null;
+            }
+
+            captureTextureState();
             const tex = gl.createTexture();
             gl.bindTexture(gl.TEXTURE_2D, tex);
 
@@ -935,21 +1141,31 @@ export class TextureStreamer {
                     return false;
                 }
             })();
+            const kindLower = String(kind || 'diffuse').toLowerCase();
+            const isTintPalette = kindLower === 'tintpalette';
+            const isFoliageDiffuse = kindLower === 'foliagediffuse';
             const isPot = this._isPowerOfTwo(img.width) && this._isPowerOfTwo(img.height);
             const canMips = isWebGL2 || isPot;
             const canRepeat = isWebGL2 || isPot;
-            const useMips = (t !== 'low') && canMips;
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, useMips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, canRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, canRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+            const useMips = !isTintPalette && !isFoliageDiffuse && (t !== 'low') && canMips;
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, isTintPalette ? gl.NEAREST : (useMips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR));
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, isTintPalette ? gl.NEAREST : gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, isTintPalette ? gl.CLAMP_TO_EDGE : (canRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE));
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, isTintPalette ? gl.CLAMP_TO_EDGE : (canRepeat ? gl.REPEAT : gl.CLAMP_TO_EDGE));
 
             // Upload: choose sRGB internalFormat for color textures when supported.
             const cs = this._colorSpaceForKind(kind);
             const srgb = this._getSrgbSupport();
             const internalFormat = (cs === 'srgb' && srgb.ok) ? srgb.internalFormat : gl.RGBA;
             const format = (cs === 'srgb' && srgb.ok) ? srgb.format : gl.RGBA;
-            gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, format, gl.UNSIGNED_BYTE, img);
+            const foliagePixels = isFoliageDiffuse ? this._imageToRgbaPixels(img) : null;
+            const imageWidth = Math.max(1, Number(foliagePixels?.width ?? img?.width) || 0);
+            const imageHeight = Math.max(1, Number(foliagePixels?.height ?? img?.height) || 0);
+            if (foliagePixels?.data) {
+                gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, imageWidth, imageHeight, 0, format, gl.UNSIGNED_BYTE, foliagePixels.data);
+            } else {
+                gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, format, gl.UNSIGNED_BYTE, img);
+            }
             try {
                 gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, prevFlip);
             } catch {
@@ -985,8 +1201,6 @@ export class TextureStreamer {
             }
             // If upload failed, don't leave an incomplete texture bound (can sample black).
             try {
-                // Drain again so we don't attribute earlier unrelated errors to this upload.
-                this._drainGlErrors(gl, 16);
                 const e0 = gl.getError();
                 if (e0 && e0 !== gl.NO_ERROR) throw new Error(`gl error ${e0} after tex upload`);
             } catch (e) {
@@ -1001,7 +1215,7 @@ export class TextureStreamer {
             // Approximate GPU memory:
             // - base level: w*h*4
             // - mip chain adds ~33% on average for POT textures
-            const baseBytes = img.width * img.height * 4;
+            const baseBytes = imageWidth * imageHeight * 4;
             const bytes = Math.floor(baseBytes * (useMips ? (4.0 / 3.0) : 1.0));
             this.totalBytes += bytes;
             // Browser-image uploads can request sRGB internalFormat when supported (see internalFormat selection above).
@@ -1015,11 +1229,18 @@ export class TextureStreamer {
             // If this is a 404, mark it missing so we can stop spamming and allow renderers
             // to try alternate candidate URLs (hash-only vs hash+slug, etc).
             let status = null;
+            let message = '';
             try {
-                const msg = String(e?.message || e || '');
-                const m = msg.match(/status=(\d+)/i);
+                message = String(e?.message || e || '');
+                const m = message.match(/status=(\d+)/i);
                 status = m ? Number(m[1]) : null;
                 if (status === 404) this._markMissing404(baseUrl);
+                if (
+                    message.includes('Texture blob is not a supported image')
+                    || message.includes('Image decode failed')
+                ) {
+                    this._markRejectedTexture(baseUrl, 'invalid image data');
+                }
             } catch { /* ignore */ }
 
             // Always record for debugging, even if we suppress console warnings.
@@ -1066,6 +1287,8 @@ export class TextureStreamer {
             } catch { /* ignore */ }
             this.cache.delete(key);
             return null;
+        } finally {
+            try { restoreTextureState?.(); } catch { /* ignore */ }
         }
     }
 
@@ -1084,6 +1307,19 @@ export class TextureStreamer {
                 if (info && now < (info.untilMs || 0)) missing404++;
             }
         } catch { /* ignore */ }
+        let rejected = 0;
+        try {
+            const now = this._nowMs();
+            for (const info of this._rejectedTextures.values()) {
+                if (info && now < (info.untilMs || 0)) rejected++;
+            }
+        } catch { /* ignore */ }
+        const bytePressure = (Number.isFinite(this.maxBytes) && this.maxBytes > 0)
+            ? (this.totalBytes / this.maxBytes)
+            : 0;
+        const texturePressure = (Number.isFinite(this.maxTextures) && this.maxTextures > 0)
+            ? (loaded / this.maxTextures)
+            : 0;
         return {
             // `textures` is how many GPU textures are actually resident (loaded).
             // Keep `cacheEntries` as a separate field so we can see if we’re accumulating too many
@@ -1097,6 +1333,12 @@ export class TextureStreamer {
             bytes: this.totalBytes,
             maxTextures: this.maxTextures,
             maxBytes: this.maxBytes,
+            pressure: {
+                byteRatio: Math.round(bytePressure * 1000) / 1000,
+                textureRatio: Math.round(texturePressure * 1000) / 1000,
+                nearByteCap: bytePressure >= 0.92,
+                nearTextureCap: texturePressure >= 0.92,
+            },
             evictions: this._evictionCount,
             lastEvictedUrl: this._lastEvictedUrl,
             lastEvictedTier: this._lastEvictedTier,
@@ -1107,6 +1349,7 @@ export class TextureStreamer {
             qualityCap: this._allowedTierMax(),
             tierConfig: { highDist: this.highDist, mediumDist: this.mediumDist, minResidentMs: this.minResidentMs },
             missing404,
+            rejected,
             recentErrors: (() => {
                 try { return (this._recentErrors || []).slice(Math.max(0, (this._recentErrors || []).length - 10)); } catch { return []; }
             })(),

@@ -28,6 +28,7 @@ def _read_u32le(b: bytes, off: int) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
+    ap.add_argument("--max-bins", type=int, default=0, help="Limit number of mesh bins scanned (0 = all)")
     ap.add_argument("--max-shards", type=int, default=0, help="Limit number of shard files scanned (0 = all)")
     ap.add_argument("--max-missing", type=int, default=50, help="Max missing texture paths to print")
     args = ap.parse_args()
@@ -39,6 +40,8 @@ def main() -> None:
 
     # 1) Bin scan (cheap header reads)
     bins = list(models_dir.glob("*.bin"))
+    if args.max_bins and int(args.max_bins) > 0:
+        bins = bins[: int(args.max_bins)]
     v4 = 0
     v4_tan = 0
     bad = 0

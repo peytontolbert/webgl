@@ -1,6 +1,8 @@
 __pycache__/
 .env
 output/
+tools/out/
+webgl_viewer/tools/out/
 CodeWalker-master/
 compiled_cw/
 webgl_viewer/assets/

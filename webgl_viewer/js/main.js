@@ -11,14 +11,152 @@ import { DrawableStreamer } from './drawable_streamer.js';
 import { TextureStreamer } from './texture_streamer.js';
 import { SkyRenderer } from './sky_renderer.js';
 import { joaat } from './joaat.js';
-import { clearAssetCacheStorage, clearAssetMemoryCaches, fetchJSON, setAssetFetchConcurrency, supportsAssetCacheStorage } from './asset_fetcher.js';
+import { clearAssetCacheStorage, clearAssetMemoryCaches, fetchJSON, setAssetFetchConcurrency, setAssetFetchPriorityConfig, supportsAssetCacheStorage } from './asset_fetcher.js';
 import { OcclusionCuller } from './occlusion.js';
 import { FileBlobReader } from './vfs/readers.js';
 import { RpfArchive } from './rpf/rpf_archive.js';
 import { PostFxRenderer } from './postfx_renderer.js';
+import { SpawnSystem } from './gameplay/spawn_system.js';
+import { CollisionWorld } from './gameplay/collision_world.js';
+import { PlayerController } from './gameplay/player_controller.js';
+import { WeaponController } from './gameplay/weapon_controller.js';
+import { InventoryOverlay } from './gameplay/inventory_overlay.js';
+import { InteractionSystem } from './gameplay/interactions.js';
+import { VehicleController } from './gameplay/vehicle_controller.js';
+import { GameplayPersistence } from './gameplay/persistence.js';
+import { WeaponRenderer } from './weapon_renderer.js';
+import { DemoBoundaryRenderer } from './demo_boundary_renderer.js';
+import { NpcSystem } from './gameplay/npc_system.js';
+import { MeleeController } from './gameplay/melee_controller.js';
+import { MultiplayerClient } from './gameplay/multiplayer_client.js';
+import { GameAudioSystem } from './gameplay/audio_system.js';
+import { GtaHud } from './gameplay/gta_hud.js';
+import { getWebGpuCullingAvailability } from './webgpu_culler.js';
 
 const _LS_SETTINGS_KEY = 'webglgta.viewer.settings.v1';
 const _LS_VIEW_KEY = 'webglgta.viewer.view.v1';
+const _SETTINGS_VERSION = 23;
+const DEFAULT_CHARACTER_MODEL_NAME = 'a_m_y_skater_01';
+const FREEMODE_CHARACTER_MODELS = Object.freeze({
+    male: Object.freeze({
+        modelName: 'mp_m_freemode_01', modelHash: 1885233650,
+        skeleton: 'peds/1885233650_skeleton.json', animations: 'peds/1885233650_animations.json',
+    }),
+    female: Object.freeze({
+        modelName: 'mp_f_freemode_01', modelHash: 2627665880,
+        skeleton: 'peds/2627665880_skeleton.json', animations: 'peds/2627665880_animations.json',
+    }),
+});
+const SPAWN_DISTRICT_DEMO = Object.freeze({
+    centerX: 186.94,
+    centerY: -850.84,
+    size: 150.0,
+});
+// Gameplay stores yaw 0 as data-space +X. The exported freemode drawable is
+// authored facing local -Y, so only its render transform needs this alignment.
+const PLAYER_DRAWABLE_FORWARD_OFFSET_RAD = Math.PI * 0.5;
+// The source Glock mesh is in GTA weapon space (+X barrel, +Z sight/up). The
+// freemode hand basis is not the same as its finger axis during pistol ADS.
+// This mount is calibrated from the sampled `aim_med_static` pose: at heading
+// zero the barrel is +X in data space and its sights are +Z/up.
+const GLOCK_RIGHT_HAND_ATTACHMENT_TRANSFORM = new Float32Array([
+    -0.0500102, 0.9983134, -0.0294840, 0.0,
+    -0.0733373, 0.0257707, 0.9969742, 0.0,
+    0.9960525, 0.0520212, 0.0719248, 0.0,
+    0.0527, 0.0448, 0.0027, 1.0,
+]);
+const GLOCK_ADS_MAX_BARREL_CORRECTION_RAD = 0.34;
+const GTA_HAIR_COLORS = Object.freeze([
+    [29, 8, 0], [41, 13, 4], [57, 24, 16], [80, 35, 24], [105, 50, 35], [127, 63, 44], [155, 83, 57], [180, 103, 76],
+    [202, 128, 93], [220, 155, 118], [230, 184, 151], [243, 210, 181], [89, 47, 20], [119, 69, 32], [154, 104, 55], [190, 145, 86],
+    [226, 192, 133], [238, 218, 180], [18, 18, 18], [35, 35, 35], [55, 55, 55], [85, 85, 85], [125, 125, 125], [170, 170, 170],
+    [205, 205, 205], [235, 235, 235], [92, 28, 31], [122, 35, 39], [160, 48, 51], [196, 66, 68], [222, 100, 102], [238, 145, 146],
+    [74, 20, 92], [104, 31, 128], [139, 49, 164], [170, 76, 194], [35, 45, 109], [44, 67, 150], [56, 94, 188], [78, 128, 216],
+    [17, 88, 71], [25, 122, 94], [39, 158, 117], [67, 192, 143], [89, 91, 20], [128, 128, 29], [168, 165, 42], [202, 198, 71],
+    [129, 55, 18], [166, 75, 24], [202, 101, 35], [229, 135, 57], [106, 32, 66], [142, 44, 89], [180, 63, 115], [214, 91, 145],
+    [14, 14, 14], [44, 28, 20], [83, 54, 38], [126, 88, 60], [174, 129, 90], [213, 174, 127], [232, 207, 167], [250, 238, 212],
+]);
+
+function hairColorLinear(index) {
+    const rgb = GTA_HAIR_COLORS[Math.max(0, Math.min(GTA_HAIR_COLORS.length - 1, Number(index) | 0))] || GTA_HAIR_COLORS[0];
+    return rgb.map((value) => Math.pow(value / 255, 2.2));
+}
+
+function isSpawnDistrictDemoRoute() {
+    const pathname = String(window?.location?.pathname || '/').replace(/\/+$/, '') || '/';
+    return pathname === '/demo';
+}
+
+function isAssetPickDiagnosticEnabled() {
+    if (!isSpawnDistrictDemoRoute()) return false;
+    try { return new URLSearchParams(window.location.search).get('assetPick') === '1'; } catch { return false; }
+}
+
+const PERF_PROFILES = {
+    gameplay: {
+        streamRadius: 1,
+        maxLoadedChunks: 9,
+        maxArchetypes: 96,
+        maxModelDistance: 320,
+        maxVisibleInstances: 12000,
+        maxInstancesPerArchetype: 128,
+        maxMeshLoadsInFlight: 3,
+        meshMaxBytes: 128 * 1024 * 1024,
+        texMaxBytes: 64 * 1024 * 1024,
+        texMaxTextures: 256,
+        assetConcurrency: 6,
+        texLoadsInFlight: 4,
+        texNewLoadsPerFrame: 8,
+        textureQuality: 'medium',
+        lodLevel: '2',
+        showModels: true,
+        wireframe: true,
+        cacheStreamedChunks: false,
+    },
+    city: {
+        streamRadius: 3,
+        maxLoadedChunks: 49,
+        maxArchetypes: 360,
+        maxModelDistance: 800,
+        maxVisibleInstances: 60000,
+        maxInstancesPerArchetype: 640,
+        maxMeshLoadsInFlight: 6,
+        meshMaxBytes: 1024 * 1024 * 1024,
+        texMaxBytes: 384 * 1024 * 1024,
+        texMaxTextures: 1536,
+        assetConcurrency: 12,
+        texLoadsInFlight: 12,
+        texNewLoadsPerFrame: 24,
+        textureQuality: 'medium',
+        lodLevel: '1',
+        showModels: true,
+        wireframe: false,
+        cacheStreamedChunks: false,
+    },
+    high: {
+        streamRadius: 6,
+        maxLoadedChunks: 169,
+        maxArchetypes: 1200,
+        maxModelDistance: 1600,
+        maxVisibleInstances: 180000,
+        maxInstancesPerArchetype: 2048,
+        maxMeshLoadsInFlight: 12,
+        meshMaxBytes: 2 * 1024 * 1024 * 1024,
+        texMaxBytes: 1024 * 1024 * 1024,
+        texMaxTextures: 4096,
+        assetConcurrency: 20,
+        texLoadsInFlight: 24,
+        texNewLoadsPerFrame: 48,
+        textureQuality: 'high',
+        lodLevel: '0',
+        showModels: true,
+        wireframe: false,
+        cacheStreamedChunks: false,
+    },
+};
+const SPAWN_DEMO_TEXTURE_QUALITY = 'medium';
+const SPAWN_DEMO_MODEL_LOD = 'med';
+const SPAWN_DEMO_LOD_LEVEL = '1';
 
 class GpuTimer {
     constructor(gl) {
@@ -226,6 +364,7 @@ export class App {
         // UI can enable it later; renderer treats falsy as disabled.
         this.enableShadows = false;
         this.shadowMapSize = 2048;
+        this.debugFrameGlErrors = false;
 
         // Streaming can trigger hundreds of loads; keep fetch concurrency bounded to avoid resource exhaustion.
         // (Cache hits bypass the limiter.)
@@ -266,9 +405,9 @@ export class App {
         // Initialize terrain renderer
         this.terrainRenderer = new TerrainRenderer(this.gl);
         console.log('Terrain renderer initialized');
-        // Models-only default: users who exported real drawables + textures generally want to see the actual world props,
-        // not a proxy terrain mesh.
-        this.showTerrain = true;
+        // The heightfield is a coarse terrain/collision proxy. Streamed GTA drawables own the city surface,
+        // so do not place the proxy over world geometry by default.
+        this.showTerrain = false;
 
         // Initialize entity streaming (client-like)
         this.entityRenderer = new EntityRenderer(this.gl);
@@ -277,7 +416,10 @@ export class App {
 
         // Buildings (city geometry)
         this.buildingRenderer = new BuildingRenderer(this.gl);
-        this.showBuildings = true;
+        this.demoBoundaryRenderer = new DemoBoundaryRenderer(this.gl);
+        // The OBJ city shell is a coarse fallback. Keep it off while streamed
+        // GTA drawables are active so coincident geometry cannot fight for depth.
+        this.showBuildings = false;
         this.showWater = true;
 
         // Entity dots (always-available point rendering)
@@ -287,9 +429,8 @@ export class App {
 
         // Real GTA drawables (exported offline into assets/models/*)
         // Cache sizing heuristic:
-        // - Browsers vary wildly in how much GPU memory they can actually allocate for WebGL buffers/textures.
-        // - `navigator.deviceMemory` (GB) is a coarse signal, but good enough to avoid picking absurd defaults
-        //   for low-memory devices while still allowing large GTA-scale caches on desktops.
+        // - Browsers can hit WebGL allocation limits far below system RAM.
+        // - Default to a bounded gameplay profile; larger city/high-detail profiles are explicit opt-ins.
         const devMemGb = (() => {
             try {
                 const v = Number((typeof navigator !== 'undefined') ? navigator.deviceMemory : NaN);
@@ -297,52 +438,83 @@ export class App {
             } catch { return null; }
         })();
         const cacheCaps = (() => {
-            // Defaults assume desktop-class hardware.
-            let meshGb = 4;
-            let texGb = 1.5;
-            let maxTextures = 4096;
-            if (devMemGb !== null) {
-                if (devMemGb <= 4) {
-                    meshGb = 1;
-                    texGb = 0.5;
-                    maxTextures = 1024;
-                } else if (devMemGb <= 8) {
-                    meshGb = 2;
-                    texGb = 1.0;
-                    maxTextures = 2048;
-                } else if (devMemGb >= 16) {
-                    meshGb = 6;      // big desktop/workstation
-                    texGb = 2.0;
-                    maxTextures = 8192;
-                }
+            const caps = { ...PERF_PROFILES.gameplay };
+            if (devMemGb !== null && devMemGb <= 4) {
+                caps.meshMaxBytes = 96 * 1024 * 1024;
+                caps.texMaxBytes = 48 * 1024 * 1024;
+                caps.texMaxTextures = 192;
+                caps.assetConcurrency = 5;
+                caps.texLoadsInFlight = 3;
+                caps.texNewLoadsPerFrame = 6;
+                caps.maxLoadedChunks = 36;
+                caps.maxArchetypes = 220;
             }
             return {
                 deviceMemoryGb: devMemGb,
-                meshMaxBytes: Math.floor(meshGb * 1024 * 1024 * 1024),
-                texMaxBytes: Math.floor(texGb * 1024 * 1024 * 1024),
-                texMaxTextures: maxTextures,
+                ...caps,
             };
         })();
+        this._activePerformanceProfile = 'gameplay';
+        this._defaultRuntimeCaps = cacheCaps;
+        try { setAssetFetchConcurrency(cacheCaps.assetConcurrency); } catch { /* ignore */ }
+        try { setAssetFetchPriorityConfig({ highShare: 0.82 }); } catch { /* ignore */ }
 
         this.modelManager = new ModelManager(this.gl);
+        this.modelManager.retainCpuPickData = isAssetPickDiagnosticEnabled();
         // Default: strict mode (missing exports simply don't appear).
         // You can toggle placeholders on in the UI to visualize missing exports.
         this.modelManager.enablePlaceholderMeshes = false;
         // Mesh cache caps (GPU buffer residency).
-        // The base game has a huge number of unique mesh bins; low budgets churn constantly when streaming.
-        // If your GPU/driver can't handle this much residency, lower it via DevTools:
-        //   __viewerApp.modelManager.setMeshCacheCaps({ maxBytes: ... })
         try { this.modelManager.setMeshCacheCaps?.({ maxBytes: cacheCaps.meshMaxBytes }); } catch { /* ignore */ }
-        // Default texture cache caps:
-        // We keep these reasonably high to avoid visible texture eviction/thrash when many unique
-        // materials are in view (city blocks, highways, vegetation).
-        //
-        // NOTE: eviction is now based on *loaded* textures, not in-flight entries, so larger scenes
-        // won't immediately churn even when many loads are pending.
         this.textureStreamer = new TextureStreamer(this.gl, { maxTextures: cacheCaps.texMaxTextures, maxBytes: cacheCaps.texMaxBytes });
-        // Limit how many new texture loads we start each frame (prevents huge stalls/thrash in dense scenes).
-        try { this.textureStreamer.setStreamingConfig({ maxLoadsInFlight: 32, maxNewLoadsPerFrame: 64 }); } catch { /* ignore */ }
+        try {
+            this.textureStreamer.setStreamingConfig({
+                maxLoadsInFlight: cacheCaps.texLoadsInFlight,
+                maxNewLoadsPerFrame: cacheCaps.texNewLoadsPerFrame,
+            });
+        } catch { /* ignore */ }
         this.instancedModelRenderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
+        // Player drawables need an independent shader pass so their render style can differ from the streamed city.
+        // Mesh buffers and texture cache are still shared with the world renderer.
+        this.playerModelRenderer = null;
+        this._playerModelRendererInitPromise = null;
+        this.npcModelRenderer = null;
+        this.npcCombatModelRenderer = null;
+        this.remotePlayerRenderer = null;
+        this._npcModelRendererInitPromise = null;
+        this._remotePlayerRendererInitPromise = null;
+        this._npcActiveMeshKeys = new Set();
+        this._npcCombatActiveMeshKeys = new Set();
+        this._remotePlayerActiveMeshKeys = new Set();
+        this._remotePlayers = [];
+        this._remotePlayerAnimationHashes = [];
+        this._npcCombatAnimationPose = null;
+        this._npcAnimatedNpcs = [];
+        this._npcAnimationHashes = [];
+        this._npcAnimPhase = 0.0;
+        this.showNpcs = true;
+        // Weapons are small, fixed assets. Keep them outside the streamed-world renderer so
+        // drawing one never competes with the archetype and chunk residency budgets.
+        this.weaponModelRenderer = null;
+        this._weaponModelRendererInitPromise = null;
+        this.weaponModelAsset = null;
+        this._weaponModelMat = glMatrix.mat4.create();
+        this._weaponModelMatBuf = new Float32Array(16);
+        this._weaponHandBoneMat = glMatrix.mat4.create();
+        this._weaponHandDataMat = glMatrix.mat4.create();
+        this._weaponGripDataMat = glMatrix.mat4.create();
+        this._weaponAdsCorrectionMat = glMatrix.mat4.create();
+        this._weaponAdsRotationMat = glMatrix.mat4.create();
+        this._weaponAdsCorrectionQuat = glMatrix.quat.create();
+        this._weaponAdsIdentityQuat = glMatrix.quat.create();
+        this._weaponModelActiveKey = null;
+        this._weaponModelMeshReady = false;
+        this.vehicleModelRenderer = null;
+        this._vehicleModelRendererInitPromise = null;
+        this._vehicleModelMat = glMatrix.mat4.create();
+        this._vehicleModelMatBuf = new Float32Array(16);
+        this._vehicleModelActiveKey = null;
+        this._vehicleModelMeshReady = false;
         this.drawableStreamer = new DrawableStreamer({
             modelMatrix: this.entityRenderer.modelMatrix,
             modelManager: this.modelManager,
@@ -351,13 +523,20 @@ export class App {
         // When sharded manifest shards load, rebuild instance selection so real meshes pop in quickly.
         this.modelManager.onManifestUpdated = () => {
             if (this.drawableStreamer) this.drawableStreamer._dirty = true;
+            if (this.player?.enabled) {
+                try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+            }
         };
-        // Models ON by default: this viewer is primarily for streaming the actual world props/drawables.
-        this.showModels = true;
+        // Models remain on, but startup is capped by the gameplay profile above.
+        this.showModels = !!cacheCaps.showModels;
         this.modelsInitialized = false;
         this._modelsInitPromise = null;
 
         // Viewer controls
+        this.playerWireframeMode = false;
+        this.objectsWireframeMode = !!cacheCaps.wireframe;
+        this.terrainWireframeMode = !!cacheCaps.wireframe;
+        this.buildingsWireframeMode = !!cacheCaps.wireframe;
         /** @type {null|'high'|'med'|'low'} */
         this.forcedModelLod = null;
 
@@ -377,22 +556,29 @@ export class App {
         this._applyLodFromUI = null;
         this._applyTextureQualityFromUI = null;
 
-        // Streaming center policy (camera-centric streaming helps first-view a lot).
-        this.streamFromCamera = true;
-        this._streamingUiParams = null; // { radius, maxLoaded, maxArch, maxDist, maxLoads, fc }
+        // A local player is always the streaming center. The camera is only a free-map fallback.
+        this.streamFromCamera = false;
+        this._streamingUiParams = null; // { radius, maxLoaded, maxArch, maxDist, maxVisible, maxPerArch, maxLoads, fc }
         this._streamingRampTimer = null;
 
         // Persistence + cache
-        this.restoreOnRefresh = true;
-        // Default ON when CacheStorage is available; can be toggled in UI and persists via localStorage.
-        this.cacheStreamedChunks = supportsAssetCacheStorage();
+        this.restoreOnRefresh = false;
+        this.spawnCharacterOnBoot = true;
+        // Disk-caching large chunk files is opt-in; it can hide stale exports and pressure storage.
+        this.cacheStreamedChunks = !!cacheCaps.cacheStreamedChunks;
         this._settingsSaveTimer = null;
         this._lastViewSaveMs = 0;
         this._restoredViewApplied = false;
+        this.settingsMenuOpen = false;
+        this._settingsMenuEl = null;
+        this._settingsBackdropEl = null;
+        this._gameplayPointerWasLocked = false;
+        this._suppressPointerUnlockMenu = false;
 
         // Simple "ped" marker renderer
         this.pedRenderer = new PedRenderer(this.gl);
         this.ped = null; // { posData: [x,y,z], posView: [x,y,z], camOffset: [x,y,z] }
+        this.showPlayer = true;
         this.followPed = true;
         this.controlPed = false;
 
@@ -405,22 +591,98 @@ export class App {
         // We keep the ped on terrain by setting Z = groundZ + this offset.
         // The rendered character mesh (whose origin is typically at/near the feet) compensates for this.
         this.pedEyeHeightData = 1.2;
+        // The exported heightmap is useful for terrain-only spawns, but it is not trusted to
+        // override an authoritative FiveM/GTA street Z while a player is moving.
+        this._pedGroundSource = 'runtime'; // terrain | interior | runtime
 
-        // "Real" player entity (static mesh instance, no skeleton/physics).
+        // "Real" player entity (mesh instance; freemode components can use exported skin palettes).
         this.player = {
             enabled: false,
             hash: null,        // stringified u32
+            hashes: [],        // one or more renderable mesh hashes (freemode components use several)
+            labels: [],
             lod: 'high',
+            renderMode: 'single',
+            requireRenderableCount: 1,
             headingRad: 0.0,   // data-space yaw (around +Z)
             _mat: glMatrix.mat4.create(),
             _matBuf: new Float32Array(16),
             _lastMoveDirData: [0, 0, 0],
+            _activeMeshKeys: new Set(),
+            animPhase: 0.0,
+            animMove01: 0.0,
+            animSpeed: 0.0,
+            animGait: 'idle',
+            handsUp: false,
         };
+        this.runtimeCharacterProfile = null;
+        this.runtimeCharacterOptions = [];
+        this.runtimeCharacterSelectedIndex = -1;
+        this.runtimeCharacterDisabledComponentIds = new Set();
+        this.runtimeCharacterComponentCatalog = null;
+        this.runtimeCharacterBaseProfile = null;
+        this._runtimeCharacterLoadPromise = null;
+        this.playerSkinningSkeleton = null;
+        this._runtimeCharacterSkeletonPromise = null;
+        this.playerSkinningAnimations = null;
+        this._runtimeCharacterAnimationsPromise = null;
+        this._weaponCombatAnimationsPromise = null;
+        this._weaponCombatAnimationsLoaded = false;
+        this._weaponCombatAnimationsUnavailable = false;
+        this._meleeAnimationsPromise = null;
+        this._meleeAnimationsLoaded = false;
+        this._meleeAnimationsUnavailable = false;
+        this.meleeSkinningAnimations = null;
+        this._playerMeshStatus = null;
+        this._pedVelocityData = [0, 0, 0];
+        this._pedVerticalVelocityData = 0.0;
+        this._pedOnGround = true;
+        this._lastUpdateDt = 1 / 60;
+        this.gameplayMoveConfig = {
+            walkSpeed: 1.7,
+            runSpeed: 4.6,
+            sprintSpeed: 7.4,
+            acceleration: 11.0,
+            runAcceleration: 11.0,
+            sprintAcceleration: 8.5,
+            braking: 14.0,
+            turnSharpness: 14.0,
+            gravity: 22.0,
+            jumpSpeed: 6.2,
+            maxStepUp: 1.15,
+            groundProbePad: 0.08,
+        };
+
+        // Browser-native gameplay layer. FiveM resources feed the manifest; the browser owns simulation.
+        this.runtimeGameplayManifest = null;
+        this.spawnSystem = new SpawnSystem();
+        this.collisionWorld = new CollisionWorld(this);
+        this.playerController = new PlayerController(this, this.collisionWorld);
+        this.npcSystem = new NpcSystem(this, this.collisionWorld);
+        this.meleeController = new MeleeController(this);
+        this.weaponController = new WeaponController(this);
+        this.inventoryOverlay = new InventoryOverlay(this);
+        this.weaponRenderer = new WeaponRenderer(this.gl);
+        // The bounded district is intentionally isolated behind /demo. It must not leak
+        // into the normal full-world viewer through persisted control state.
+        this.spawnDistrictDemo = isSpawnDistrictDemoRoute();
+        this.spawnDistrictBounds = null;
+        this._spawnDistrictDescriptor = null;
+        this.interactionSystem = new InteractionSystem();
+        this.vehicleController = new VehicleController(this);
+        this.gameplayPersistence = new GameplayPersistence();
+        this.audioSystem = new GameAudioSystem(this);
+        this.gtaHud = new GtaHud(this);
+        this.multiplayer = new MultiplayerClient(this);
+        this.audioSystem.attachMultiplayer(this.multiplayer);
+        this._lastGameplayAction = null;
+        this._gameplayManifestStatus = 'pending';
 
         // Gameplay camera controller (smooth follow/orbit/zoom around the player).
         this.gameplayCamEnabled = true;
         this._gpYaw = 0.0;
         this._gpPitch = -0.22;
+        this._gpAimNeutralPitch = this._gpPitch;
         this._gpDist = 6.0;
         this._gpFollowSharpness = 14.0; // higher = snappier
 
@@ -445,7 +707,15 @@ export class App {
         this.occlusionCuller = null;
         try {
             if (this.gl && typeof WebGL2RenderingContext !== 'undefined' && (this.gl instanceof WebGL2RenderingContext)) {
-                this.occlusionCuller = new OcclusionCuller(this.gl, { width: 256, height: 256, readbackEveryNFrames: 2, depthEps: 0.0025 });
+                this.occlusionCuller = new OcclusionCuller(this.gl, {
+                    width: 256,
+                    height: 256,
+                    readbackEveryNFrames: 2,
+                    depthEps: 0.0025,
+                    enableSoftwareHzb: true,
+                    hzbMinScreenPixels: 4,
+                    temporalKeepFrames: 2,
+                });
             }
         } catch {
             this.occlusionCuller = null;
@@ -455,15 +725,28 @@ export class App {
         this._orbitSensitivity = 0.005;
         this._orbitPitchLimit = 0.98; // clamp |y| <= limit * dist
 
-        // Spawned-ped grounding behavior:
-        // - If enabled, we snap to terrain only when the provided Z is "close enough" to ground.
-        //   This avoids breaking interior/roof spawns where Z is far above the terrain surface.
+        // YBN/interior collision is authoritative for gameplay grounding. GTA's
+        // heightmap.dat is a pair of coarse bounds envelopes, not a street surface.
         this.groundPedToTerrain = true;
         this.groundPedMaxDelta = 25.0; // data-space units
+        this.runtimeSpawnGroundSnapMaxDelta = 2.5; // Saved ped root can sit above the YBN floor.
         this._pedGroundingDebug = null; // { desiredZ, groundZ, finalZ, usedGround }
+        this._runtimeSpawnInfo = null;
+        this._bundledRuntimeSpawn = null;
         this._pedDebugEl = null;
         this._streamDebugEl = null;
         this._bootStatusEl = null;
+        this._assetInspectorEl = null;
+        this._assetInspectorTitleEl = null;
+        this._assetInspectorSummaryEl = null;
+        this._assetInspectorBodyEl = null;
+        this._assetInspectorCopyBtn = null;
+        this._assetInspectorText = '';
+        this._lastAssetInspectorReport = null;
+        this._vehiclePromptEl = null;
+        this.assetPickerEnabled = false;
+        this._weaponInventoryDialog = null;
+        this._weaponInventoryKey = '';
 
         // Perf HUD (Task A6)
         this._perfHudEl = null;
@@ -471,6 +754,9 @@ export class App {
         this._perfHudLastUpdateMs = 0;
         this._perfDtMs = 0;
         this._fpsEma = null;
+        this._cpuUpdateMs = 0;
+        this._cpuRenderMs = 0;
+        this._cpuFrameMs = 0;
         this._gpuTimer = null;
         
         // Set initial canvas size after camera is initialized
@@ -478,6 +764,7 @@ export class App {
 
         // Setup event listeners
         this.setupEventListeners();
+        this._createMultiplayerHud();
 
         // Boot async, then start animation once "world is ready"
         void this.initializeTerrain();
@@ -511,17 +798,27 @@ export class App {
             // (Terrain + entity dots + ped are enough to verify the world/coords and start moving.)
             this._setLoading({ detail: 'Loading textures/buildings (background)…', progress: 0.18 });
             this._setBootStatus('Loading textures/buildings (background)…');
-            void this.loadTextures().catch((e) => {
-                console.warn('Texture load failed:', e);
-            });
+            if (!this.spawnDistrictDemo) {
+                void this.loadTextures().catch((e) => {
+                    console.warn('Texture load failed:', e);
+                });
+            }
 
-            void (async () => {
+            if (!this.spawnDistrictDemo) void (async () => {
                 try {
                     await this.buildingRenderer.init();
-                    await this.buildingRenderer.loadOBJ('assets/buildings.obj');
-                    if (this.buildingRenderer.boundsView) {
-                        // Expand framing to include buildings too (if present)
-                        this.camera.frameAABB(this.buildingRenderer.boundsView.min, this.buildingRenderer.boundsView.max);
+                    const runtimeManifest = await fetchJSON('assets/manifest.json', { priority: 'low' }).catch(() => null);
+                    const buildingObj =
+                        runtimeManifest?.buildings?.obj_file ||
+                        runtimeManifest?.buildings_obj ||
+                        runtimeManifest?.terrain?.buildings_obj ||
+                        null;
+                    if (buildingObj) {
+                        await this.buildingRenderer.loadOBJ(`assets/${String(buildingObj).replace(/^assets[\\/]/i, '')}`);
+                        if (this.buildingRenderer.boundsView) {
+                            // Expand framing to include debug buildings if a monolithic OBJ is intentionally staged.
+                            this.camera.frameAABB(this.buildingRenderer.boundsView.min, this.buildingRenderer.boundsView.max);
+                        }
                     }
                 } catch (e) {
                     console.warn('Building load failed:', e);
@@ -533,6 +830,22 @@ export class App {
             this._setBootStatus('Loading entities index…');
             await this.entityRenderer.init();
             await this.entityStreamer.init();
+            if (this.spawnDistrictDemo) {
+                // This is deliberately configured before first playable frame. Entity dots
+                // otherwise begin parsing the original 512 m source chunk before the model
+                // pipeline has a chance to load the compact demo descriptor.
+                this.entityStreamer.setDemoBootstrap?.({
+                    key: '__demo_spawn_district__',
+                    pointFile: 'demo/spawn_district_points.bin',
+                });
+                this.drawableStreamer.setDemoBootstrap?.({
+                    key: '__demo_spawn_district__',
+                    instanceFile: 'demo/spawn_district_entities.bin',
+                });
+            }
+            try { await this.demoBoundaryRenderer.init(this._dataToViewMatrix); } catch (e) {
+                console.warn('Demo boundary renderer init failed:', e);
+            }
             this.entityReady = this.entityRenderer.ready && this.entityStreamer.ready;
             if (this.entityReady) {
                 const chunkCount = this.entityStreamer?.index?.chunks ? Object.keys(this.entityStreamer.index.chunks).length : 0;
@@ -540,26 +853,34 @@ export class App {
                 console.log(`Entity streaming enabled: chunks=${chunkCount} total_entities=${total ?? 'n/a'}`);
             }
 
+            // Use exported GTA YBN collision triangles for street-level elevation before
+            // falling back to the coarse terrain heightfield outside the cached tile.
+            await this.collisionWorld?.loadYbnGround?.();
+            // The demo descriptor carries the authoritative FiveM spawn. Load that
+            // small JSON before the normal boot spawn, while the full model subset
+            // remains deferred until after the first playable frame.
+            if (this.spawnDistrictDemo) await this._loadSpawnDistrictDescriptor();
+            this._setSpawnDistrictDemo(this.spawnDistrictDemo, { dropResident: false });
+
             // Init ped renderer
             this._setLoading({ detail: 'Starting…', progress: 0.40 });
             this._setBootStatus('Starting…');
             await this.pedRenderer.init();
+            await this._loadRuntimeCharacterProfile({ timeoutMs: 5_000 });
+            await this._loadGameplayManifest({ timeoutMs: 900 });
 
-            // If models are enabled by default, start initializing them now, but DO NOT block first frame on it.
-            // (manifest.json can be huge; we want the world to be "playable" quickly.)
+            // Sync model setting, but do not start model initialization yet. The manifest/drawable path is heavy;
+            // street-level spawn should get its first frame before this work starts.
             {
                 const modelsEl = document.getElementById('showModels');
                 // Sync runtime flag from UI (restore-on-refresh can toggle this before boot).
                 if (modelsEl) this.showModels = !!modelsEl.checked;
-                if (this.showModels) {
-                    if (modelsEl) modelsEl.checked = true;
-                    void this._preloadModelsIfEnabled();
-                } else {
+                if (this.showModels && modelsEl) modelsEl.checked = true;
+                if (!this.showModels) {
                     console.log('Models are disabled (Show Models unchecked or restored settings). Enable "Show Models" to initialize streaming drawables.');
                 }
             }
-
-            // Boot the viewer like a "client": restore view if enabled, otherwise spawn a default ped.
+            // Boot the viewer like a "client": start on foot in the city unless explicit restore is enabled.
             if (!this._tryRestoreViewFromStorage()) {
                 try {
                     const follow = document.getElementById('followPed');
@@ -570,29 +891,54 @@ export class App {
                     if (control) control.checked = true;
                     this.controlPed = true;
 
-                    // Prefer UI ped/cam vector4s; otherwise spawn at a reasonable city-ish ground location.
-                    if (!this._spawnPedCamFromUiOrFallback()) {
-                        this.spawnPedAtCity();
+                    // The remote resolver reads a live FiveM/MySQL profile and can take
+                    // longer than the first-playable budget. Keep a locally exported
+                    // snapshot in flight so a timeout never sends the user to the old,
+                    // arbitrary Legion Square fallback.
+                    const bundledSpawnPromise = this._loadBundledRuntimeSpawn();
+                    const runtimeSpawn = await this._resolveRuntimeSpawn({ timeoutMs: 1400 });
+                    const spawnToApply = runtimeSpawn || await bundledSpawnPromise;
+                    if (!this._applyRuntimeSpawn(spawnToApply)) {
+                        await this.spawnCharacter({ toggle: false, waitForModel: false, snapshot: false, initModel: false });
                     }
                 } catch {
-                    // ignore
+                    try {
+                        // The editable coordinate controls are for an explicit manual spawn,
+                        // not an automatic boot fallback. A stale control value must never
+                        // displace the normal city-character fallback.
+                        await this.spawnCharacter({ toggle: false, waitForModel: false, snapshot: false, initModel: false });
+                    } catch {
+                        // ignore
+                    }
                 }
             }
 
-            // Phase A complete: start rendering immediately (fast first playable frame).
-            // Resolve the "skip loading" promise so any time-bounded boot tasks (like models init)
-            // can continue in the background without blocking the renderer.
+            // Do not render the character before the spawn-area world is resident. Starting
+            // the loop here used to show the ped against collision/terrain first, then stream
+            // the actual road above it on a later frame.
+            const spawnWarmupCenter = this.ped
+                ? [this.ped.posData[0], this.ped.posData[1], this.ped.posData[2]]
+                : null;
+            if (this.showModels || this.showPlayer) {
+                const modelsReady = await this.ensureModelsInitialized();
+                if (modelsReady) {
+                    await this._warmupStreaming({
+                        showOverlay: true,
+                        timeoutMs: 8000,
+                        centerDataPos: spawnWarmupCenter,
+                    });
+                    // Mesh metadata and skinned bounds are now final, so rebuild the player
+                    // transform once before its first visible frame.
+                    try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+                }
+            }
+
+            // The first visible character frame now has both the player and nearby road data.
             this._loading = false;
             this._loadingResolve?.();
             this._setLoading({ visible: false, progress: 1.0 });
             this._startAnimationLoop();
-
-            // Phase B: warm up streaming in the background (soft warmup; no boot stall).
-            void this._warmupStreaming({ showOverlay: false }).then(() => {
-                this._setBootStatus('');
-            }).catch((e) => {
-                console.warn('Warmup streaming failed:', e);
-            });
+            this._setBootStatus('');
         } catch (error) {
             console.error('Failed to initialize terrain:', error);
             const msg = `Startup failed:\n${error?.message || error}`;
@@ -620,10 +966,142 @@ export class App {
             // If the user clicked "Skip loading", never re-show the blocking overlay.
             // We still update the lightweight status panel elsewhere.
             if (this._loadingSkipped) visible = false;
+            // After the first playable frame, model/chunk warmup must stay in the lightweight status panel.
+            // This prevents background manifest work from bringing the fullscreen loader back.
+            if (visible === true && !this._loading) visible = false;
             window.__viewerSetLoading?.({ title, detail, progress, visible });
         } catch {
             // ignore
         }
+    }
+
+    async _initializeAppearancePreview() {
+        try {
+            this.spawnDistrictDemo = false;
+            this.showModels = true;
+            this.showPlayer = true;
+            this.enablePostFx = false;
+            this.atmosphereEnabled = true;
+            this.timeOfDayHours = 12;
+            this._setLoading({ title: 'Loading character preview', detail: 'Loading freemode components', progress: 0.2, visible: true });
+            this._dataToViewMatrix = glMatrix.mat4.create();
+            glMatrix.mat4.rotateX(this._dataToViewMatrix, this._dataToViewMatrix, -Math.PI / 2);
+            this._viewToDataMatrix = glMatrix.mat4.create();
+            glMatrix.mat4.invert(this._viewToDataMatrix, this._dataToViewMatrix);
+            await this.skyRenderer.init();
+            await this.pedRenderer.init();
+            await this.modelManager.init('assets/models/manifest.json');
+            await this.instancedModelRenderer.init();
+            this.modelsInitialized = true;
+            await this._loadRuntimeCharacterProfile({ timeoutMs: 5_000 });
+            await this._loadRuntimeCharacterComponentCatalog();
+            if (!this.runtimeCharacterProfile) throw new Error('Runtime freemode character profile is unavailable');
+            await Promise.all([
+                this._loadRuntimePlayerSkeleton(this.runtimeCharacterProfile),
+                this._loadRuntimePlayerAnimations(this.runtimeCharacterProfile),
+            ]);
+            this.player.enabled = true;
+            this.player.lod = 'high';
+            this.player.headingRad = 0;
+            this.player.animPhase = 0;
+            this.player.animMove01 = 0;
+            this.player.animGait = 'idle';
+            this.spawnPedAt([0, 0, this.pedEyeHeightData], { groundSource: 'appearance_preview' });
+            this.camera.position[0] = 0;
+            this.camera.position[1] = 1.15;
+            this.camera.position[2] = 3.4;
+            this.camera.lookAtPoint([0, 1.0, 0]);
+            this.camera.setFovDegrees?.(42);
+            this.camera.setClipPlanes?.(0.05, 100);
+            this.camera.updateViewMatrix();
+            await this._ensurePlayerModelRenderer();
+            this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+            this._tryApplyClothingPackPreview();
+            this._syncPlayerEntityMesh(true);
+            this.playerModelRenderer?.pumpMeshLoadsOnce?.();
+            if (this.gtaHud?.root) this.gtaHud.root.style.display = 'none';
+            this._loading = false;
+            this._loadingResolve?.();
+            this._setLoading({ visible: false, progress: 1 });
+            this._startAnimationLoop();
+            this._setBootStatus('');
+        } catch (error) {
+            console.error('Failed to initialize character preview:', error);
+            const message = `Character preview failed:\n${error?.message || error}`;
+            this._setBootStatus(message);
+            try { window.__viewerShowFatal?.(message); } catch { /* ignore */ }
+        }
+    }
+
+    async _resolveRuntimeSpawn({ timeoutMs = 1400 } = {}) {
+        const ms = Number.isFinite(Number(timeoutMs)) ? Math.max(200, Number(timeoutMs)) : 1400;
+        const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = ac ? window.setTimeout(() => ac.abort(), ms) : null;
+        try {
+            const resp = await fetch('/__spawn/resolve', {
+                method: 'GET',
+                cache: 'no-store',
+                signal: ac?.signal,
+            });
+            if (!resp.ok) return null;
+            const data = await resp.json().catch(() => null);
+            if (!data?.ok || !data?.spawn) return null;
+            return data;
+        } catch {
+            return null;
+        } finally {
+            if (timer !== null) window.clearTimeout(timer);
+        }
+    }
+
+    async _loadBundledRuntimeSpawn({ timeoutMs = 1000 } = {}) {
+        if (this._bundledRuntimeSpawn?.spawn) return this._bundledRuntimeSpawn;
+        const ms = Number.isFinite(Number(timeoutMs)) ? Math.max(200, Number(timeoutMs)) : 1000;
+        const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = ac ? window.setTimeout(() => ac.abort(), ms) : null;
+        try {
+            const response = await fetch('assets/runtime_spawn.json', {
+                cache: 'no-store',
+                signal: ac?.signal,
+            });
+            if (!response.ok) return null;
+            const data = await response.json().catch(() => null);
+            const ped = this._spawnObjToVector4(data?.spawn?.ped);
+            if (!data?.spawn || !ped || !this._isFiniteVec2(ped)) return null;
+            this._bundledRuntimeSpawn = {
+                ...data,
+                diagnostics: {
+                    ...(data?.diagnostics || {}),
+                    fallback: 'assets/runtime_spawn.json',
+                },
+            };
+            return this._bundledRuntimeSpawn;
+        } catch {
+            return null;
+        } finally {
+            if (timer !== null) window.clearTimeout(timer);
+        }
+    }
+
+    async _loadGameplayManifest({ timeoutMs = 900, refresh = false } = {}) {
+        this._gameplayManifestStatus = 'loading';
+        const manifest = await this.spawnSystem?.load?.({ timeoutMs, refresh });
+        if (!manifest?.ok) {
+            this.runtimeGameplayManifest = null;
+            this._gameplayManifestStatus = this.spawnSystem?.lastError || 'missing';
+            return null;
+        }
+
+        this.runtimeGameplayManifest = manifest;
+        try { this.collisionWorld?.setManifest?.(manifest); } catch { /* ignore */ }
+        try { this.interactionSystem?.setManifest?.(manifest); } catch { /* ignore */ }
+        try { this.vehicleController?.setManifest?.(manifest); } catch { /* ignore */ }
+
+        const s = this.spawnSystem?.summarize?.() || {};
+        this._gameplayManifestStatus =
+            `${s.mode || 'loaded'} jobs=${s.jobs || 0} items=${s.items || 0} shops=${s.shops || 0} ` +
+            `garages=${s.garages || 0} vehicles=${s.vehicles || 0} interactions=${s.interactions || 0}`;
+        return manifest;
     }
 
     _safeLocalStorageGet(key) {
@@ -663,24 +1141,82 @@ export class App {
             else el.value = String(v);
         };
 
+        const savedVersion = Number(data.__version ?? 0);
+        if (!Number.isFinite(savedVersion) || savedVersion < 2) {
+            // Older builds defaulted to restoring aerial/map camera state. Reset that legacy default so
+            // the viewer now opens as a street-level city character unless the user opts in again.
+            data.restoreOnRefresh = false;
+        }
+        if (!Number.isFinite(savedVersion) || savedVersion < 20) {
+            const p = PERF_PROFILES.gameplay;
+            Object.assign(data, {
+                // The old visual heightfield was frequently left enabled in saved state. It is
+                // only a coarse landscape reference and must not overlap a streamed city by default.
+                showTerrain: false,
+                showModels: p.showModels,
+                showBuildings: false,
+                showPlayer: true,
+                showNpcs: true,
+                enableAutoExposure: false,
+                playerTextured: true,
+                objectsTextured: false,
+                terrainTextured: false,
+                buildingsTextured: false,
+                crossArchetypeInstancing: false,
+                cacheStreamedChunks: p.cacheStreamedChunks,
+                streamRadius: p.streamRadius,
+                maxLoadedChunks: p.maxLoadedChunks,
+                maxArchetypes: p.maxArchetypes,
+                maxModelDistance: p.maxModelDistance,
+                maxVisibleInstances: p.maxVisibleInstances,
+                maxInstancesPerArchetype: p.maxInstancesPerArchetype,
+                maxMeshLoadsInFlight: p.maxMeshLoadsInFlight,
+                textureQuality: p.textureQuality,
+                lodLevel: p.lodLevel,
+                enableShadows: false,
+                enablePostFx: false,
+                enableBloom: false,
+                groundPedToTerrain: true,
+                characterModel: DEFAULT_CHARACTER_MODEL_NAME,
+                assetPicker: false,
+            });
+        }
+        if (!Number.isFinite(savedVersion) || savedVersion < 21) {
+            // Gameplay should boot with the actual textured character visible.
+            // This also repairs version-20 saves that retained the old debug default.
+            data.showPlayer = true;
+            data.playerTextured = true;
+        }
+        if (!Number.isFinite(savedVersion) || savedVersion < 23) {
+            data.ambientAudio = true;
+            data.ambientVolume = '0.28';
+            data.gameplayAudio = true;
+            data.sfxVolume = '0.8';
+            data.voiceVolume = '1';
+            data.voiceMode = '1';
+        }
+
         // Toggles + numeric/select knobs
         [
             'showTerrain', 'showBuildings', 'showWater', 'showEntityDots', 'entityDotsOverlay',
+            'showPlayer', 'showNpcs', 'playerTextured', 'objectsTextured', 'terrainTextured', 'buildingsTextured',
             'showModels', 'crossArchetypeInstancing', 'showPlaceholders',
             'followPed', 'controlPed', 'groundPedToTerrain',
             'enableAtmosphere', 'enableFog',
+            'ambientAudio', 'ambientVolume', 'gameplayAudio', 'sfxVolume', 'voiceVolume', 'voiceMode',
             'enablePostFx', 'postFxExposure', 'postFxLum', 'enableAutoExposure', 'autoExposureSpeed', 'enableBloom', 'bloomStrength', 'bloomThreshold', 'bloomRadius',
             'frustumCulling', 'streamFromCamera',
-            'enableOcclusionCulling',
+            'enableOcclusionCulling', 'enableWebGpuCulling',
             'enableShadows', 'shadowMapSize',
             'enablePerfHud',
+            'assetPicker',
             'restoreOnRefresh', 'cacheStreamedChunks',
-            'streamRadius', 'maxLoadedChunks', 'maxArchetypes', 'maxModelDistance', 'maxMeshLoadsInFlight',
+            'streamRadius', 'maxLoadedChunks', 'maxArchetypes', 'maxModelDistance', 'maxVisibleInstances', 'maxInstancesPerArchetype', 'maxMeshLoadsInFlight',
             'textureQuality', 'lodLevel',
             'cameraSpeedPct',
             'timeOfDay', 'fogStart', 'fogEnd',
             'groundPedMaxDelta',
-            'pedCoords', 'camCoords',
+            'characterModel', 'pedCoords', 'camCoords',
         ].forEach(setVal);
     }
 
@@ -695,25 +1231,28 @@ export class App {
 
         [
             'showTerrain', 'showBuildings', 'showWater', 'showEntityDots', 'entityDotsOverlay',
+            'showPlayer', 'showNpcs', 'playerTextured', 'objectsTextured', 'terrainTextured', 'buildingsTextured',
             'showModels', 'crossArchetypeInstancing', 'showPlaceholders',
             'followPed', 'controlPed', 'groundPedToTerrain',
             'enableAtmosphere', 'enableFog',
+            'ambientAudio', 'ambientVolume', 'gameplayAudio', 'sfxVolume', 'voiceVolume', 'voiceMode',
             'enablePostFx', 'postFxExposure', 'postFxLum', 'enableAutoExposure', 'autoExposureSpeed', 'enableBloom', 'bloomStrength', 'bloomThreshold', 'bloomRadius',
             'frustumCulling', 'streamFromCamera',
-            'enableOcclusionCulling',
+            'enableOcclusionCulling', 'enableWebGpuCulling',
             'enableShadows', 'shadowMapSize',
             'enablePerfHud',
+            'assetPicker',
             'restoreOnRefresh', 'cacheStreamedChunks',
-            'streamRadius', 'maxLoadedChunks', 'maxArchetypes', 'maxModelDistance', 'maxMeshLoadsInFlight',
+            'streamRadius', 'maxLoadedChunks', 'maxArchetypes', 'maxModelDistance', 'maxVisibleInstances', 'maxInstancesPerArchetype', 'maxMeshLoadsInFlight',
             'textureQuality', 'lodLevel',
             'cameraSpeedPct',
             'timeOfDay', 'fogStart', 'fogEnd',
             'groundPedMaxDelta',
-            'pedCoords', 'camCoords',
+            'characterModel', 'pedCoords', 'camCoords',
         ].forEach(read);
 
         out.__savedAt = new Date().toISOString();
-        out.__version = 1;
+        out.__version = _SETTINGS_VERSION;
         return out;
     }
 
@@ -764,6 +1303,21 @@ export class App {
                 this.pedRenderer?.setPositions?.([posData]);
             }
 
+            const player = data.player || null;
+            if (this.ped && player && player.enabled) {
+                const hash = String(player.hash || '').trim();
+                this.player.enabled = true;
+                this.player.hash = hash || String((joaat(DEFAULT_CHARACTER_MODEL_NAME) >>> 0));
+                this.player.hashes = Array.isArray(player.hashes) && player.hashes.length
+                    ? player.hashes.map((x) => String(x || '').trim()).filter(Boolean)
+                    : [this.player.hash];
+                this.player.labels = [];
+                this.player.lod = String(player.lod || 'high');
+                this.player.headingRad = Number(player.headingRad) || 0.0;
+                this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+                try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+            }
+
             // If we restored a "map view" camera (very far away), clamp back to a ground third-person rig.
             // This fixes the “everything looks tiny” feeling after refresh.
             if (this.followPed && this.ped) {
@@ -777,6 +1331,7 @@ export class App {
             }
 
             this._restoredViewApplied = true;
+            this._setSpawnCharacterButtonLabel();
             return true;
         } catch {
             return false;
@@ -790,7 +1345,7 @@ export class App {
         this._lastViewSaveMs = now;
 
         const payload = {
-            __version: 1,
+            __version: _SETTINGS_VERSION,
             savedAt: new Date().toISOString(),
             camera: {
                 position: [this.camera.position[0], this.camera.position[1], this.camera.position[2]],
@@ -805,6 +1360,13 @@ export class App {
                 posData: [this.ped.posData[0], this.ped.posData[1], this.ped.posData[2]],
                 camOffset: [this.ped.camOffset[0], this.ped.camOffset[1], this.ped.camOffset[2]],
             } : null,
+            player: this.player?.enabled ? {
+                enabled: true,
+                hash: String(this.player.hash || ''),
+                hashes: Array.isArray(this.player.hashes) ? this.player.hashes.slice(0, 64).map((h) => String(h)) : [],
+                lod: String(this.player.lod || 'high'),
+                headingRad: Number(this.player.headingRad) || 0.0,
+            } : null,
         };
         this._safeLocalStorageSet(_LS_VIEW_KEY, JSON.stringify(payload));
     }
@@ -814,16 +1376,341 @@ export class App {
         const m = Number(document.getElementById('maxLoadedChunks')?.value ?? 25);
         const a = Number(document.getElementById('maxArchetypes')?.value ?? (this.drawableStreamer?.maxArchetypes ?? 250));
         const md = Number(document.getElementById('maxModelDistance')?.value ?? (this.drawableStreamer?.maxModelDistance ?? 350));
+        const vi = Number(document.getElementById('maxVisibleInstances')?.value ?? (this.drawableStreamer?.maxVisibleInstances ?? 12000));
+        const pa = Number(document.getElementById('maxInstancesPerArchetype')?.value ?? (this.drawableStreamer?.maxInstancesPerArchetype ?? 128));
         const ml = Number(document.getElementById('maxMeshLoadsInFlight')?.value ?? (this.instancedModelRenderer?.maxMeshLoadsInFlight ?? 6));
         const fc = !!document.getElementById('frustumCulling')?.checked;
+        const webgpu = !!document.getElementById('enableWebGpuCulling')?.checked
+            && getWebGpuCullingAvailability().available;
 
         const radius = Number.isFinite(r) ? Math.max(1, Math.min(24, Math.floor(r))) : 2;
         const maxLoaded = Number.isFinite(m) ? Math.max(9, Math.min(4000, Math.floor(m))) : 25;
         // 0 means "no cap" (distance cutoff still applies).
         const maxArch = Number.isFinite(a) ? Math.max(0, Math.floor(a)) : 250;
         const maxDist = Number.isFinite(md) ? Math.max(0, Math.min(100000, md)) : 350;
+        const maxVisible = Number.isFinite(vi) ? Math.max(1, Math.min(1000000, Math.floor(vi))) : 12000;
+        const maxPerArch = Number.isFinite(pa) ? Math.max(1, Math.min(100000, Math.floor(pa))) : 128;
         const maxLoads = Number.isFinite(ml) ? Math.max(1, Math.min(64, Math.floor(ml))) : 6;
-        return { radius, maxLoaded, maxArch, maxDist, maxLoads, fc };
+        return { radius, maxLoaded, maxArch, maxDist, maxVisible, maxPerArch, maxLoads, fc, webgpu };
+    }
+
+    _getStreamingFocusDataPos() {
+        // Free-map mode streams from the camera. Character mode should stream like the game:
+        // the local ped is the focus, even when the third-person camera is offset behind it.
+        if (this.ped) {
+            return this.ped.posData;
+        }
+        return null;
+    }
+
+    _getSpawnDistrictBounds() {
+        const half = SPAWN_DISTRICT_DEMO.size * 0.5;
+        const candidate = {
+            minX: SPAWN_DISTRICT_DEMO.centerX - half,
+            minY: SPAWN_DISTRICT_DEMO.centerY - half,
+            maxX: SPAWN_DISTRICT_DEMO.centerX + half,
+            maxY: SPAWN_DISTRICT_DEMO.centerY + half,
+        };
+        const ybn = this.collisionWorld?.ybnGround;
+        const minX = Number(ybn?.minX);
+        const minY = Number(ybn?.minY);
+        const maxX = Number(ybn?.maxX);
+        const maxY = Number(ybn?.maxY);
+        if ([minX, minY, maxX, maxY].every(Number.isFinite) && maxX > minX && maxY > minY) {
+            return {
+                minX: Math.max(candidate.minX, minX),
+                minY: Math.max(candidate.minY, minY),
+                maxX: Math.min(candidate.maxX, maxX),
+                maxY: Math.min(candidate.maxY, maxY),
+            };
+        }
+        return candidate;
+    }
+
+    _clampDataPositionToSpawnDistrict(posData) {
+        const x = Number(posData?.[0]);
+        const y = Number(posData?.[1]);
+        const z = Number(posData?.[2]);
+        const b = this.spawnDistrictDemo ? this.spawnDistrictBounds : null;
+        if (!b || !Number.isFinite(x) || !Number.isFinite(y)) return [x, y, z];
+        return [
+            Math.max(b.minX, Math.min(b.maxX, x)),
+            Math.max(b.minY, Math.min(b.maxY, y)),
+            z,
+        ];
+    }
+
+    _setSpawnDistrictDemo(enabled, { dropResident = true } = {}) {
+        this.spawnDistrictDemo = !!enabled;
+        this.spawnDistrictBounds = this.spawnDistrictDemo ? this._getSpawnDistrictBounds() : null;
+        const bounds = this.spawnDistrictBounds;
+
+        this.collisionWorld?.setMovementBounds?.(bounds);
+        this.entityStreamer?.setWorldBounds?.(bounds);
+        this.drawableStreamer?.setWorldBounds?.(bounds);
+        if (!this.spawnDistrictDemo) {
+            this.npcSystem?.clear?.();
+            this._clearNpcEntityMeshes();
+        }
+        if (this.demoBoundaryRenderer?.ready) {
+            if (bounds) {
+                const offset = Number(this.collisionWorld?.ybnGroundOffset) || 0.0;
+                this.demoBoundaryRenderer.setBounds(bounds, (x, y) => {
+                    const raw = this.collisionWorld?._getYbnGroundAtXY?.(x, y, NaN, 1000.0);
+                    return Number.isFinite(Number(raw)) ? Number(raw) + offset : NaN;
+                });
+            } else {
+                this.demoBoundaryRenderer.clear();
+            }
+        }
+        try {
+            if (this.spawnDistrictDemo) {
+                globalThis.__WEBGLGTA_TEXTURE_SLUG_FALLBACK = true;
+            } else if (globalThis.__WEBGLGTA_TEXTURE_SLUG_FALLBACK === true) {
+                delete globalThis.__WEBGLGTA_TEXTURE_SLUG_FALLBACK;
+            }
+        } catch { /* ignore */ }
+        if (!this.spawnDistrictDemo) {
+            this.entityStreamer?.setDemoBootstrap?.(null);
+            this.drawableStreamer?.setDemoBootstrap?.(null);
+            if (this.drawableStreamer) {
+                this.drawableStreamer.enableWorkerFrustumCulling = false;
+                this.drawableStreamer.enableWasmCulling = true;
+                this.drawableStreamer.rebuildInstancesOnMove = false;
+                this.drawableStreamer._dirty = true;
+            }
+        } else {
+            // /demo is a bounded playable district. Always begin with its local
+            // drawables and diffuse textures visible, regardless of a saved
+            // full-map wireframe preference. The controls remain user-editable
+            // once the demo has loaded.
+            this.showTerrain = false;
+            this.showBuildings = false;
+            this.showModels = true;
+            this.objectsWireframeMode = false;
+            this.forcedModelLod = SPAWN_DEMO_MODEL_LOD;
+            this._setControlValue('showTerrain', false);
+            this._setControlValue('showBuildings', false);
+            this._setControlValue('showModels', true);
+            this._setControlValue('objectsTextured', true);
+            this._setControlValue('lodLevel', SPAWN_DEMO_LOD_LEVEL);
+            this._setControlValue('textureQuality', SPAWN_DEMO_TEXTURE_QUALITY);
+            this._setControlValue('crossArchetypeInstancing', false);
+            this._setControlValue('entityLodTraversal', false);
+            this._applySpawnDistrictDemoBudget();
+            // Software HZB occlusion uses a depth pass + readback cadence. Keep it
+            // available in the UI, but default it off for gameplay frame pacing.
+            this.enableOcclusionCulling = false;
+            this._setControlValue('enableOcclusionCulling', false);
+            if (this.drawableStreamer) {
+                this.drawableStreamer.enableCrossArchetypeInstancing = false;
+                this.drawableStreamer.forcedLod = this.forcedModelLod;
+                if (typeof this.drawableStreamer.setEntityLodTraversalEnabled === 'function') {
+                    this.drawableStreamer.setEntityLodTraversalEnabled(false);
+                } else {
+                    this.drawableStreamer.enableEntityLodTraversal = false;
+                }
+            }
+            this._configureSpawnDistrictDemoOcclusion();
+            if (this.occlusionCuller) this.occlusionCuller.enabled = false;
+        }
+
+        if (bounds && this.ped) {
+            const current = this.ped.posData;
+            const clamped = this._clampDataPositionToSpawnDistrict(current);
+            if (clamped[0] !== current[0] || clamped[1] !== current[1]) {
+                this.spawnPedAt(clamped, { groundSource: this._pedGroundSource });
+            }
+        }
+        if (dropResident) this._dropStreamedResidency({ dropEntities: true });
+        this._scheduleSaveSettings();
+    }
+
+    _configureSpawnDistrictDemoOcclusion() {
+        const occ = this.occlusionCuller;
+        if (!this.spawnDistrictDemo || !occ) return;
+        // Keep the software HZB path active, but bias toward stability for the
+        // visual demo so uncertain/near-edge bounds fail open instead of popping.
+        occ.enableSoftwareHzb = true;
+        occ.readbackEveryNFrames = 3;
+        occ.depthEps = 0.006;
+        occ.hzbMinScreenPixels = 8.0;
+        occ.temporalKeepFrames = 6;
+    }
+
+    _applySpawnDistrictDemoBudget() {
+        if (!this.spawnDistrictDemo) return;
+        const descriptor = this._spawnDistrictDescriptor || null;
+        const demoInstances = Math.max(0, Math.floor(Number(descriptor?.instanceCount) || 0));
+        const demoNonRenderable = Math.max(0, Math.floor(Number(descriptor?.nonRenderableEntityCount) || 0));
+        const demoRenderableInstances = Math.max(0, demoInstances - demoNonRenderable);
+        const demoArchetypes = Math.max(
+            0,
+            Math.floor(Number(descriptor?.manifestArchetypeCount ?? descriptor?.archetypeCount) || 0),
+        );
+        const webGpuAvailability = getWebGpuCullingAvailability();
+        const bounds = descriptor?.bounds || null;
+        const spanX = Math.max(0, Number(bounds?.maxX) - Number(bounds?.minX)) || SPAWN_DISTRICT_DEMO.size;
+        const spanY = Math.max(0, Number(bounds?.maxY) - Number(bounds?.minY)) || SPAWN_DISTRICT_DEMO.size;
+        const districtRadius = Math.hypot(spanX, spanY) * 0.5;
+        const visibleCap = webGpuAvailability.available ? 12000 : 4096;
+        // The preprocessed district is one permanent cell. Scale its limits with the
+        // descriptor while retaining bounded GPU, mesh, and texture residency.
+        const budget = {
+            radius: 0,
+            maxLoaded: 1,
+            maxArch: demoArchetypes > 0 ? Math.max(128, Math.min(512, demoArchetypes + 16)) : 320,
+            maxDist: Math.max(340, Math.min(1200, Math.ceil(districtRadius + 120))),
+            maxVisible: demoRenderableInstances > 0
+                ? Math.max(512, Math.min(visibleCap, demoRenderableInstances))
+                : Math.min(2048, visibleCap),
+            maxPerArch: webGpuAvailability.available ? 1024 : 512,
+            maxLoads: 10,
+            fc: true,
+        };
+        this._applyStreamingParams(budget);
+        this.showTerrain = false;
+        this.showBuildings = false;
+        this.forcedModelLod = SPAWN_DEMO_MODEL_LOD;
+        this.enableOcclusionCulling = false;
+        this._setControlValue('showTerrain', false);
+        this._setControlValue('showBuildings', false);
+        this._setControlValue('lodLevel', SPAWN_DEMO_LOD_LEVEL);
+        this._setControlValue('textureQuality', SPAWN_DEMO_TEXTURE_QUALITY);
+        this._setControlValue('enableOcclusionCulling', false);
+        this._setControlValue('enableWebGpuCulling', webGpuAvailability.available);
+        this._setControlValue('crossArchetypeInstancing', false);
+        this._setControlValue('entityLodTraversal', false);
+        if (this.entityStreamer) {
+            this.entityStreamer.maxNewLoadsPerUpdate = 1;
+            this.entityStreamer.extraFrontChunks = 0;
+        }
+        if (this.drawableStreamer) {
+            this.drawableStreamer.maxNewLoadsPerUpdate = 1;
+            this.drawableStreamer.extraFrontChunks = 0;
+            this.drawableStreamer.enableWorkerFrustumCulling = true;
+            this.drawableStreamer.enableWasmCulling = false;
+            this.drawableStreamer.enableWebGpuCulling = webGpuAvailability.available;
+            this.drawableStreamer.webGpuCullingMinInstances = 2048;
+            this.drawableStreamer.webGpuCullingMinSliceInstances = 1;
+            this.drawableStreamer.enableCrossArchetypeInstancing = false;
+            this.drawableStreamer.forcedLod = this.forcedModelLod;
+            this.drawableStreamer.maxBehindModelDistance = budget.maxDist;
+            if (typeof this.drawableStreamer.setEntityLodTraversalEnabled === 'function') {
+                this.drawableStreamer.setEntityLodTraversalEnabled(false);
+            } else {
+                this.drawableStreamer.enableEntityLodTraversal = false;
+            }
+            this.drawableStreamer.workerFrustumPadding = 28.0;
+            this.drawableStreamer.rebuildInstancesOnMove = true;
+            this.drawableStreamer.instanceRebuildMinMove = webGpuAvailability.available ? 12.0 : 20.0;
+            this.drawableStreamer.instanceRebuildMinMs = webGpuAvailability.available ? 250 : 350;
+            this.drawableStreamer.instanceRebuildMinDirDot = 0.966;
+            this.drawableStreamer._dirty = true;
+        }
+        this._configureSpawnDistrictDemoOcclusion();
+        if (this.occlusionCuller) this.occlusionCuller.enabled = false;
+        try { setAssetFetchConcurrency(12); } catch { /* ignore */ }
+        try { setAssetFetchPriorityConfig({ highShare: 0.9 }); } catch { /* ignore */ }
+        try { this.modelManager?.setMeshCacheCaps?.({ maxBytes: 128 * 1024 * 1024 }); } catch { /* ignore */ }
+        // Unlike the map-wide viewer, /demo has a fixed 150 m resident set. Keep
+        // its nearby diffuse maps long enough to avoid texture pop-out while the
+        // player moves between streets. Explicit profile changes such as Memory
+        // saver still override this after the demo is initialized.
+        try {
+            const deviceMemoryGb = Number(this._defaultRuntimeCaps?.deviceMemoryGb);
+            const constrainedDevice = Number.isFinite(deviceMemoryGb) && deviceMemoryGb <= 4;
+            this.textureStreamer?.setCacheCaps?.({
+                maxTextures: constrainedDevice ? 512 : 1024,
+                maxBytes: constrainedDevice ? (192 * 1024 * 1024) : (384 * 1024 * 1024),
+            });
+            this.textureStreamer?.setStreamingConfig?.({
+                maxLoadsInFlight: constrainedDevice ? 4 : 6,
+                maxNewLoadsPerFrame: constrainedDevice ? 8 : 12,
+            });
+            this.textureStreamer?.setDistanceTierConfig?.({
+                highDist: constrainedDevice ? 28 : 45,
+                mediumDist: constrainedDevice ? 170 : 260,
+                minResidentMs: constrainedDevice ? 6000 : 12000,
+            });
+            this.textureStreamer?.setQuality?.(SPAWN_DEMO_TEXTURE_QUALITY);
+        } catch { /* ignore */ }
+
+        // /demo is a visual-density test, not the memory-saver profile. Saved/default
+        // gameplay settings leave objects in wireframe, which makes texture loading
+        // look broken even when culling is doing the right thing.
+        this.objectsWireframeMode = false;
+        this._setControlValue('objectsTextured', true);
+
+        this._setControlValue('streamRadius', budget.radius);
+        this._setControlValue('maxLoadedChunks', budget.maxLoaded);
+        this._setControlValue('maxArchetypes', budget.maxArch);
+        this._setControlValue('maxModelDistance', budget.maxDist);
+        this._setControlValue('maxVisibleInstances', budget.maxVisible);
+        this._setControlValue('maxInstancesPerArchetype', budget.maxPerArch);
+        this._setControlValue('maxMeshLoadsInFlight', budget.maxLoads);
+    }
+
+    async _loadSpawnDistrictDescriptor() {
+        if (!this.spawnDistrictDemo) return null;
+        const existing = this._spawnDistrictDescriptor;
+        if (existing?.bounds && Number.isFinite(Number(existing.bounds.minX)) && Number.isFinite(Number(existing.bounds.minY))
+            && Number.isFinite(Number(existing.bounds.maxX)) && Number.isFinite(Number(existing.bounds.maxY))) {
+            return existing;
+        }
+        try {
+            const descriptor = await fetchJSON('assets/demo/spawn_district.json', {
+                priority: 'high',
+                usePersistentCache: false,
+                useMemoryCache: false,
+            });
+            const bounds = descriptor?.bounds;
+            const validBounds = [bounds?.minX, bounds?.minY, bounds?.maxX, bounds?.maxY]
+                .map(Number)
+                .every(Number.isFinite) && Number(bounds?.maxX) > Number(bounds?.minX) && Number(bounds?.maxY) > Number(bounds?.minY);
+            const instanceFile = String(descriptor?.instanceFile || '').trim();
+            const pointFile = String(descriptor?.pointFile || '').trim();
+            const manifestFile = String(descriptor?.manifestFile || '').trim();
+            if (!validBounds || !instanceFile || !manifestFile) throw new Error('invalid spawn district descriptor');
+
+            this._spawnDistrictDescriptor = descriptor;
+            this.spawnDistrictBounds = {
+                minX: Number(bounds.minX), minY: Number(bounds.minY),
+                maxX: Number(bounds.maxX), maxY: Number(bounds.maxY),
+            };
+            return descriptor;
+        } catch (e) {
+            console.warn('[demo] Spawn district descriptor unavailable; using generic city spawn.', e);
+            return null;
+        }
+    }
+
+    async _prepareSpawnDistrictDemoAssets() {
+        if (!this.spawnDistrictDemo) return false;
+        try {
+            const descriptor = await this._loadSpawnDistrictDescriptor();
+            if (!descriptor) throw new Error('spawn district descriptor unavailable');
+            const instanceFile = String(descriptor.instanceFile || '').trim();
+            const pointFile = String(descriptor.pointFile || '').trim();
+            const manifestFile = String(descriptor.manifestFile || '').trim();
+            const manifest = await fetchJSON(`assets/${manifestFile.replace(/^assets\//i, '')}`, {
+                priority: 'high',
+                usePersistentCache: false,
+                useMemoryCache: false,
+            });
+            const installed = this.modelManager?.installManifestSubset?.(manifest, { source: 'demo/spawn_district_models.json' }) ?? 0;
+            this.drawableStreamer?.setDemoBootstrap?.({ key: '__demo_spawn_district__', instanceFile });
+            if (pointFile) this.entityStreamer?.setDemoBootstrap?.({ key: '__demo_spawn_district__', pointFile });
+            this._setSpawnDistrictDemo(true, { dropResident: false });
+            console.info(`[demo] Prepared ${Number(descriptor.instanceCount || 0).toLocaleString()} instances and ${installed.toLocaleString()} model definitions.`);
+            return true;
+        } catch (e) {
+            // Preserve the normal world-data path if a developer has not generated the demo bundle yet.
+            console.warn('[demo] Compact district assets unavailable; using filtered source chunks.', e);
+            this.entityStreamer?.setDemoBootstrap?.(null);
+            this.drawableStreamer?.setDemoBootstrap?.(null);
+            return false;
+        }
     }
 
     _cancelStreamingRamp() {
@@ -833,7 +1720,7 @@ export class App {
         }
     }
 
-    _applyStreamingParams({ radius, maxLoaded, maxArch, maxDist, maxLoads, fc } = {}) {
+    _applyStreamingParams({ radius, maxLoaded, maxArch, maxDist, maxVisible, maxPerArch, maxLoads, fc } = {}) {
         if (this.entityStreamer) {
             if (Number.isFinite(radius)) this.entityStreamer.radiusChunks = radius;
             if (Number.isFinite(maxLoaded)) this.entityStreamer.maxLoadedChunks = maxLoaded;
@@ -845,12 +1732,98 @@ export class App {
             if (typeof fc === 'boolean') this.drawableStreamer.enableFrustumCulling = fc;
             if (Number.isFinite(maxArch)) this.drawableStreamer.maxArchetypes = maxArch;
             if (Number.isFinite(maxDist)) this.drawableStreamer.maxModelDistance = maxDist;
+            if (Number.isFinite(maxVisible)) this.drawableStreamer.maxVisibleInstances = maxVisible;
+            if (Number.isFinite(maxPerArch)) this.drawableStreamer.maxInstancesPerArchetype = maxPerArch;
             // Force rebuild so caps apply immediately.
             this.drawableStreamer._dirty = true;
         }
         if (this.instancedModelRenderer) {
             if (Number.isFinite(maxLoads)) this.instancedModelRenderer.maxMeshLoadsInFlight = maxLoads;
         }
+    }
+
+    _setControlValue(id, value) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        if (el.type === 'checkbox') el.checked = !!value;
+        else el.value = String(value);
+    }
+
+    _dropStreamedResidency({ dropEntities = false } = {}) {
+        try { this._cancelStreamingRamp(); } catch { /* ignore */ }
+        try { this.instancedModelRenderer?.clearScene?.(); } catch { /* ignore */ }
+        try { this.modelManager?.clearMeshCache?.(); } catch { /* ignore */ }
+        try { this.textureStreamer?.clear?.(); } catch { /* ignore */ }
+        try { this.drawableStreamer?.clear?.(); } catch { /* ignore */ }
+        if (dropEntities) {
+            try { this.entityStreamer?.clear?.(this.entityRenderer); } catch { /* ignore */ }
+            try { this.entityRenderer?.clear?.(); } catch { /* ignore */ }
+        }
+        try { clearAssetMemoryCaches(); } catch { /* ignore */ }
+        if (this.showPlayer && this.player?.enabled) {
+            try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+        }
+    }
+
+    _applyPerformanceProfile(name = 'gameplay', { updateUi = true, dropResident = false, save = false, startModels = false } = {}) {
+        const key = Object.prototype.hasOwnProperty.call(PERF_PROFILES, name) ? String(name) : 'gameplay';
+        const p = PERF_PROFILES[key];
+        this._activePerformanceProfile = key;
+
+        if (updateUi) {
+            this._setControlValue('streamRadius', p.streamRadius);
+            this._setControlValue('maxLoadedChunks', p.maxLoadedChunks);
+            this._setControlValue('maxArchetypes', p.maxArchetypes);
+            this._setControlValue('maxModelDistance', p.maxModelDistance);
+            this._setControlValue('maxVisibleInstances', p.maxVisibleInstances);
+            this._setControlValue('maxInstancesPerArchetype', p.maxInstancesPerArchetype);
+            this._setControlValue('maxMeshLoadsInFlight', p.maxMeshLoadsInFlight);
+            this._setControlValue('textureQuality', p.textureQuality);
+            this._setControlValue('lodLevel', p.lodLevel);
+            this._setControlValue('showModels', p.showModels);
+            this._setControlValue('objectsTextured', !p.wireframe);
+            this._setControlValue('terrainTextured', !p.wireframe);
+            this._setControlValue('buildingsTextured', !p.wireframe);
+            this._setControlValue('cacheStreamedChunks', p.cacheStreamedChunks);
+            this._setControlValue('frustumCulling', true);
+            this._setControlValue('enableWebGpuCulling', false);
+            this._setControlValue('enableShadows', false);
+            this._setControlValue('enablePostFx', false);
+            this._setControlValue('enableBloom', false);
+        }
+
+        this.showModels = !!p.showModels;
+        this.objectsWireframeMode = !!p.wireframe;
+        this.terrainWireframeMode = !!p.wireframe;
+        this.buildingsWireframeMode = !!p.wireframe;
+        this.cacheStreamedChunks = !!p.cacheStreamedChunks;
+        if (this.entityStreamer) this.entityStreamer.usePersistentCacheForChunks = this.cacheStreamedChunks;
+        if (this.drawableStreamer) this.drawableStreamer.usePersistentCacheForChunks = this.cacheStreamedChunks;
+
+        try { setAssetFetchConcurrency(p.assetConcurrency); } catch { /* ignore */ }
+        try { setAssetFetchPriorityConfig({ highShare: 0.82 }); } catch { /* ignore */ }
+        try { this.modelManager?.setMeshCacheCaps?.({ maxBytes: p.meshMaxBytes }); } catch { /* ignore */ }
+        try {
+            this.textureStreamer?.setCacheCaps?.({ maxTextures: p.texMaxTextures, maxBytes: p.texMaxBytes });
+            this.textureStreamer?.setStreamingConfig?.({
+                maxLoadsInFlight: p.texLoadsInFlight,
+                maxNewLoadsPerFrame: p.texNewLoadsPerFrame,
+            });
+            this.textureStreamer?.setQuality?.(p.textureQuality);
+        } catch { /* ignore */ }
+
+        this._applyLodFromUI?.();
+        this._applyStreamingFromUI?.();
+        if (dropResident) this._dropStreamedResidency({ dropEntities: true });
+        if (startModels && (this.showModels || this.showPlayer)) {
+            void this.ensureModelsInitialized?.().then((ok) => {
+                if (!ok) {
+                    this.showModels = false;
+                    this._setControlValue('showModels', false);
+                }
+            });
+        }
+        if (save) this._scheduleSaveSettings();
     }
 
     _startStreamingFastRamp() {
@@ -867,6 +1840,8 @@ export class App {
             maxLoaded: Math.min(25, target.maxLoaded),
             maxArch: Math.min(250, target.maxArch),
             maxDist: Math.min(350, target.maxDist),
+            maxVisible: Math.min(8000, target.maxVisible),
+            maxPerArch: Math.min(96, target.maxPerArch),
             maxLoads: Math.min(6, target.maxLoads),
             fc: target.fc,
         };
@@ -876,6 +1851,8 @@ export class App {
         const curLoaded = this.entityStreamer?.maxLoadedChunks ?? boot.maxLoaded;
         const curArch = this.drawableStreamer?.maxArchetypes ?? boot.maxArch;
         const curDist = this.drawableStreamer?.maxModelDistance ?? boot.maxDist;
+        const curVisible = this.drawableStreamer?.maxVisibleInstances ?? boot.maxVisible;
+        const curPerArch = this.drawableStreamer?.maxInstancesPerArchetype ?? boot.maxPerArch;
         const curLoads = this.instancedModelRenderer?.maxMeshLoadsInFlight ?? boot.maxLoads;
 
         const start = {
@@ -883,6 +1860,8 @@ export class App {
             maxLoaded: Math.min(curLoaded, boot.maxLoaded),
             maxArch: Math.min(curArch, boot.maxArch),
             maxDist: Math.min(curDist, boot.maxDist),
+            maxVisible: Math.min(curVisible, boot.maxVisible),
+            maxPerArch: Math.min(curPerArch, boot.maxPerArch),
             maxLoads: Math.min(curLoads, boot.maxLoads),
             fc: boot.fc,
         };
@@ -901,6 +1880,8 @@ export class App {
             const curM = this.entityStreamer?.maxLoadedChunks ?? start.maxLoaded;
             const curA = this.drawableStreamer?.maxArchetypes ?? start.maxArch;
             const curD = this.drawableStreamer?.maxModelDistance ?? start.maxDist;
+            const curV = this.drawableStreamer?.maxVisibleInstances ?? start.maxVisible;
+            const curP = this.drawableStreamer?.maxInstancesPerArchetype ?? start.maxPerArch;
             const curL = this.instancedModelRenderer?.maxMeshLoadsInFlight ?? start.maxLoads;
 
             const next = {
@@ -908,6 +1889,8 @@ export class App {
                 maxLoaded: Math.min(latest.maxLoaded, curM + 60),
                 maxArch: Math.min(latest.maxArch, curA + 200),
                 maxDist: Math.min(latest.maxDist, curD + 250),
+                maxVisible: Math.min(latest.maxVisible, curV + 8000),
+                maxPerArch: Math.min(latest.maxPerArch, curP + 128),
                 maxLoads: Math.min(latest.maxLoads, curL + 1),
                 fc: latest.fc,
             };
@@ -919,15 +1902,18 @@ export class App {
                 next.maxLoaded >= latest.maxLoaded &&
                 next.maxArch >= latest.maxArch &&
                 next.maxDist >= latest.maxDist &&
+                next.maxVisible >= latest.maxVisible &&
+                next.maxPerArch >= latest.maxPerArch &&
                 next.maxLoads >= latest.maxLoads;
 
             if (done) this._cancelStreamingRamp();
         }, stepMs);
     }
 
-    async _preloadModelsIfEnabled() {
-        if (!this.showModels) return;
-        this._setLoading({
+    async _preloadModelsIfEnabled({ showOverlay = true, maxWaitMs = 1800 } = {}) {
+        if (!this.showModels && !this.showPlayer) return;
+        if (!showOverlay) this._setBootStatus('Loading GTA models manifest in background...');
+        if (showOverlay) this._setLoading({
             title: 'Loading world…',
             detail: 'Loading GTA models manifest… (large manifests may take a while; you can skip)',
             progress: 0.55,
@@ -936,8 +1922,11 @@ export class App {
 
         // Start the heavy model pipeline init, but only wait a short time for "fast path" wins.
         // If it takes longer, let it continue in the background and don't block first render.
-        const maxWaitMs = 1800;
         const initPromise = this.ensureModelsInitialized();
+        if (maxWaitMs <= 0) {
+            void initPromise;
+            return;
+        }
         const okOrNull = await Promise.race([
             initPromise, // resolves true/false
             (async () => {
@@ -968,19 +1957,19 @@ export class App {
         });
     }
 
-    async _warmupStreaming({ showOverlay = true, timeoutMs = 6000 } = {}) {
+    async _warmupStreaming({ showOverlay = true, timeoutMs = 6000, centerDataPos = null } = {}) {
         // If user skipped, do the bare minimum and get to first frame.
         if (this._loadingSkipped) return;
 
-        // Use the same center policy as the main update loop.
-        const center = (!this.streamFromCamera && this.followPed && this.ped) ? this.ped.posData : null;
+        // Use a supplied spawn focus when available, otherwise match the main update loop.
+        const center = centerDataPos || this._getStreamingFocusDataPos();
 
         // Fast-start: temporarily use a small bubble and ramp up to UI settings in the background.
         // This makes "first look around" responsive instead of waiting on a huge chunk burst.
         this._startStreamingFastRamp();
 
         // Kick streaming once to populate wanted keys and begin async loads.
-        if (this.entityReady) this.entityStreamer.update(this.camera, this.entityRenderer, center);
+        if (this.entityReady && this.showEntityDots) this.entityStreamer.update(this.camera, this.entityRenderer, center);
         try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
         try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
         if (this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
@@ -991,25 +1980,40 @@ export class App {
 
         // Compute the set of chunk keys that actually exist in the index (missing meta should not block boot).
         const wantedEntity = (this.entityReady && this.entityStreamer?.getWantedKeys)
-            ? this.entityStreamer.getWantedKeys(this.camera, center).filter((k) => !!this.entityStreamer?.index?.chunks?.[k])
+            ? this.entityStreamer.getWantedKeys(this.camera, center).filter((k) => (
+                k === this.entityStreamer?.demoBootstrap?.key || !!this.entityStreamer?.index?.chunks?.[k]
+            ))
             : [];
         const wantedDraw = (this.showModels && this.modelsInitialized && this.drawableStreamer?.getWantedKeys)
-            ? this.drawableStreamer.getWantedKeys(this.camera, center).filter((k) => !!this.drawableStreamer?.index?.chunks?.[k])
+            ? this.drawableStreamer.getWantedKeys(this.camera, center).filter((k) => (
+                k === this.drawableStreamer?.demoBootstrap?.key || !!this.drawableStreamer?.index?.chunks?.[k]
+            ))
             : [];
 
         while (performance.now() - start < timeoutMs) {
             if (this._loadingSkipped) return;
 
             // Keep requesting wanted chunks (async loads are fire-and-forget).
-            if (this.entityReady) this.entityStreamer.update(this.camera, this.entityRenderer, center);
+            if (this.entityReady && this.showEntityDots) this.entityStreamer.update(this.camera, this.entityRenderer, center);
             try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             if (this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
 
             // Drive mesh queue without drawing.
             if (this.showModels && this.modelsInitialized) {
+                try { this.textureStreamer?.beginFrame?.(); } catch { /* ignore */ }
                 this.instancedModelRenderer?.pumpMeshLoadsOnce?.();
-                this.instancedModelRenderer?.prefetchDiffuseTextures?.(220);
+                const textureQuality = String(this.textureStreamer?.quality || 'medium').toLowerCase();
+                const demoPrefetchLimit = textureQuality === 'high' ? 384 : (textureQuality === 'medium' ? 160 : 64);
+                const prefetchLimit = this.spawnDistrictDemo ? demoPrefetchLimit : 48;
+                const includeSecondary = this.spawnDistrictDemo && textureQuality === 'high';
+                if (!this.objectsWireframeMode) {
+                    this.instancedModelRenderer?.prefetchDiffuseTextures?.(prefetchLimit, { includeSecondary });
+                }
+                if (!this.playerWireframeMode) {
+                    this.playerModelRenderer?.prefetchDiffuseTextures?.(textureQuality === 'high' ? 96 : 48, { includeSecondary });
+                }
+                try { this.textureStreamer?.endFrame?.(); } catch { /* ignore */ }
             }
 
             const eDone = wantedEntity.every((k) => this.entityStreamer.loaded.has(k));
@@ -1070,9 +2074,26 @@ export class App {
                 this._setBootStatus('Loading GTA models manifest (this can take a while)…');
                 // Note: manifest.json can be ~50MB; only load on-demand.
                 await this.modelManager.init('assets/models/manifest.json');
+                if (this.runtimeCustomClothingManifest) {
+                    this.modelManager.installManifestSubset(
+                        this.runtimeCustomClothingManifest,
+                        { source: 'custom_clothing/nx_chains.json' },
+                    );
+                }
                 await this.instancedModelRenderer.init();
                 await this.drawableStreamer.init();
+                await this._prepareSpawnDistrictDemoAssets();
                 this.modelsInitialized = true;
+                // Do not hold world startup on a single optional held-weapon asset.
+                void this._ensureWeaponModelRenderer().then((ok) => {
+                    if (ok) this._syncWeaponModelMesh(true);
+                });
+                if (this.player?.enabled) {
+                    await this._ensurePlayerModelRenderer();
+                    this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+                    try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+                    try { this.playerModelRenderer?.pumpMeshLoadsOnce?.(); } catch { /* ignore */ }
+                }
                 this._setBootStatus('');
                 return true;
             } catch (e) {
@@ -1087,6 +2108,503 @@ export class App {
         })();
 
         return this._modelsInitPromise;
+    }
+
+    async _ensurePlayerModelRenderer() {
+        if (this.playerModelRenderer?.ready) return true;
+        if (this._playerModelRendererInitPromise) return this._playerModelRendererInitPromise;
+
+        this._playerModelRendererInitPromise = (async () => {
+            try {
+                const renderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
+                // A player has only a handful of component meshes; keep its queue focused without competing with world bursts.
+                renderer.maxMeshLoadsInFlight = 2;
+                // Character bins were upgraded with blend weights after earlier exports had
+                // reached Cache Storage. Keep that cache isolation limited to the player.
+                renderer.meshLoadOptions = {
+                    usePersistentCache: false,
+                    cacheBust: `player-skin-v8-${Date.now()}`,
+                    requireBlendAttributes: true,
+                };
+                await renderer.init();
+                if (!renderer.ready) return false;
+                this.playerModelRenderer = renderer;
+                this._syncPlayerHairAppearance();
+                if (this.playerSkinningSkeleton) {
+                    try { renderer.setSkinningSkeleton?.(this.playerSkinningSkeleton); } catch { /* ignore */ }
+                } else if (this.runtimeCharacterProfile) {
+                    try { void this._loadRuntimePlayerSkeleton(this.runtimeCharacterProfile); } catch { /* ignore */ }
+                }
+                if (this.playerSkinningAnimations) {
+                    try { renderer.setSkinningAnimationSet?.(this.playerSkinningAnimations); } catch { /* ignore */ }
+                } else if (this.runtimeCharacterProfile) {
+                    try { void this._loadRuntimePlayerAnimations(this.runtimeCharacterProfile); } catch { /* ignore */ }
+                }
+                if (this.meleeSkinningAnimations) renderer.mergeSkinningAnimationSet?.(this.meleeSkinningAnimations);
+                return true;
+            } catch (e) {
+                console.warn('Player model renderer failed to initialize:', e);
+                return false;
+            } finally {
+                if (!this.playerModelRenderer?.ready) this._playerModelRendererInitPromise = null;
+            }
+        })();
+
+        return this._playerModelRendererInitPromise;
+    }
+
+    async _ensureNpcModelRenderer() {
+        if (this.npcModelRenderer?.ready) return true;
+        if (this._npcModelRendererInitPromise) return this._npcModelRendererInitPromise;
+        if (!this.modelsInitialized || !this.runtimeCharacterProfile) return false;
+
+        this._npcModelRendererInitPromise = (async () => {
+            try {
+                if (!this.playerSkinningSkeleton) await this._loadRuntimePlayerSkeleton(this.runtimeCharacterProfile);
+                if (!this.playerSkinningAnimations) await this._loadRuntimePlayerAnimations(this.runtimeCharacterProfile);
+                const renderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
+                renderer.maxMeshLoadsInFlight = 2;
+                renderer.meshLoadOptions = {
+                    usePersistentCache: false,
+                    cacheBust: 'npc-skin-v1',
+                    requireBlendAttributes: true,
+                };
+                await renderer.init();
+                if (!renderer.ready) return false;
+                const hair = this.runtimeCharacterProfile?.appearance?.hair || { color: 0, highlight: 0 };
+                renderer.pedHairPrimary = hairColorLinear(hair.color);
+                renderer.pedHairHighlight = hairColorLinear(hair.highlight);
+                if (this.playerSkinningSkeleton) renderer.setSkinningSkeleton?.(this.playerSkinningSkeleton);
+                if (this.playerSkinningAnimations) renderer.setSkinningAnimationSet?.(this.playerSkinningAnimations);
+                if (this.meleeSkinningAnimations) renderer.mergeSkinningAnimationSet?.(this.meleeSkinningAnimations);
+                this.npcModelRenderer = renderer;
+                const combatRenderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
+                combatRenderer.maxMeshLoadsInFlight = 2;
+                combatRenderer.meshLoadOptions = {
+                    usePersistentCache: false,
+                    cacheBust: 'npc-combat-skin-v1',
+                    requireBlendAttributes: true,
+                };
+                await combatRenderer.init();
+                if (combatRenderer.ready) {
+                    combatRenderer.pedHairPrimary = renderer.pedHairPrimary;
+                    combatRenderer.pedHairHighlight = renderer.pedHairHighlight;
+                    if (this.playerSkinningSkeleton) combatRenderer.setSkinningSkeleton?.(this.playerSkinningSkeleton);
+                    if (this.playerSkinningAnimations) combatRenderer.setSkinningAnimationSet?.(this.playerSkinningAnimations);
+                    if (this.meleeSkinningAnimations) combatRenderer.mergeSkinningAnimationSet?.(this.meleeSkinningAnimations);
+                    this.npcCombatModelRenderer = combatRenderer;
+                }
+                this._syncNpcEntityMeshes(true);
+                return true;
+            } catch (error) {
+                console.warn('NPC model renderer failed to initialize:', error);
+                return false;
+            } finally {
+                if (!this.npcModelRenderer?.ready) this._npcModelRendererInitPromise = null;
+            }
+        })();
+        return this._npcModelRendererInitPromise;
+    }
+
+    async _ensureRemotePlayerRenderer() {
+        if (this.remotePlayerRenderer?.ready) return true;
+        if (this._remotePlayerRendererInitPromise) return this._remotePlayerRendererInitPromise;
+        if (!this.modelsInitialized || !this.runtimeCharacterProfile) return false;
+        this._remotePlayerRendererInitPromise = (async () => {
+            try {
+                if (!this.playerSkinningSkeleton) await this._loadRuntimePlayerSkeleton(this.runtimeCharacterProfile);
+                if (!this.playerSkinningAnimations) await this._loadRuntimePlayerAnimations(this.runtimeCharacterProfile);
+                const renderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
+                renderer.maxMeshLoadsInFlight = 2;
+                renderer.meshLoadOptions = {
+                    usePersistentCache: false,
+                    cacheBust: 'multiplayer-skin-v1',
+                    requireBlendAttributes: true,
+                };
+                await renderer.init();
+                if (!renderer.ready) return false;
+                const hair = this.runtimeCharacterProfile?.appearance?.hair || { color: 0, highlight: 0 };
+                renderer.pedHairPrimary = hairColorLinear(hair.color);
+                renderer.pedHairHighlight = hairColorLinear(hair.highlight);
+                if (this.playerSkinningSkeleton) renderer.setSkinningSkeleton?.(this.playerSkinningSkeleton);
+                if (this.playerSkinningAnimations) renderer.setSkinningAnimationSet?.(this.playerSkinningAnimations);
+                this.remotePlayerRenderer = renderer;
+                this._syncRemotePlayerMeshes(true);
+                return true;
+            } catch (error) {
+                console.warn('Remote player renderer failed to initialize:', error);
+                return false;
+            } finally {
+                if (!this.remotePlayerRenderer?.ready) this._remotePlayerRendererInitPromise = null;
+            }
+        })();
+        return this._remotePlayerRendererInitPromise;
+    }
+
+    _clearRemotePlayerMeshes() {
+        this._clearNpcRendererInstances(this.remotePlayerRenderer, this._remotePlayerActiveMeshKeys);
+        this._remotePlayers = [];
+        this._remotePlayerAnimationHashes = [];
+    }
+
+    _syncRemotePlayerMeshes(forceFullInit = false) {
+        const players = this.multiplayer?.getRemotePlayers?.() || [];
+        this._remotePlayers = players;
+        if (!players.length) {
+            this._clearRemotePlayerMeshes();
+            return;
+        }
+        if (!this.remotePlayerRenderer?.ready) {
+            void this._ensureRemotePlayerRenderer();
+            return;
+        }
+        const chosen = this._getPlayerRenderSpecsFromProfileOrUi({ preserveStored: true });
+        const visibleComponent = /^(head|hair|uppr|lowr|hand|feet|jbib)_/i;
+        this._remotePlayerAnimationHashes = (chosen.specs || [])
+            .filter((spec) => visibleComponent.test(String(spec.label || '')))
+            .map((spec) => String(spec.hash || ''))
+            .filter(Boolean);
+        if (!this._remotePlayerAnimationHashes.length) return;
+        this._setNpcRendererInstances(
+            this.remotePlayerRenderer,
+            this._remotePlayerActiveMeshKeys,
+            this._remotePlayerAnimationHashes,
+            players.slice(0, 1),
+            forceFullInit,
+        );
+    }
+
+    _createMultiplayerHud() {
+        if (!this.spawnDistrictDemo || document.getElementById('multiplayerHud')) return;
+        const hud = document.createElement('div');
+        hud.id = 'multiplayerHud';
+        hud.style.cssText = 'position:fixed;top:14px;right:14px;z-index:25;padding:7px 10px;border:1px solid rgba(255,255,255,.22);background:rgba(10,12,14,.78);color:#fff;font:600 12px/1.2 system-ui,sans-serif;pointer-events:none';
+        document.body.appendChild(hud);
+        this._multiplayerHudEl = hud;
+        this._syncMultiplayerHud();
+    }
+
+    _syncMultiplayerHud() {
+        const hud = this._multiplayerHudEl;
+        if (!hud) return;
+        const status = String(this.multiplayer?.status || 'offline');
+        const peers = this.multiplayer?.peers?.size || 0;
+        const voice = this.audioSystem?.getNetworkState?.();
+        const voiceState = voice?.voiceTalking ? 'TALKING' : voice?.voiceEnabled ? 'MIC' : 'MUTED';
+        hud.textContent = `${status === 'online' ? 'ONLINE' : status.toUpperCase()}  ${peers + 1}  ROOM ${this.multiplayer?.room || 'demo'}  ${voiceState}`;
+        hud.style.color = status === 'online' ? '#9ff0ba' : '#ffd28a';
+    }
+
+    _clearNpcEntityMeshes() {
+        this._clearNpcRendererInstances(this.npcModelRenderer, this._npcActiveMeshKeys);
+        this._clearNpcRendererInstances(this.npcCombatModelRenderer, this._npcCombatActiveMeshKeys);
+        this._npcCombatAnimationPose = null;
+        this._npcAnimatedNpcs = [];
+        this._npcAnimationHashes = [];
+    }
+
+    _clearNpcRendererInstances(renderer, activeKeys) {
+        if (!renderer?.ready) return;
+        for (const key of activeKeys) {
+            const [hash, lod = 'high'] = String(key).split(':');
+            if (hash) try { void renderer.setInstancesForArchetype(hash, lod, new Float32Array(0), 0.0); } catch { /* ignore */ }
+        }
+        activeKeys.clear();
+    }
+
+    _setNpcRendererInstances(renderer, activeKeys, hashes, npcs, forceFullInit) {
+        if (!renderer?.ready) return;
+        if (!npcs.length) {
+            this._clearNpcRendererInstances(renderer, activeKeys);
+            return;
+        }
+        const matrices = new Float32Array(npcs.length * 16);
+        const q = glMatrix.quat.create();
+        const mat = glMatrix.mat4.create();
+        for (let i = 0; i < npcs.length; i++) {
+            const npc = npcs[i];
+            const heading = Number.isFinite(Number(npc.heading)) ? Number(npc.heading) : 0.0;
+            glMatrix.quat.setAxisAngle(q, [0, 0, 1], heading + PLAYER_DRAWABLE_FORWARD_OFFSET_RAD);
+            const ragdollPitch = Number(npc.ragdollPitch) || 0.0;
+            const ragdollRoll = Number(npc.ragdollRoll) || 0.0;
+            if (Math.abs(ragdollPitch) > 1e-5) glMatrix.quat.rotateX(q, q, ragdollPitch);
+            if (Math.abs(ragdollRoll) > 1e-5) glMatrix.quat.rotateY(q, q, ragdollRoll);
+            glMatrix.mat4.fromRotationTranslation(mat, q, [
+                npc.x,
+                npc.y,
+                npc.feetZ + (Number(npc.ragdollOffsetZ) || 0.0) + (Number(npc.ragdollGroundOffsetZ) || 0.0),
+            ]);
+            matrices.set(mat, i * 16);
+        }
+        const lod = 'high';
+        const desired = new Set(hashes.map((hash) => `${hash}:${lod}`));
+        for (const oldKey of Array.from(activeKeys)) {
+            if (desired.has(oldKey)) continue;
+            const [oldHash, oldLod = lod] = oldKey.split(':');
+            try { void renderer.setInstancesForArchetype(oldHash, oldLod, new Float32Array(0), 0.0); } catch { /* ignore */ }
+            activeKeys.delete(oldKey);
+        }
+        for (const hash of hashes) {
+            const key = `${hash}:${lod}`;
+            const existing = renderer.instances?.get?.(key);
+            const hasPlaceholderMesh = !!existing?.submeshes?.has?.('__placeholder__');
+            const isWaitingForRealMesh = !existing || !existing.submeshes || existing.submeshes.size === 0;
+            if (isWaitingForRealMesh) {
+                void this.modelManager?.prefetchMeta?.(hash, { priority: 'high' });
+            }
+            const updated = !forceFullInit
+                && !hasPlaceholderMesh
+                && !isWaitingForRealMesh
+                && renderer.updateInstanceMatricesForArchetype(hash, lod, matrices, 0.0);
+            if (!updated) void renderer.setInstancesForArchetype(hash, lod, matrices, -1.0, {
+                loadPriority: 90,
+                allowPlaceholderMesh: false,
+            });
+            activeKeys.add(key);
+        }
+    }
+
+    _syncNpcEntityMeshes(forceFullInit = false) {
+        const renderer = this.npcModelRenderer;
+        const npcs = this.showNpcs && this.spawnDistrictDemo ? (this.npcSystem?.npcs || []) : [];
+        if (!renderer?.ready) {
+            if (npcs.length) void this._ensureNpcModelRenderer();
+            return;
+        }
+        if (!npcs.length) {
+            this._clearNpcEntityMeshes();
+            return;
+        }
+        const chosen = this._getPlayerRenderSpecsFromProfileOrUi({ preserveStored: true });
+        const npcVisibleComponent = /^(head|hair|uppr|lowr|hand|feet|jbib)_/i;
+        const hashes = (chosen.specs || [])
+            .filter((spec) => npcVisibleComponent.test(String(spec.label || '')))
+            .map((spec) => String(spec.hash || ''))
+            .filter(Boolean);
+        if (!hashes.length) return;
+        const combatNpcs = npcs.filter((npc) => !!this.npcSystem?.getAnimationPose?.(npc));
+        const ambientNpcs = npcs.filter((npc) => !combatNpcs.includes(npc));
+        this._npcCombatAnimationPose = combatNpcs.length ? this.npcSystem.getAnimationPose(combatNpcs[0]) : null;
+        this._npcAnimatedNpcs = combatNpcs;
+        this._npcAnimationHashes = hashes;
+        this._setNpcRendererInstances(renderer, this._npcActiveMeshKeys, hashes, ambientNpcs, forceFullInit);
+        this._setNpcRendererInstances(this.npcCombatModelRenderer, this._npcCombatActiveMeshKeys, hashes, combatNpcs.slice(0, 1), forceFullInit);
+    }
+
+    async _ensureWeaponModelRenderer() {
+        if (this.weaponModelRenderer?.ready && this.weaponModelAsset?.hash) return true;
+        if (this._weaponModelRendererInitPromise) return this._weaponModelRendererInitPromise;
+        if (!this.modelsInitialized || !this.modelManager?.manifest) return false;
+
+        this._weaponModelRendererInitPromise = (async () => {
+            try {
+                const manifest = await fetchJSON('assets/custom_weapons/glock17.json', {
+                    usePersistentCache: false,
+                    useMemoryCache: false,
+                    priority: 'high',
+                });
+                const weapon = manifest?.weapon || null;
+                const hash = String(weapon?.hash || '').trim();
+                if (!hash || !manifest?.meshes?.[hash]) return false;
+
+                this.modelManager.installManifestSubset(manifest, { source: 'custom_weapons/glock17.json' });
+                const renderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
+                renderer.maxMeshLoadsInFlight = 1;
+                renderer.meshLoadOptions = {
+                    usePersistentCache: false,
+                    cacheBust: 'fivem-glock17-v1',
+                    requireBlendAttributes: false,
+                };
+                await renderer.init();
+                if (!renderer.ready) return false;
+
+                this.weaponModelRenderer = renderer;
+                this.weaponModelAsset = { hash, lod: 'high', modelName: String(weapon?.modelName || 'w_pi_glock17_luxe') };
+                return true;
+            } catch (error) {
+                console.warn('Glock-17 model renderer failed to initialize:', error);
+                return false;
+            } finally {
+                if (!this.weaponModelRenderer?.ready) this._weaponModelRendererInitPromise = null;
+            }
+        })();
+
+        return this._weaponModelRendererInitPromise;
+    }
+
+    async _ensureVehicleModelRenderer() {
+        if (this.vehicleModelRenderer?.ready) return true;
+        if (this._vehicleModelRendererInitPromise) return this._vehicleModelRendererInitPromise;
+        if (!this.modelsInitialized || !this.modelManager?.manifest) return false;
+        const state = this.vehicleController?.getRenderState?.();
+        const hash = String(state?.hash || '').trim();
+        if (!hash) return false;
+
+        this._vehicleModelRendererInitPromise = (async () => {
+            try {
+                await this.modelManager.prefetchMeta?.(hash, { priority: 'high', force: true });
+                if (!this.modelManager.hasRealMesh?.(hash)) return false;
+                const renderer = new InstancedModelRenderer(this.gl, this.modelManager, this.textureStreamer);
+                renderer.maxMeshLoadsInFlight = 4;
+                renderer.meshLoadOptions = {
+                    usePersistentCache: false,
+                    cacheBust: 'demo-sultan-v3-exact-wheels',
+                    requireBlendAttributes: false,
+                };
+                await renderer.init();
+                if (!renderer.ready) return false;
+                this.vehicleModelRenderer = renderer;
+                return true;
+            } catch (error) {
+                console.warn('Vehicle model renderer failed to initialize:', error);
+                return false;
+            } finally {
+                if (!this.vehicleModelRenderer?.ready) this._vehicleModelRendererInitPromise = null;
+            }
+        })();
+        return this._vehicleModelRendererInitPromise;
+    }
+
+    async _loadRuntimePlayerSkeleton(profile = null) {
+        const render = profile?.render || null;
+        const relRaw = String(render?.skeleton || '').trim();
+        const wantsSkinning = !!render?.skinning && !!relRaw;
+        if (!wantsSkinning) {
+            this.playerSkinningSkeleton = null;
+            try { this.playerModelRenderer?.setSkinningSkeleton?.(null); } catch { /* ignore */ }
+            return null;
+        }
+        const rel = relRaw.replace(/^assets[\\/]/i, '').replace(/\\/g, '/').replace(/^\/+/, '');
+        const url = `assets/${rel}?live=${Date.now()}`;
+        this._runtimeCharacterSkeletonPromise = (async () => {
+            try {
+                const skeleton = await fetchJSON(url, {
+                    usePersistentCache: false,
+                    useMemoryCache: false,
+                    priority: 'high',
+                });
+                if (!skeleton || !Array.isArray(skeleton.bones)) return null;
+                this.playerSkinningSkeleton = skeleton;
+                try { this.playerModelRenderer?.setSkinningSkeleton?.(skeleton); } catch { /* ignore */ }
+                return skeleton;
+            } catch (e) {
+                console.warn('Runtime player skeleton failed to load:', e);
+                this.playerSkinningSkeleton = null;
+                try { this.playerModelRenderer?.setSkinningSkeleton?.(null); } catch { /* ignore */ }
+                return null;
+            }
+        })();
+        return this._runtimeCharacterSkeletonPromise;
+    }
+
+    async _loadRuntimePlayerAnimations(profile = null) {
+        const render = profile?.render || null;
+        const relRaw = String(render?.animations || '').trim();
+        const wantsAnimations = !!render?.skinning && !!relRaw;
+        if (!wantsAnimations) {
+            this.playerSkinningAnimations = null;
+            try { this.playerModelRenderer?.setSkinningAnimationSet?.(null); } catch { /* ignore */ }
+            return null;
+        }
+        const rel = relRaw.replace(/^assets[\\/]/i, '').replace(/\\/g, '/').replace(/^\/+/, '');
+        const url = `assets/${rel}?live=${Date.now()}`;
+        this._runtimeCharacterAnimationsPromise = (async () => {
+            try {
+                const animations = await fetchJSON(url, {
+                    usePersistentCache: false,
+                    useMemoryCache: false,
+                    priority: 'high',
+                });
+                if (!animations || !animations.clips || typeof animations.clips !== 'object') return null;
+                this.playerSkinningAnimations = animations;
+                try { this.playerModelRenderer?.setSkinningAnimationSet?.(animations); } catch { /* ignore */ }
+                return animations;
+            } catch (e) {
+                console.warn('Runtime player animations failed to load:', e);
+                this.playerSkinningAnimations = null;
+                try { this.playerModelRenderer?.setSkinningAnimationSet?.(null); } catch { /* ignore */ }
+                return null;
+            }
+        })();
+        return this._runtimeCharacterAnimationsPromise;
+    }
+
+    async _ensureWeaponCombatAnimations() {
+        if (this._weaponCombatAnimationsLoaded) return true;
+        if (this._weaponCombatAnimationsUnavailable) return false;
+        if (this._weaponCombatAnimationsPromise) return this._weaponCombatAnimationsPromise;
+        const profile = this.runtimeCharacterProfile;
+        const render = profile?.render || null;
+        const animationRel = String(render?.animations || '').trim();
+        if (!animationRel) return false;
+        const combatRel = animationRel
+            .replace(/^assets[\\/]/i, '')
+            .replace(/\\/g, '/')
+            .replace(/_animations\.json$/i, '_combat_animations.json');
+        if (!combatRel || combatRel === animationRel) return false;
+
+        this._weaponCombatAnimationsPromise = (async () => {
+            try {
+                if (!this.playerModelRenderer?.ready) {
+                    const ready = await this._ensurePlayerModelRenderer();
+                    if (!ready) return false;
+                }
+                if (!this.playerSkinningAnimations) await this._loadRuntimePlayerAnimations(profile);
+                const animations = await fetchJSON(`assets/${combatRel}?live=${Date.now()}`, {
+                    usePersistentCache: false,
+                    useMemoryCache: false,
+                    priority: 'high',
+                });
+                if (!animations?.clips || typeof animations.clips !== 'object') return false;
+                const merged = this.playerModelRenderer?.mergeSkinningAnimationSet?.(animations);
+                this._weaponCombatAnimationsLoaded = !!merged;
+                return this._weaponCombatAnimationsLoaded;
+            } catch (error) {
+                this._weaponCombatAnimationsUnavailable = true;
+                console.warn('GTA pistol combat clips failed to load:', error);
+                return false;
+            } finally {
+                this._weaponCombatAnimationsPromise = null;
+            }
+        })();
+        return this._weaponCombatAnimationsPromise;
+    }
+
+    async _ensureMeleeAnimations() {
+        if (this._meleeAnimationsLoaded) return true;
+        if (this._meleeAnimationsUnavailable) return false;
+        if (this._meleeAnimationsPromise) return this._meleeAnimationsPromise;
+        const animationRel = String(this.runtimeCharacterProfile?.render?.animations || '').trim();
+        const meleeRel = animationRel
+            .replace(/^assets[\\/]/i, '')
+            .replace(/\\/g, '/')
+            .replace(/_animations\.json$/i, '_melee_animations.json');
+        if (!animationRel || !meleeRel || meleeRel === animationRel) return false;
+        this._meleeAnimationsPromise = (async () => {
+            try {
+                if (!this.playerModelRenderer?.ready && !(await this._ensurePlayerModelRenderer())) return false;
+                if (!this.playerSkinningAnimations) await this._loadRuntimePlayerAnimations(this.runtimeCharacterProfile);
+                const animations = await fetchJSON(`assets/${meleeRel}?live=${Date.now()}`, {
+                    usePersistentCache: false,
+                    useMemoryCache: false,
+                    priority: 'high',
+                });
+                if (!animations?.clips || typeof animations.clips !== 'object') return false;
+                this.meleeSkinningAnimations = animations;
+                const playerMerged = this.playerModelRenderer?.mergeSkinningAnimationSet?.(animations);
+                this.npcModelRenderer?.mergeSkinningAnimationSet?.(animations);
+                this.npcCombatModelRenderer?.mergeSkinningAnimationSet?.(animations);
+                this._meleeAnimationsLoaded = !!playerMerged;
+                return this._meleeAnimationsLoaded;
+            } catch (error) {
+                this._meleeAnimationsUnavailable = true;
+                console.warn('GTA melee clips failed to load:', error);
+                return false;
+            } finally {
+                this._meleeAnimationsPromise = null;
+            }
+        })();
+        return this._meleeAnimationsPromise;
     }
 
     _dataToViewer(posData) {
@@ -1116,6 +2634,31 @@ export class App {
         const out = glMatrix.vec4.create();
         glMatrix.vec4.transformMat4(out, v, inv);
         return [out[0], out[1], out[2]];
+    }
+
+    _getGameplayAimDirectionData() {
+        const fallback = this._viewerDirToDataDir(this.camera?.direction || [0, 0, -1]);
+        if (!this.gameplayCamEnabled || !this.ped?.posData || !this.camera?.position) return fallback;
+
+        const cameraData = this._viewerPosToDataPos(this.camera.position);
+        const pedData = this.ped.posData;
+        const toPedX = Number(pedData[0]) - Number(cameraData[0]);
+        const toPedY = Number(pedData[1]) - Number(cameraData[1]);
+        const horizontalLength = Math.hypot(toPedX, toPedY);
+        if (!Number.isFinite(horizontalLength) || horizontalLength < 1e-5) return fallback;
+
+        // The visual orbit looks at the ped eye point. For gameplay, neutral aim
+        // must be level instead of continuing that downward camera-to-eye slope.
+        const neutralPitch = Number.isFinite(Number(this._gpAimNeutralPitch))
+            ? Number(this._gpAimNeutralPitch)
+            : Number(this._gpPitch) || 0.0;
+        const aimPitch = Math.max(-0.9, Math.min(0.9, neutralPitch - (Number(this._gpPitch) || 0.0)));
+        const horizontalScale = Math.cos(aimPitch);
+        return [
+            (toPedX / horizontalLength) * horizontalScale,
+            (toPedY / horizontalLength) * horizontalScale,
+            Math.sin(aimPitch),
+        ];
     }
 
     _orbitFollowPed(deltaX, deltaY) {
@@ -1316,28 +2859,22 @@ export class App {
         const btn = this._spawnCharacterBtn;
         if (!btn) return;
         const inChar = !!(this.player && this.player.enabled);
-        btn.textContent = inChar ? 'Exit character view (back to map)' : 'Spawn character (GTA camera)';
+        btn.textContent = inChar ? 'Exit character view (back to map)' : 'Spawn character (city)';
     }
 
     exitCharacterView() {
         // Disable player mesh instance (and clear its instance buffer so it doesn't linger).
-        const h = this.player?.hash;
-        const lod = this.player?.lod || 'high';
         if (this.player) {
+            try { this._clearPlayerEntityMeshes(); } catch { /* ignore */ }
             this.player.enabled = false;
             this.player.hash = null;
-        }
-        try {
-            if (h && this.instancedModelRenderer?.ready && this.instancedModelRenderer.setInstancesForArchetype) {
-                // Empty instance list.
-                void this.instancedModelRenderer.setInstancesForArchetype(String(h), String(lod), new Float32Array(0), 0.0);
-            }
-        } catch {
-            // ignore
+            this.player.hashes = [];
+            this.player.labels = [];
         }
 
         // Clear ped state + marker.
         this.ped = null;
+        this._resetPedMotion();
         try { this.pedRenderer?.setPositions?.([]); } catch { /* ignore */ }
 
         // Exit follow/control mode back to map view defaults.
@@ -1368,6 +2905,684 @@ export class App {
         return !!v && Number.isFinite(v[0]) && Number.isFinite(v[1]);
     }
 
+    _spawnObjToVector4(obj) {
+        if (!obj || typeof obj !== 'object') return null;
+        const v = [
+            Number(obj.x),
+            Number(obj.y),
+            Number(obj.z),
+            Number(obj.w ?? obj.heading ?? 0.0),
+        ];
+        return this._isFiniteVec3(v) ? v : null;
+    }
+
+    _getCharacterModelHashFromUi() {
+        const el = document.getElementById('characterModel');
+        let raw = String(el?.value || '').trim();
+        if (!raw) {
+            raw = DEFAULT_CHARACTER_MODEL_NAME;
+            if (el && !String(el.value || '').trim()) el.value = raw;
+        }
+        return this._hashModelToken(raw);
+    }
+
+    _hashModelToken(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+        if (/^\d+$/.test(raw)) return String((Number(raw) >>> 0));
+        return String((joaat(raw) >>> 0));
+    }
+
+    async _loadRuntimeCharacterProfile({ timeoutMs = 5_000 } = {}) {
+        if (this._runtimeCharacterLoadPromise) return this._runtimeCharacterLoadPromise;
+        const ms = Number.isFinite(Number(timeoutMs)) ? Math.max(100, Number(timeoutMs)) : 900;
+        this._runtimeCharacterLoadPromise = (async () => {
+            const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+            const timer = ac ? window.setTimeout(() => ac.abort(), ms) : null;
+            try {
+                const resp = await fetch(`assets/runtime_character.json?live=${Date.now()}`, {
+                    method: 'GET',
+                    cache: 'no-store',
+                    signal: ac?.signal,
+                });
+                if (!resp.ok) return null;
+                const data = await resp.json().catch(() => null);
+                if (!data || typeof data !== 'object') return null;
+                this.runtimeCharacterProfile = data;
+                this.runtimeCharacterBaseProfile = structuredClone(data);
+                this._applyRuntimeCharacterProfileToUi(data);
+                void this._loadRuntimeCharacterComponentCatalog();
+                this._tryApplyClothingPackPreview();
+                void this._loadRuntimePlayerSkeleton(data);
+                void this._loadRuntimePlayerAnimations(data);
+                if (this.player?.enabled) {
+                    this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+                    try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+                }
+                return data;
+            } catch (error) {
+                window.setTimeout(() => { this._runtimeCharacterLoadPromise = null; }, 0);
+                console.warn('[character] Runtime profile load failed; a later sync may retry.', error);
+                return null;
+            } finally {
+                if (timer !== null) window.clearTimeout(timer);
+            }
+        })();
+        return this._runtimeCharacterLoadPromise;
+    }
+
+    async _loadRuntimeCharacterOptions({ timeoutMs = 900 } = {}) {
+        const ms = Number.isFinite(Number(timeoutMs)) ? Math.max(100, Number(timeoutMs)) : 900;
+        const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = ac ? window.setTimeout(() => ac.abort(), ms) : null;
+        try {
+            const resp = await fetch(`assets/runtime_characters.json?live=${Date.now()}`, {
+                method: 'GET',
+                cache: 'no-store',
+                signal: ac?.signal,
+            });
+            if (!resp.ok) return [];
+            const data = await resp.json().catch(() => null);
+            const chars = Array.isArray(data?.characters) ? data.characters.filter((x) => x && typeof x === 'object') : [];
+            this.runtimeCharacterOptions = chars;
+            this._populateRuntimeAppearanceSelect();
+            return chars;
+        } catch {
+            return [];
+        } finally {
+            if (timer !== null) window.clearTimeout(timer);
+        }
+    }
+
+    async _loadRuntimeCharacterComponentCatalog() {
+        try {
+            const [response, customResponse, clothingPackResponse] = await Promise.all([
+                fetch(`assets/character_component_catalog.json?live=${Date.now()}`, { cache: 'no-store' }),
+                fetch(`assets/custom_clothing/nx_chains.json?live=${Date.now()}`, { cache: 'no-store' }),
+                fetch(`assets/custom_clothing/clothingpack5m.json?live=${Date.now()}`, { cache: 'no-store' }),
+            ]);
+            if (!response.ok) return null;
+            const catalog = await response.json();
+            const customPayloads = [
+                customResponse.ok ? await customResponse.json() : null,
+                clothingPackResponse.ok ? await clothingPackResponse.json() : null,
+            ].filter(Boolean);
+            for (const custom of customPayloads) {
+              if (custom?.models && custom?.meshes) {
+                for (const [modelName, components] of Object.entries(custom.models)) {
+                    const targetModel = catalog.models?.[modelName];
+                    if (!targetModel || !components || typeof components !== 'object') continue;
+                    for (const [componentId, variants] of Object.entries(components)) {
+                        if (!Array.isArray(variants)) continue;
+                        targetModel[componentId] = [
+                            ...(Array.isArray(targetModel[componentId]) ? targetModel[componentId] : []),
+                            ...variants,
+                        ];
+                    }
+                }
+                this.runtimeCustomClothingManifest = custom;
+                if (this.modelManager?.manifest) {
+                    this.modelManager.installManifestSubset(custom, { source: `custom_clothing/${custom.collection || 'custom'}.json` });
+                }
+              }
+            }
+            this.runtimeCharacterComponentCatalog = catalog && typeof catalog === 'object' ? catalog : null;
+            this._renderRuntimeAppearanceComponents();
+            this._tryApplyClothingPackPreview();
+            return this.runtimeCharacterComponentCatalog;
+        } catch {
+            return null;
+        }
+    }
+
+    _tryApplyClothingPackPreview() {
+        if (!new URLSearchParams(window.location.search).has('appearancePreview')) return;
+        if (!this.runtimeCharacterProfile || !this.runtimeCharacterComponentCatalog || this._clothingPackPreviewApplied) return;
+        let preview = null;
+        try { preview = JSON.parse(localStorage.getItem('webglgta.clothingpack5m.preview.v1') || 'null'); } catch { return; }
+        if (!preview?.id) return;
+        const modelName = preview.sex === 'female' ? 'mp_f_freemode_01' : 'mp_m_freemode_01';
+        if (this.runtimeCharacterProfile.modelName !== modelName) {
+            void this._switchRuntimeCharacterSex(preview.sex).then(() => this._tryApplyClothingPackPreview());
+            return;
+        }
+        const variants = this.runtimeCharacterComponentCatalog.models?.[modelName]?.[String(preview.componentId)] || [];
+        const variant = variants.find((entry) => entry.itemId === preview.id);
+        if (!variant) return;
+        this._clothingPackPreviewApplied = true;
+        this._setRuntimeCharacterComponent(Number(preview.componentId), variant, Number(preview.texture ?? variant.textures?.[0]) || 0);
+        this._setGtaThirdPersonRigForPed({ distanceData: 3.1, heightData: 0.75, sideData: 0 });
+        if (!new URLSearchParams(window.location.search).has('catalogPreview')) {
+            window.setTimeout(() => document.getElementById('openCharacterCreator')?.click(), 250);
+        }
+    }
+
+    _applyRuntimeCharacterProfileToUi(profile) {
+        if (!profile || typeof profile !== 'object') return;
+        const modelName = String(profile.modelName || '').trim();
+        const el = document.getElementById('characterModel');
+        if (el && modelName) {
+            const cur = String(el.value || '').trim();
+            if (!cur || cur === DEFAULT_CHARACTER_MODEL_NAME || cur === 'player_zero' || modelName.startsWith('mp_')) {
+                el.value = modelName;
+            }
+        }
+        this._syncRuntimeCharacterSexControls();
+        this._renderRuntimeAppearanceComponents();
+        this._renderCompleteAppearanceControls();
+        this._syncPlayerHairAppearance();
+    }
+
+    _syncRuntimeCharacterSexControls() {
+        const modelName = String(this.runtimeCharacterProfile?.modelName || '');
+        document.querySelectorAll('[data-character-sex]').forEach((button) => {
+            const selected = modelName === FREEMODE_CHARACTER_MODELS[button.dataset.characterSex]?.modelName;
+            button.setAttribute('aria-pressed', String(selected));
+        });
+    }
+
+    async _switchRuntimeCharacterSex(sex) {
+        const target = FREEMODE_CHARACTER_MODELS[String(sex || '').toLowerCase()];
+        const catalog = this.runtimeCharacterComponentCatalog?.models?.[target?.modelName];
+        if (!target || !catalog) return false;
+        if (this.runtimeCharacterProfile?.modelName === target.modelName) return true;
+
+        const previous = this._ensureCompleteAppearanceProfile() || {};
+        const previousComponents = new Map((previous.components || []).map((component) => [
+            Number(component.componentId ?? component.component_id ?? component.id), component,
+        ]));
+        const components = Object.keys(catalog).map(Number).sort((a, b) => a - b).map((componentId) => {
+            const variants = Array.isArray(catalog[String(componentId)]) ? catalog[String(componentId)] : [];
+            const old = previousComponents.get(componentId);
+            const variant = (!old?.collection
+                ? variants.find((item) => !item.collection && Number(item.drawable) === Number(old?.drawable))
+                : null) || variants.find((item) => !item.collection) || variants[0];
+            if (!variant) return null;
+            const textures = Array.isArray(variant.textures) && variant.textures.length ? variant.textures : [0];
+            const texture = textures.includes(Number(old?.texture)) ? Number(old.texture) : Number(textures[0]);
+            return {
+                componentId,
+                drawable: Number(variant.drawable) || 0,
+                texture: Number.isFinite(texture) ? texture : 0,
+                palette: Number(old?.palette) || 0,
+                assetName: String(variant.assetName || ''),
+                assetHash: String(variant.textureAssets?.[String(texture)] || variant.hash || ''),
+                drawableName: String(variant.assetName || ''),
+                collection: variant.collection ? String(variant.collection) : null,
+                itemId: variant.itemId ? String(variant.itemId) : null,
+                variantKey: variant.variantKey ? String(variant.variantKey) : null,
+            };
+        }).filter(Boolean);
+
+        const profile = structuredClone(previous);
+        profile.modelName = target.modelName;
+        profile.modelHash = target.modelHash;
+        profile.components = components;
+        profile.render = {
+            ...(profile.render || {}),
+            mode: 'freemode_components',
+            modelNames: components.map((component) => component.assetHash).filter(Boolean),
+            fallbackModelName: DEFAULT_CHARACTER_MODEL_NAME,
+            meshComposition: 'skinned_drawable_components',
+            skinning: true,
+            skeleton: target.skeleton,
+            animations: target.animations,
+        };
+        this.runtimeCharacterProfile = profile;
+        this.runtimeCharacterSelectedIndex = -1;
+        this.runtimeCharacterDisabledComponentIds = new Set();
+        const selection = document.getElementById('runtimeAppearanceSelect');
+        if (selection) selection.value = '';
+        const modelInput = document.getElementById('characterModel');
+        if (modelInput) modelInput.value = target.modelName;
+        this._applyRuntimeCharacterProfileToUi(profile);
+        this._applyPlayerRenderTargetsFromProfileOrUi();
+        await Promise.all([this._loadRuntimePlayerSkeleton(profile), this._loadRuntimePlayerAnimations(profile)]);
+        if (this.player?.enabled) this._syncPlayerEntityMesh(true);
+        this._saveRuntimeAppearanceDraft();
+        return true;
+    }
+
+    _runtimeAppearanceOptionLabel(profile, index) {
+        const row = profile?.row || {};
+        const model = String(profile?.modelName || 'unknown');
+        const cid = String(row.citizenid || '').trim();
+        const active = String(row.active || '').trim();
+        const rowId = String(row.rowId || row.updated || '').trim();
+        const bits = [`${index + 1}`, model];
+        if (cid) bits.push(cid);
+        if (active) bits.push(`active=${active}`);
+        if (rowId) bits.push(rowId);
+        return bits.join(' | ');
+    }
+
+    _populateRuntimeAppearanceSelect() {
+        const el = document.getElementById('runtimeAppearanceSelect');
+        if (!el) return;
+        const prev = String(el.value || '');
+        while (el.options.length > 1) el.remove(1);
+        const chars = Array.isArray(this.runtimeCharacterOptions) ? this.runtimeCharacterOptions : [];
+        for (let i = 0; i < chars.length; i++) {
+            const opt = document.createElement('option');
+            opt.value = String(i);
+            opt.textContent = this._runtimeAppearanceOptionLabel(chars[i], i);
+            el.appendChild(opt);
+        }
+        if (this.runtimeCharacterSelectedIndex >= 0 && this.runtimeCharacterSelectedIndex < chars.length) {
+            el.value = String(this.runtimeCharacterSelectedIndex);
+        } else if (prev && chars[Number(prev)]) {
+            el.value = prev;
+        } else {
+            el.value = '';
+        }
+    }
+
+    _activeRuntimeCharacterComponents(profile = this.runtimeCharacterProfile) {
+        const disabled = this.runtimeCharacterDisabledComponentIds instanceof Set
+            ? this.runtimeCharacterDisabledComponentIds
+            : new Set();
+        return (Array.isArray(profile?.components) ? profile.components : [])
+            .filter((c) => c && typeof c === 'object')
+            .filter((c) => {
+                const id = Number(c.componentId ?? c.component_id ?? c.id);
+                return !Number.isFinite(id) || !disabled.has(id);
+            });
+    }
+
+    _profileWithActiveComponents(profile = this.runtimeCharacterProfile) {
+        if (!profile || typeof profile !== 'object') return profile;
+        const components = this._activeRuntimeCharacterComponents(profile);
+        const names = components.map((c) => String(c.assetHash || c.assetName || '').trim()).filter(Boolean);
+        const render = { ...(profile.render || {}) };
+        if (String(render.mode || '') === 'freemode_components' || names.length > 1) {
+            render.modelNames = names;
+        }
+        return { ...profile, components, render };
+    }
+
+    _renderRuntimeAppearanceComponents() {
+        const roots = [
+            document.getElementById('runtimeAppearanceComponents'),
+            document.getElementById('characterCreatorComponents'),
+        ].filter(Boolean);
+        if (!roots.length) return;
+        const profile = this.runtimeCharacterProfile || null;
+        const components = Array.isArray(profile?.components) ? profile.components : [];
+        if (!components.length) {
+            for (const root of roots) root.textContent = 'No saved freemode components loaded.';
+            return;
+        }
+        const disabled = this.runtimeCharacterDisabledComponentIds instanceof Set
+            ? this.runtimeCharacterDisabledComponentIds
+            : new Set();
+        for (const root of roots) root.replaceChildren();
+        for (const c of components) {
+            if (!c || typeof c !== 'object') continue;
+            const id = Number(c.componentId ?? c.component_id ?? c.id);
+            const row = document.createElement('div');
+            row.style.display = 'grid';
+            row.style.gridTemplateColumns = '22px minmax(76px, 1fr) minmax(88px, 1.25fr) 58px';
+            row.style.gap = '4px';
+            row.style.alignItems = 'center';
+            row.style.marginTop = '5px';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = !(Number.isFinite(id) && disabled.has(id));
+            cb.addEventListener('change', () => {
+                if (Number.isFinite(id)) {
+                    if (cb.checked) disabled.delete(id);
+                    else disabled.add(id);
+                    this.runtimeCharacterDisabledComponentIds = disabled;
+                }
+                this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+                if (this.player?.enabled) this._syncPlayerEntityMesh(true);
+            });
+            const name = String(c.assetName || '').trim() || `component_${Number.isFinite(id) ? id : '?'}`;
+            const draw = Number(c.drawable ?? c.drawable_id ?? c.drawableId);
+            const tex = Number(c.texture ?? c.texture_id ?? c.textureId);
+            const model = String(profile?.modelName || 'mp_m_freemode_01');
+            const variants = this.runtimeCharacterComponentCatalog?.models?.[model]?.[String(id)] || [];
+            const title = document.createElement('span');
+            title.textContent = String(variants[0]?.label || name.split('_')[0] || `Slot ${id}`);
+            cb.setAttribute('aria-label', `Show ${title.textContent}`);
+
+            const drawableSelect = document.createElement('select');
+            drawableSelect.title = `${title.textContent} drawable`;
+            drawableSelect.setAttribute('aria-label', `${title.textContent} drawable`);
+            const available = variants.length ? variants : [{ drawable: draw, assetName: name, textures: [tex] }];
+            const optionKey = (variant) => String(variant?.variantKey || `base:${variant?.drawable}`);
+            for (const variant of available) {
+                const option = document.createElement('option');
+                option.value = optionKey(variant);
+                option.textContent = variant.collection
+                    ? `Chain: ${variant.label || variant.itemId || variant.assetName}`
+                    : `${variant.drawable}: ${variant.assetName}`;
+                drawableSelect.appendChild(option);
+            }
+            const selectedVariant = c.variantKey
+                ? available.find((variant) => variant.variantKey === c.variantKey)
+                : available.find((variant) => !variant.collection && Number(variant.drawable) === draw);
+            drawableSelect.value = optionKey(selectedVariant || available[0]);
+
+            const textureSelect = document.createElement('select');
+            textureSelect.title = `${title.textContent} texture`;
+            textureSelect.setAttribute('aria-label', `${title.textContent} texture`);
+            const fillTextures = (variant) => {
+                textureSelect.replaceChildren();
+                const textures = Array.isArray(variant?.textures) && variant.textures.length ? variant.textures : [tex];
+                for (const texture of textures) {
+                    const option = document.createElement('option');
+                    option.value = String(texture);
+                    option.textContent = `T${texture}`;
+                    textureSelect.appendChild(option);
+                }
+                textureSelect.value = String(tex);
+            };
+            fillTextures(selectedVariant || available[0]);
+
+            drawableSelect.addEventListener('change', () => {
+                const variant = available.find((v) => optionKey(v) === drawableSelect.value);
+                if (!variant) return;
+                fillTextures(variant);
+                this._setRuntimeCharacterComponent(id, variant, Number(textureSelect.value));
+            });
+            textureSelect.addEventListener('change', () => {
+                const variant = available.find((v) => optionKey(v) === drawableSelect.value);
+                if (variant) this._setRuntimeCharacterComponent(id, variant, Number(textureSelect.value));
+            });
+
+            row.append(cb, title, drawableSelect, textureSelect);
+            for (const root of roots) root.appendChild(root === roots[0] ? row : row.cloneNode(true));
+        }
+        // Cloned creator rows need their own event handlers; rendering once per
+        // destination keeps the compact panel and dialog synchronized.
+        if (roots.length > 1 && roots[1].children.length) {
+            const compact = roots[0];
+            const clones = Array.from(compact.children).map((node) => {
+                const clone = node.cloneNode(true);
+                const sourceControls = node.querySelectorAll('input,select');
+                const cloneControls = clone.querySelectorAll('input,select');
+                cloneControls.forEach((control, index) => {
+                    const source = sourceControls[index];
+                    if (!source) return;
+                    if (control.type === 'checkbox') control.checked = source.checked;
+                    else control.value = source.value;
+                });
+                return clone;
+            });
+            roots[1].replaceChildren(...clones);
+            for (let i = 0; i < roots[1].children.length; i++) {
+                const sourceRow = compact.children[i];
+                const targetRow = roots[1].children[i];
+                const sourceControls = sourceRow.querySelectorAll('input,select');
+                const targetControls = targetRow.querySelectorAll('input,select');
+                targetControls.forEach((control, index) => {
+                    control.addEventListener('change', () => {
+                        const source = sourceControls[index];
+                        if (!source) return;
+                        if (control.type === 'checkbox') source.checked = control.checked;
+                        else source.value = control.value;
+                        source.dispatchEvent(new Event('change'));
+                        this._renderRuntimeAppearanceComponents();
+                    });
+                });
+            }
+        }
+    }
+
+    _setRuntimeCharacterComponent(componentId, variant, texture) {
+        const profile = this.runtimeCharacterProfile;
+        if (!profile || !Array.isArray(profile.components)) return;
+        const component = profile.components.find((c) => Number(c.componentId ?? c.component_id ?? c.id) === Number(componentId));
+        if (!component) return;
+        component.componentId = Number(componentId);
+        component.drawable = Number(variant.drawable) || 0;
+        component.texture = Number.isFinite(Number(texture)) ? Number(texture) : 0;
+        component.palette = Number(component.palette) || 0;
+        component.assetName = String(variant.assetName || component.assetName || '');
+        component.assetHash = String(variant.textureAssets?.[String(component.texture)] || variant.hash || '');
+        component.drawableName = component.assetName;
+        component.collection = variant.collection ? String(variant.collection) : null;
+        component.itemId = variant.itemId ? String(variant.itemId) : null;
+        component.variantKey = variant.variantKey ? String(variant.variantKey) : null;
+        this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+        if (this.player?.enabled) this._syncPlayerEntityMesh(true);
+        try { localStorage.setItem('webglgta.characterAppearanceDraft', JSON.stringify(this._getIlleniumAppearancePayload())); } catch { /* ignore */ }
+    }
+
+    _getIlleniumAppearancePayload() {
+        const profile = this.runtimeCharacterProfile || {};
+        return {
+            model: String(profile.modelName || ''),
+            components: (profile.components || []).map((c) => ({
+                component_id: Number(c.componentId ?? c.component_id ?? c.id),
+                drawable: Number(c.drawable ?? 0),
+                texture: Number(c.texture ?? 0),
+            })),
+            props: Array.isArray(profile.props) ? profile.props : [],
+            hair: profile.appearance?.hair || { color: 0, highlight: 0 },
+            headBlend: profile.headBlend || profile.appearance?.headBlend || null,
+            faceFeatures: profile.faceFeatures || profile.appearance?.faceFeatures || {},
+            headOverlays: profile.headOverlays || profile.appearance?.headOverlays || {},
+            tattoos: Array.isArray(profile.tattoos) ? profile.tattoos : [],
+        };
+    }
+
+    _ensureCompleteAppearanceProfile() {
+        const profile = this.runtimeCharacterProfile;
+        if (!profile) return null;
+        profile.appearance ||= {};
+        profile.appearance.hair ||= { color: 0, highlight: 0 };
+        profile.headBlend ||= { shapeFirst: 0, shapeSecond: 0, shapeThird: 0, skinFirst: 0, skinSecond: 0, skinThird: 0, shapeMix: 0.5, skinMix: 0.5, thirdMix: 0 };
+        profile.faceFeatures ||= {};
+        profile.headOverlays ||= {};
+        profile.props ||= [0, 1, 2, 6, 7].map((propId) => ({ propId, drawable: -1, texture: 0 }));
+        profile.tattoos ||= [];
+        return profile;
+    }
+
+    _renderCompleteAppearanceControls() {
+        const profile = this._ensureCompleteAppearanceProfile();
+        if (!profile) return;
+        const makeNumber = (root, label, value, min, max, step, onChange) => {
+            if (!root) return;
+            const row = document.createElement('label');
+            row.className = 'appearance-field';
+            const title = document.createElement('span'); title.textContent = label;
+            const input = document.createElement('input'); input.type = 'range'; input.min = min; input.max = max; input.step = step; input.value = value;
+            const number = document.createElement('input'); number.type = 'number'; number.min = min; number.max = max; number.step = step; number.value = value;
+            const apply = (next) => { input.value = next; number.value = next; onChange(Number(next)); this._saveRuntimeAppearanceDraft(); };
+            input.addEventListener('input', () => apply(input.value));
+            number.addEventListener('change', () => apply(number.value));
+            row.append(title, input, number); root.appendChild(row);
+        };
+        const heritage = document.getElementById('characterCreatorHeritage');
+        heritage?.replaceChildren();
+        for (const [key, label, min, max, step] of [
+            ['shapeFirst', 'Mother shape', 0, 45, 1], ['shapeSecond', 'Father shape', 0, 45, 1],
+            ['skinFirst', 'Mother skin', 0, 45, 1], ['skinSecond', 'Father skin', 0, 45, 1],
+            ['shapeMix', 'Shape mix', 0, 1, 0.01], ['skinMix', 'Skin mix', 0, 1, 0.01],
+        ]) makeNumber(heritage, label, profile.headBlend[key] ?? 0, min, max, step, (v) => { profile.headBlend[key] = v; });
+
+        const face = document.getElementById('characterCreatorFace');
+        face?.replaceChildren();
+        const faceNames = ['Nose width','Nose peak','Nose length','Nose bone','Nose tip','Nose twist','Brow height','Brow depth','Cheekbone height','Cheekbone width','Cheek width','Eye opening','Lip thickness','Jaw width','Jaw shape','Chin height','Chin depth','Chin width','Chin indent','Neck width'];
+        faceNames.forEach((label, index) => makeNumber(face, label, profile.faceFeatures[index] ?? 0, -1, 1, 0.01, (v) => { profile.faceFeatures[index] = v; }));
+
+        const overlays = document.getElementById('characterCreatorOverlays');
+        overlays?.replaceChildren();
+        const overlayNames = ['Blemishes','Facial hair','Eyebrows','Ageing','Makeup','Blush','Complexion','Sun damage','Lipstick','Moles/freckles','Chest hair','Body blemishes'];
+        overlayNames.forEach((label, index) => makeNumber(overlays, label, profile.headOverlays[index]?.value ?? -1, -1, 63, 1, (v) => { profile.headOverlays[index] = { ...(profile.headOverlays[index] || {}), value: v, opacity: profile.headOverlays[index]?.opacity ?? 1 }; }));
+        makeNumber(overlays, 'Hair color', profile.appearance.hair.color ?? 0, 0, 63, 1, (v) => { profile.appearance.hair.color = v; this._syncPlayerHairAppearance(); });
+        makeNumber(overlays, 'Hair highlight', profile.appearance.hair.highlight ?? 0, 0, 63, 1, (v) => { profile.appearance.hair.highlight = v; this._syncPlayerHairAppearance(); });
+
+        const props = document.getElementById('characterCreatorProps');
+        props?.replaceChildren();
+        const propNames = {0:'Hat',1:'Glasses',2:'Ears',6:'Watch',7:'Bracelet'};
+        profile.props.forEach((prop) => makeNumber(props, propNames[prop.propId] || `Prop ${prop.propId}`, prop.drawable ?? -1, -1, 255, 1, (v) => { prop.drawable = v; }));
+    }
+
+    _saveRuntimeAppearanceDraft() {
+        try { localStorage.setItem('webglgta.characterAppearanceDraft', JSON.stringify(this._getIlleniumAppearancePayload())); } catch { /* ignore */ }
+    }
+
+    _syncPlayerHairAppearance() {
+        const renderer = this.playerModelRenderer;
+        if (!renderer) return;
+        const hair = this.runtimeCharacterProfile?.appearance?.hair || { color: 0, highlight: 0 };
+        renderer.pedHairPrimary = hairColorLinear(hair.color);
+        renderer.pedHairHighlight = hairColorLinear(hair.highlight);
+    }
+
+    _getPlayerRenderSpecsFromProfileOrUi({ preserveStored = false } = {}) {
+        const profile = this._profileWithActiveComponents(this.runtimeCharacterProfile || null);
+        const render = profile?.render || null;
+        const names = Array.isArray(render?.modelNames)
+            ? render.modelNames.map((x) => String(x || '').trim()).filter(Boolean)
+            : [];
+        if (names.length) {
+            const mode = String(render?.mode || (names.length > 1 ? 'composite' : 'single'));
+            const isComposite = names.length > 1 || mode === 'freemode_components';
+            return {
+                specs: names.map((name) => ({
+                    hash: /^\d+$/.test(name) ? String(Number(name) >>> 0) : this._hashModelToken(name),
+                    label: name,
+                })).filter((s) => !!s.hash),
+                mode,
+                requireRenderableCount: isComposite ? names.length : 1,
+            };
+        }
+
+        if (preserveStored && Array.isArray(this.player?.hashes) && this.player.hashes.length) {
+            return {
+                specs: this.player.hashes.map((h) => ({ hash: String(h), label: String(h) })),
+                mode: this.player?.renderMode || 'single',
+                requireRenderableCount: 1,
+            };
+        }
+
+        const h = this._getCharacterModelHashFromUi();
+        return {
+            specs: h ? [{ hash: h, label: String(document.getElementById('characterModel')?.value || h) }] : [],
+            mode: 'single',
+            requireRenderableCount: 1,
+        };
+    }
+
+    _applyPlayerRenderTargetsFromProfileOrUi({ preserveStored = false } = {}) {
+        if (!this.player) return [];
+        const chosen = this._getPlayerRenderSpecsFromProfileOrUi({ preserveStored });
+        const specs = chosen.specs || [];
+        this.player.hashes = specs.map((s) => String(s.hash)).filter(Boolean);
+        this.player.labels = specs.map((s) => String(s.label || s.hash));
+        this.player.hash = this.player.hashes[0] || String((joaat(DEFAULT_CHARACTER_MODEL_NAME) >>> 0));
+        this.player.renderMode = String(chosen.mode || (this.player.hashes.length > 1 ? 'composite' : 'single'));
+        this.player.requireRenderableCount = Math.max(1, Number(chosen.requireRenderableCount) || 1);
+        for (const h of this.player.hashes) this._queuePlayerModelMetaRefresh(h);
+        return this.player.hashes;
+    }
+
+    _clearPlayerEntityMeshes() {
+        if (!this.player || !this.playerModelRenderer?.ready || !this.playerModelRenderer.setInstancesForArchetype) return;
+        const keys = this.player._activeMeshKeys instanceof Set
+            ? Array.from(this.player._activeMeshKeys)
+            : [];
+        const lod = String(this.player.lod || 'high');
+        for (const key of keys) {
+            const h = String(key).split(':')[0];
+            if (!h) continue;
+            try { void this.playerModelRenderer.setInstancesForArchetype(h, lod, new Float32Array(0), 0.0); } catch { /* ignore */ }
+        }
+        if (this.player._activeMeshKeys instanceof Set) this.player._activeMeshKeys.clear();
+    }
+
+    _queuePlayerModelMetaRefresh(h) {
+        if (!h || !this.modelManager?.prefetchMeta) return;
+        try {
+            const p = this.modelManager.prefetchMeta(h, { priority: 'high', force: true });
+            if (p && typeof p.then === 'function') {
+                void p.then(() => {
+                    try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+                    try { this.playerModelRenderer?.pumpMeshLoadsOnce?.(); } catch { /* ignore */ }
+                });
+            }
+        } catch {
+            // ignore
+        }
+    }
+
+    _applyRuntimeSpawn(result) {
+        const spawn = result?.spawn || null;
+        if (!spawn || typeof spawn !== 'object') return false;
+        const ped = this._spawnObjToVector4(spawn.ped);
+        if (!ped || !this._isFiniteVec2(ped)) return false;
+        const cam = this._spawnObjToVector4(spawn.cam);
+        this._runtimeYbnAlignment = Number.isFinite(Number(ped[2]))
+            ? this.collisionWorld?.alignYbnToKnownSurface?.(ped[0], ped[1], ped[2])
+            : null;
+        const rawHeightEnvelopeZ = this.terrainRenderer?.getHeightAtXY?.(ped[0], ped[1]);
+        const heightVisualOffset = Number.isFinite(Number(rawHeightEnvelopeZ)) && Number.isFinite(Number(ped[2]))
+            ? Number(ped[2]) - Number(rawHeightEnvelopeZ)
+            : 0.0;
+        this.terrainRenderer?.setVisualZOffset?.(heightVisualOffset);
+        this._terrainDebugVisualOffset = heightVisualOffset;
+
+        if (cam && this._isFiniteVec3(cam)) {
+            this.applyPedAndCameraFromConfig(ped, cam, { preservePedZ: true });
+        } else {
+            this.spawnPedAt([ped[0], ped[1], ped[2] + this.pedEyeHeightData], { groundSource: 'runtime' });
+            this._setGtaThirdPersonRigForPed({ distanceData: 6.0, heightData: 1.7, sideData: 0.6 });
+        }
+
+        // Keep manual controls truthful after a server-resolved spawn. Previously
+        // they retained a legacy fallback position even when the player was placed
+        // at the active FiveM location.
+        try {
+            const pedInput = document.getElementById('pedCoords');
+            if (pedInput) pedInput.value = `vector4(${ped[0].toFixed(4)}, ${ped[1].toFixed(4)}, ${ped[2].toFixed(4)}, ${ped[3].toFixed(4)})`;
+            const camInput = document.getElementById('camCoords');
+            if (camInput && cam) camInput.value = `vector4(${cam[0].toFixed(4)}, ${cam[1].toFixed(4)}, ${cam[2].toFixed(4)}, ${cam[3].toFixed(4)})`;
+        } catch {
+            // ignore UI-only update
+        }
+
+        this.player.enabled = true;
+        this.player.lod = 'high';
+        this.player.headingRad = glMatrix.glMatrix.toRadian(Number(ped[3]) || 0.0);
+        this.player._lastMoveDirData = [0, 0, 0];
+        this.player.animPhase = 0.0;
+        this.player.animMove01 = 0.0;
+        this.player.animSpeed = 0.0;
+        this.player.animGait = 'idle';
+        this.player.handsUp = false;
+        this.followPed = true;
+        this.controlPed = true;
+        this._followPedYSmoothed = null;
+        this._applyPlayerRenderTargetsFromProfileOrUi();
+        try { this._initGameplayCameraFromCurrentPose(); } catch { /* ignore */ }
+        try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+
+        try {
+            const follow = document.getElementById('followPed');
+            if (follow) follow.checked = true;
+            const control = document.getElementById('controlPed');
+            if (control) control.checked = true;
+        } catch {
+            // ignore
+        }
+
+        this._runtimeSpawnInfo = {
+            kind: String(spawn.kind || 'unknown'),
+            source: String(spawn.source || ''),
+            ped: [ped[0], ped[1], ped[2], ped[3]],
+            diagnostics: result?.diagnostics || null,
+        };
+        this._setSpawnCharacterButtonLabel();
+        const sourceText = this._runtimeSpawnInfo.source ? ` (${this._runtimeSpawnInfo.source})` : '';
+        this._setBootStatus(`Spawn source: ${this._runtimeSpawnInfo.kind}${sourceText}`);
+        return true;
+    }
+
     _spawnPedCamFromUiOrFallback() {
         const ped = this._parseVector4(document.getElementById('pedCoords')?.value);
         const cam = this._parseVector4(document.getElementById('camCoords')?.value);
@@ -1380,10 +3595,11 @@ export class App {
         return true;
     }
 
-    spawnPedAt(posDataXYZ) {
-        const x = posDataXYZ[0];
-        const y = posDataXYZ[1];
-        const z = posDataXYZ[2];
+    spawnPedAt(posDataXYZ, { groundSource = null } = {}) {
+        const constrained = this._clampDataPositionToSpawnDistrict(posDataXYZ);
+        const x = constrained[0];
+        const y = constrained[1];
+        const z = constrained[2];
         const posData = [x, y, z];
         const posView = this._dataToViewer(posData);
 
@@ -1392,6 +3608,8 @@ export class App {
         glMatrix.vec3.subtract(camOffset, this.camera.position, this.camera.target);
 
         this.ped = { posData, posView, camOffset: [camOffset[0], camOffset[1], camOffset[2]] };
+        if (groundSource) this._pedGroundSource = String(groundSource);
+        this._resetPedMotion();
         this.pedRenderer.setPositions([posData]);
     }
 
@@ -1455,9 +3673,83 @@ export class App {
         return x >= minX && x <= maxX && y >= minY && y <= maxY;
     }
 
+    _getSpawnDistrictDemoGroundZAtXY(x, y) {
+        if (!this.spawnDistrictDemo) return null;
+        const nx = Number(x);
+        const ny = Number(y);
+        if (![nx, ny].every(Number.isFinite)) return null;
+        const b = this.spawnDistrictBounds;
+        if (b && (nx < b.minX || nx > b.maxX || ny < b.minY || ny > b.maxY)) return null;
+
+        const desc = this._spawnDistrictDescriptor || {};
+        const sp = desc.spawn;
+        const spawnX = Number(sp?.x);
+        const spawnY = Number(sp?.y);
+        // A configured FiveM profile stores a ped root coordinate, not a terrain
+        // sample. Never use it to pull arbitrary player positions onto a floor.
+        const profileSpawn = sp?.source === 'configured_fivem_profile';
+        const spawnGroundZ = profileSpawn ? NaN : Number(sp?.groundZ ?? sp?.z);
+        if ([spawnX, spawnY, spawnGroundZ].every(Number.isFinite) && Math.hypot(nx - spawnX, ny - spawnY) <= 5.0) {
+            return spawnGroundZ;
+        }
+        return null;
+    }
+
     _chooseCitySpawn() {
+        if (this.spawnDistrictDemo) {
+            const sp = this._spawnDistrictDescriptor?.spawn;
+            const x = Number(sp?.x);
+            const y = Number(sp?.y);
+            // FiveM persists the player root location. It is already the correct
+            // street/interior elevation, so use it exactly once with the viewer's
+            // eye-point convention. `groundZ` is accepted only for descriptors
+            // written before this field was named correctly.
+            const profileSpawn = sp?.source === 'configured_fivem_profile';
+            const pedZ = Number(sp?.pedZ ?? (profileSpawn ? sp?.groundZ : NaN));
+            if ([x, y, pedZ].every(Number.isFinite)) {
+                return {
+                    x,
+                    y,
+                    z: pedZ + this.pedEyeHeightData,
+                    groundSource: 'runtime',
+                    spawnKind: 'configured_fivem_profile',
+                    spawnSource: String(sp?.source || 'assets/demo/spawn_district.json'),
+                    spawnPedZ: pedZ,
+                };
+            }
+            const groundZ = this._getSpawnDistrictDemoGroundZAtXY(x, y);
+            if ([x, y, groundZ].every(Number.isFinite)) {
+                return {
+                    x,
+                    y,
+                    z: groundZ + this.pedEyeHeightData,
+                    groundSource: 'demo',
+                    spawnKind: 'configured_fivem_profile',
+                    spawnSource: String(sp?.source || 'assets/demo/spawn_district.json'),
+                    spawnGroundZ: groundZ,
+                };
+            }
+        }
+
         // A handful of known “Los Santos-ish” coordinates in GTA data space.
         // We pick the first candidate that’s within terrain bounds and has a sane ground height.
+        // Match the boot fallback when the live resolver is slow or unavailable.
+        // The bundled snapshot is generated from the same FiveM profile and is a
+        // better default than a generic terrain coordinate.
+        const bundled = this._bundledRuntimeSpawn;
+        const bundledPed = this._spawnObjToVector4(bundled?.spawn?.ped);
+        if (bundledPed && this._isFiniteVec2(bundledPed) && Number.isFinite(Number(bundledPed[2]))) {
+            return {
+                x: Number(bundledPed[0]),
+                y: Number(bundledPed[1]),
+                z: Number(bundledPed[2]) + this.pedEyeHeightData,
+                groundSource: 'runtime',
+                spawnKind: String(bundled?.kind || 'bundled_runtime_snapshot'),
+                spawnSource: 'assets/runtime_spawn.json',
+                spawnPedZ: Number(bundledPed[2]),
+            };
+        }
+
         const candidates = [
             // Legion Square (approx)
             [195.0, -933.0],
@@ -1480,86 +3772,158 @@ export class App {
         ];
 
         for (const [x, y] of candidates) {
+            const b = this.spawnDistrictDemo ? this.spawnDistrictBounds : null;
+            if (b && (x < b.minX || x > b.maxX || y < b.minY || y > b.maxY)) continue;
             if (!this._isInTerrainXY(x, y)) continue;
-            const hz = this.terrainRenderer.getHeightAtXY?.(x, y);
-            if (hz === null || hz === undefined || !Number.isFinite(hz)) continue;
-            // Exclude extreme values (edge artifacts)
-            if (hz < -10 || hz > 400) continue;
-            return { x, y, z: hz + this.pedEyeHeightData };
+            const floor = this.collisionWorld?.resolveGround?.(x, y, NaN, { preferInterior: false });
+            if (floor?.source !== 'ybn' || !Number.isFinite(Number(floor.z))) continue;
+            return { x, y, z: Number(floor.z) + this.pedEyeHeightData, groundSource: 'ybn' };
         }
 
         // Fallback: center of terrain bounds.
         const b = this.terrainRenderer?.terrainBounds || [0, 0, 0];
         const s = this.terrainRenderer?.terrainSize || [0, 0, 0];
-        const x = b[0] + (s[0] || 0) * 0.5;
-        const y = b[1] + (s[1] || 0) * 0.5;
-        const hz = this.terrainRenderer.getHeightAtXY?.(x, y);
-        const z = (Number.isFinite(hz) ? hz : (b[2] || 0)) + this.pedEyeHeightData;
-        return { x, y, z };
+        const constrained = this._clampDataPositionToSpawnDistrict([
+            b[0] + (s[0] || 0) * 0.5,
+            b[1] + (s[1] || 0) * 0.5,
+            0.0,
+        ]);
+        const x = constrained[0];
+        const y = constrained[1];
+        return { x, y, z: this.pedEyeHeightData, groundSource: 'runtime' };
     }
 
-    applyPedAndCameraFromConfig(pedV4, camV4) {
+    applyPedAndCameraFromConfig(pedV4, camV4, { preservePedZ = false } = {}) {
         if (!pedV4 || !camV4) return;
 
-        // Decide ped Z:
-        // - If heightmap is available, use ground Z *only* when the provided Z is near the ground.
-        //   Otherwise keep provided Z (common for interiors/roofs).
-        const x = Number(pedV4[0]);
-        const y = Number(pedV4[1]);
-        const desiredZ = Number(pedV4[2]);
-        const groundZ = this.terrainRenderer.getHeightAtXY?.(x, y);
+        // FiveM stores a ped root Z while YBN/interior collision describes floors.
+        // heightmap.dat is deliberately excluded: it contains bounds envelopes.
+        const constrainedPed = this._clampDataPositionToSpawnDistrict(pedV4);
+        const x = Number(constrainedPed[0]);
+        const y = Number(constrainedPed[1]);
+        const desiredZ = Number(constrainedPed[2]);
+        const terrainEnvelopeZ = this.terrainRenderer.getHeightAtXY?.(x, y);
+        const demoGroundZ = this._getSpawnDistrictDemoGroundZAtXY(x, y);
 
         let baseZ = desiredZ;
         let usedGround = false;
+        let usedDemoGround = false;
+        let usedYbnGround = false;
         let usedInterior = false;
+        let collisionGround = null;
         let interior = null;
 
-        // If the point is in/near a known MLO room, prefer its floor and/or avoid terrain-snapping.
-        // This prevents spawns from ending up *under* interior floors when terrain is close.
-        try {
-            const zHint = Number.isFinite(desiredZ)
-                ? desiredZ
-                : (Number.isFinite(groundZ) ? groundZ : 0.0);
-            interior = this.drawableStreamer?.getInteriorFloorAtDataPos?.([x, y, zHint], {
-                zPadBelow: 14.0,
-                zPadAbove: 8.0,
-                maxRaise: this.groundPedMaxDelta,
-            }) || null;
-        } catch {
-            interior = null;
-        }
-
-        const blockTerrainSnap = !!(interior && interior.inRoom);
-        if (!blockTerrainSnap && this.groundPedToTerrain && Number.isFinite(groundZ)) {
-            if (!Number.isFinite(baseZ) || Math.abs(baseZ - groundZ) <= this.groundPedMaxDelta) {
-                baseZ = groundZ;
-                usedGround = true;
+        // The full viewer can use nearby drawable floor probes for MLOs. In
+        // /demo, those visual meshes often overlap the street and YBN owns the
+        // collision contract, so do not let a render-only floor move the spawn.
+        if (!this.spawnDistrictDemo) {
+            try {
+                const zHint = Number.isFinite(desiredZ)
+                    ? desiredZ
+                    : 0.0;
+                interior = this.drawableStreamer?.getInteriorFloorAtDataPos?.([x, y, zHint], {
+                    zPadBelow: 14.0,
+                    zPadAbove: 8.0,
+                    maxRaise: this.groundPedMaxDelta,
+                }) || null;
+            } catch {
+                interior = null;
             }
         }
 
+        if (this.groundPedToTerrain) {
+            try {
+                collisionGround = this.collisionWorld?.resolveGround?.(x, y, desiredZ, {
+                    maxSnapDistance: this.groundPedMaxDelta,
+                }) || null;
+            } catch {
+                collisionGround = null;
+            }
+            const collisionZ = Number(collisionGround?.z);
+            const collisionSource = String(collisionGround?.source || '');
+            const isCollisionFloor = collisionSource === 'terrain' || collisionSource === 'ybn' || collisionSource === 'interior';
+            const maxRuntimeGroundSnap = Math.max(
+                0.5,
+                Math.min(5.0, Number(this.runtimeSpawnGroundSnapMaxDelta) || 2.5),
+            );
+            if (!preservePedZ && !Number.isFinite(desiredZ) && isCollisionFloor && Number.isFinite(collisionZ)) {
+                baseZ = collisionZ;
+                usedYbnGround = collisionSource === 'ybn';
+                usedGround = usedYbnGround;
+                usedInterior = collisionSource === 'interior';
+            } else if (
+                !preservePedZ && collisionSource === 'terrain' && Number.isFinite(collisionZ)
+            ) {
+                baseZ = collisionZ;
+                usedGround = true;
+                usedYbnGround = false;
+                usedInterior = false;
+            } else if (
+                preservePedZ && Number.isFinite(desiredZ) && isCollisionFloor &&
+                Number.isFinite(collisionZ) &&
+                (collisionSource === 'terrain' || Math.abs(collisionZ - desiredZ) <= maxRuntimeGroundSnap)
+            ) {
+                baseZ = collisionZ;
+                usedYbnGround = collisionSource === 'ybn';
+                usedGround = collisionSource === 'terrain' || usedYbnGround;
+                usedInterior = collisionSource === 'interior';
+                usedDemoGround = false;
+            }
+        }
+
+        const blockConfiguredSnap = preservePedZ || !!(interior && interior.inRoom);
+        if (!blockConfiguredSnap && Number.isFinite(demoGroundZ) && (!Number.isFinite(baseZ) || demoGroundZ > baseZ + 0.25)) {
+            baseZ = demoGroundZ;
+            usedDemoGround = true;
+            usedGround = false;
+            usedYbnGround = false;
+        }
+
         // If interior floor is known and would raise us, snap up (prefer smallest raise).
-        if (interior && Number.isFinite(interior.floorZ)) {
+        if (!this.spawnDistrictDemo && interior && Number.isFinite(interior.floorZ)) {
             if (!Number.isFinite(baseZ) || interior.floorZ > baseZ) {
                 baseZ = interior.floorZ;
                 usedInterior = true;
                 usedGround = false;
+                usedDemoGround = false;
+                usedYbnGround = false;
             }
         }
-        if (!Number.isFinite(baseZ)) baseZ = Number.isFinite(groundZ) ? groundZ : 0.0;
+        if (!Number.isFinite(baseZ)) baseZ = 0.0;
 
         const z = baseZ + this.pedEyeHeightData; // eye-height-ish offset
-        this.spawnPedAt([x, y, z]);
+        const groundSource = usedInterior
+            ? 'interior'
+            : (usedYbnGround ? 'ybn' : (usedDemoGround ? 'demo' : (usedGround ? 'terrain' : 'runtime')));
+        this.spawnPedAt([x, y, z], {
+            groundSource,
+        });
         this._pedGroundingDebug = {
             desiredZ,
-            groundZ: Number.isFinite(groundZ) ? groundZ : null,
+            groundZ: Number.isFinite(baseZ) ? Number(baseZ) : null,
+            terrainEnvelopeZ: Number.isFinite(terrainEnvelopeZ) ? terrainEnvelopeZ : null,
+            demoGroundZ: Number.isFinite(demoGroundZ) ? demoGroundZ : null,
+            ybnZ: Number.isFinite(Number(collisionGround?.ybnZ)) ? Number(collisionGround.ybnZ) : null,
+            rawYbnZ: Number.isFinite(Number(collisionGround?.rawYbnZ)) ? Number(collisionGround.rawYbnZ) : null,
+            ybnAlignmentOffset: Number.isFinite(Number(collisionGround?.ybnCalibrationOffset)) ? Number(collisionGround.ybnCalibrationOffset) : null,
+            collisionGroundZ: Number.isFinite(Number(collisionGround?.z)) ? Number(collisionGround.z) : null,
+            collisionGroundSource: collisionGround?.source || null,
+            heightmapLoaded: !!this.terrainRenderer?.heightmapPixels,
             interiorFloorZ: (interior && Number.isFinite(interior.floorZ)) ? interior.floorZ : null,
             usedGround,
+            usedDemoGround,
+            usedYbnGround,
             usedInterior,
+            groundSource: this._pedGroundSource,
             finalZ: z,
         };
 
         // Place camera at CamCoords and look at ped.
-        const camData = [camV4[0], camV4[1], camV4[2]];
+        const originalPedZ = Number.isFinite(desiredZ)
+            ? desiredZ + this.pedEyeHeightData
+            : z;
+        const camZDelta = ((usedDemoGround || usedYbnGround) && Number.isFinite(originalPedZ)) ? (z - originalPedZ) : 0.0;
+        const camData = [camV4[0], camV4[1], Number(camV4[2]) + camZDelta];
         const camView = this._dataToViewer(camData);
         this.camera.position[0] = camView[0];
         this.camera.position[1] = camView[1];
@@ -1581,10 +3945,22 @@ export class App {
 
         // Update the UI inputs so it's obvious where we spawned.
         const pedInput = document.getElementById('pedCoords');
-        if (pedInput) pedInput.value = `vector4(${p.x.toFixed(4)}, ${p.y.toFixed(4)}, ${p.z.toFixed(4)}, 0.0)`;
+        const pedInputZ = Number.isFinite(Number(p.spawnPedZ)) ? Number(p.spawnPedZ) : p.z;
+        if (pedInput) pedInput.value = `vector4(${p.x.toFixed(4)}, ${p.y.toFixed(4)}, ${pedInputZ.toFixed(4)}, 0.0)`;
 
         // Spawn ped first, then force a close 3rd-person rig in viewer-space.
-        this.spawnPedAt([p.x, p.y, p.z]);
+        this.spawnPedAt([p.x, p.y, p.z], { groundSource: p.groundSource || null });
+        // When the remote resolver is unavailable at boot, /demo falls back to the
+        // descriptor generated from the FiveM profile. Keep the diagnostics explicit
+        // so this does not read as an arbitrary local-coordinate fallback.
+        if (p.spawnKind) {
+            this._runtimeSpawnInfo = {
+                kind: String(p.spawnKind),
+                source: String(p.spawnSource || ''),
+                ped: [p.x, p.y, Number.isFinite(Number(p.spawnPedZ)) ? Number(p.spawnPedZ) : (Number.isFinite(Number(p.spawnGroundZ)) ? Number(p.spawnGroundZ) : p.z), 0.0],
+                diagnostics: { fallback: 'demo_descriptor' },
+            };
+        }
         this._setGtaThirdPersonRigForPed({ distanceData: 6.0, heightData: 1.7, sideData: 0.6 });
 
         // Update the camCoords UI from the actual camera position (data-space).
@@ -1610,48 +3986,83 @@ export class App {
         // Let the user opt-in via "Stream more (city)" or the preset dropdown.
     }
 
+    respawnPlayerFromDeath() {
+        const spawn = this._chooseCitySpawn();
+        if (![spawn?.x, spawn?.y, spawn?.z].map(Number).every(Number.isFinite)) return false;
+
+        this.spawnPedAt([Number(spawn.x), Number(spawn.y), Number(spawn.z)], {
+            groundSource: spawn.groundSource || 'runtime',
+        });
+        this.showPlayer = true;
+        this.player.enabled = true;
+        this.player.handsUp = false;
+        this.player.animPhase = 0.0;
+        this.player.animMove01 = 0.0;
+        this.player.animSpeed = 0.0;
+        this.player.animGait = 'idle';
+        this.player._sprintRequested = false;
+        this.player._lastMoveDirData = [0.0, 0.0, 0.0];
+        this.followPed = true;
+        this.controlPed = true;
+        this._followPedYSmoothed = null;
+        this._resetPedMotion();
+        for (const key of Object.keys(this.keyState || {})) this.keyState[key] = false;
+        try { this.weaponController?.holsterImmediate?.(); } catch { /* ignore */ }
+        try { this._setGtaThirdPersonRigForPed({ distanceData: 6.0, heightData: 1.7, sideData: 0.6 }); } catch { /* ignore */ }
+        try { this._applyPlayerRenderTargetsFromProfileOrUi(); } catch { /* ignore */ }
+        try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+
+        const showPlayerEl = document.getElementById('showPlayer');
+        if (showPlayerEl) showPlayerEl.checked = true;
+        const followEl = document.getElementById('followPed');
+        if (followEl) followEl.checked = true;
+        const controlEl = document.getElementById('controlPed');
+        if (controlEl) controlEl.checked = true;
+        return true;
+    }
+
     /**
      * “Game-like” spawn: spawn a ped marker and immediately enable follow + WASD control,
      * with a GTA-ish 3rd-person camera rig.
      */
-    async spawnCharacter() {
+    async spawnCharacter({ toggle = true, waitForModel = true, snapshot = true, initModel = true } = {}) {
         // Toggle: if already spawned, clicking again exits back to map view.
         if (this.player?.enabled) {
-            this.exitCharacterView();
+            if (toggle) this.exitCharacterView();
             return;
         }
 
         // Snapshot the current map-view pose so we can toggle back later.
-        this._snapshotMapViewPose();
+        if (snapshot) this._snapshotMapViewPose();
 
         // Ensure a ped exists first (and it already applies a 3rd-person-ish camera rig).
         this.spawnPedAtCity();
 
-        // Ensure model pipeline is ready so we can render a real player entity mesh.
-        // (If this fails, we still keep the marker + camera controls working.)
-        try {
-            // Force models on (we need instanced meshes for the player entity).
-            this.showModels = true;
-            const showModelsEl = document.getElementById('showModels');
-            if (showModelsEl) showModelsEl.checked = true;
-            await this.ensureModelsInitialized();
-        } catch {
-            // ignore
+        if (initModel) {
+            // Ensure model pipeline is ready so we can render a real player entity mesh.
+            // (If this fails, we still keep the fallback wireframe character + camera controls working.)
+            try {
+                // The player has its own render pass, so enabling character view does not force world objects on.
+                this.showPlayer = true;
+                const showPlayerEl = document.getElementById('showPlayer');
+                if (showPlayerEl) showPlayerEl.checked = true;
+                this.playerWireframeMode = false;
+                const playerTexturedEl = document.getElementById('playerTextured');
+                if (playerTexturedEl) playerTexturedEl.checked = true;
+                const initPromise = this.ensureModelsInitialized();
+                if (waitForModel) await initPromise;
+            } catch {
+                // ignore
+            }
         }
-
-        // Pick character model hash from UI (name or numeric hash).
-        const raw = String(document.getElementById('characterModel')?.value || '').trim();
-        let h = null;
-        if (raw) {
-            if (/^\d+$/.test(raw)) h = String((Number(raw) >>> 0));
-            else h = String((joaat(raw) >>> 0));
-        }
-        // Default to Michael if input is empty.
-        if (!h) h = String((joaat('player_zero') >>> 0));
-
         this.player.enabled = true;
-        this.player.hash = h;
         this.player.lod = 'high';
+        this.player.animPhase = 0.0;
+        this.player.animMove01 = 0.0;
+        this.player.animSpeed = 0.0;
+        this.player.animGait = 'idle';
+        this.player.handsUp = false;
+        this._applyPlayerRenderTargetsFromProfileOrUi();
 
         // Enable follow + control mode.
         this.followPed = true;
@@ -1692,12 +4103,16 @@ export class App {
         this._gpPitch = Math.asin(Math.max(-1, Math.min(1, off[1] / d)));
         // Clamp pitch a bit so we don't end up flipped.
         this._gpPitch = Math.max(-1.2, Math.min(1.2, this._gpPitch));
+        this._gpAimNeutralPitch = this._gpPitch;
     }
 
     _applyGameplayCameraInputDelta(deltaX, deltaY) {
         const sens = 0.0045;
-        this._gpYaw += deltaX * sens;
-        this._gpPitch += -deltaY * sens;
+        // This is an orbit camera: the gameplay aim ray points from the camera
+        // back toward the ped. Its angular input must therefore be the inverse of
+        // a first-person camera, otherwise right/up mouse motion aims left/down.
+        this._gpYaw -= deltaX * sens;
+        this._gpPitch += deltaY * sens;
         this._gpPitch = Math.max(-1.15, Math.min(1.15, this._gpPitch));
     }
 
@@ -1755,48 +4170,781 @@ export class App {
         this.ped.posView = pedView;
     }
 
-    _syncPlayerEntityMesh(forceFullInit = false) {
-        if (!this.player?.enabled || !this.ped) return;
-        if (!this.modelsInitialized || !this.instancedModelRenderer?.ready) return;
-        const h = String(this.player.hash || '');
-        if (!h) return;
+    _resetPedMotion() {
+        this._pedVelocityData = [0, 0, 0];
+        this._pedVerticalVelocityData = 0.0;
+        this._pedOnGround = true;
+        if (this.player) {
+            this.player._lastMoveDirData = [0, 0, 0];
+            this.player.animMove01 = 0.0;
+            this.player.animSpeed = 0.0;
+            this.player.animGait = 'idle';
+        }
+    }
 
-        // Update heading from last movement direction (data-space XY).
-        const md = this.player._lastMoveDirData;
-        const mv2 = Math.hypot(Number(md[0]) || 0, Number(md[1]) || 0);
-        if (mv2 > 1e-4) {
-            this.player.headingRad = Math.atan2(md[1], md[0]);
+    _lerpAngleRad(a, b, t) {
+        const twoPi = Math.PI * 2.0;
+        let d = (b - a) % twoPi;
+        if (d > Math.PI) d -= twoPi;
+        if (d < -Math.PI) d += twoPi;
+        return a + d * Math.max(0.0, Math.min(1.0, t));
+    }
+
+    _updateControlledPed(dt) {
+        if (!this.ped) return;
+        if (this.playerController?.update?.(dt)) return;
+        const cfg = this.gameplayMoveConfig || {};
+        const ks = this.keyState || {};
+
+        const inputRight = (ks['d'] ? 1 : 0) - (ks['a'] ? 1 : 0);
+        const inputForward = (ks['w'] ? 1 : 0) - (ks['s'] ? 1 : 0);
+        const inputLen = Math.hypot(inputRight, inputForward);
+        const hasInput = inputLen > 1e-5;
+
+        let desiredVx = 0.0;
+        let desiredVy = 0.0;
+        if (hasInput) {
+            const invInput = 1.0 / inputLen;
+
+            const fwdView = glMatrix.vec3.fromValues(
+                this.camera.direction[0],
+                this.camera.direction[1],
+                this.camera.direction[2],
+            );
+            fwdView[1] = 0.0;
+            if (glMatrix.vec3.length(fwdView) < 1e-5) fwdView[2] = -1.0;
+            glMatrix.vec3.normalize(fwdView, fwdView);
+
+            const rightView = glMatrix.vec3.create();
+            glMatrix.vec3.cross(rightView, fwdView, this.camera.up);
+            glMatrix.vec3.normalize(rightView, rightView);
+
+            const fwdData = this._viewerDirToDataDir(fwdView);
+            const rightData = this._viewerDirToDataDir(rightView);
+            const fx = Number(fwdData[0]) || 0.0;
+            const fy = Number(fwdData[1]) || 0.0;
+            const rx = Number(rightData[0]) || 0.0;
+            const ry = Number(rightData[1]) || 0.0;
+
+            let dx = (inputRight * invInput) * rx + (inputForward * invInput) * fx;
+            let dy = (inputRight * invInput) * ry + (inputForward * invInput) * fy;
+            const dLen = Math.hypot(dx, dy) || 1.0;
+            dx /= dLen;
+            dy /= dLen;
+
+            const slow = !!(ks['control'] || ks['ctrl'] || ks['alt']);
+            const sprint = !!ks['shift'] && inputForward > 0.15 && !slow;
+            const speed = slow
+                ? (Number(cfg.walkSpeed) || 1.7)
+                : (sprint ? (Number(cfg.sprintSpeed) || 7.4) : (Number(cfg.runSpeed) || 4.6));
+            desiredVx = dx * speed;
+            desiredVy = dy * speed;
+
+            const turnA = 1.0 - Math.exp(-(Number(cfg.turnSharpness) || 14.0) * dt);
+            if (this.player) {
+                const targetHeading = Math.atan2(dy, dx);
+                this.player.headingRad = this._lerpAngleRad(Number(this.player.headingRad) || targetHeading, targetHeading, turnA);
+                this.player._lastMoveDirData = [dx, dy, 0.0];
+            }
+        } else if (this.player) {
+            this.player._lastMoveDirData = [0, 0, 0];
         }
 
-        // Build a data-space transform.
+        const vel = this._pedVelocityData || [0, 0, 0];
+        const accelBase = hasInput
+            ? (Number(cfg.acceleration) || 11.0)
+            : (Number(cfg.braking) || 14.0);
+        const accel = (hasInput && !!ks['shift'])
+            ? (Number(cfg.sprintAcceleration) || accelBase)
+            : accelBase;
+        const a = 1.0 - Math.exp(-Math.max(0.1, accel) * dt);
+        vel[0] = vel[0] * (1 - a) + desiredVx * a;
+        vel[1] = vel[1] * (1 - a) + desiredVy * a;
+        if (!hasInput && Math.hypot(vel[0], vel[1]) < 0.02) {
+            vel[0] = 0.0;
+            vel[1] = 0.0;
+        }
+
+        const oldX = this.ped.posData[0];
+        const oldY = this.ped.posData[1];
+        const eye = Number(this.pedEyeHeightData) || 0.0;
+        const oldFeetZ = this.ped.posData[2] - eye;
+        const oldFloor = this.collisionWorld?.resolveGround?.(oldX, oldY, oldFeetZ, { preferInterior: true });
+        const oldGroundZ = (oldFloor?.source === 'ybn' || oldFloor?.source === 'interior')
+            ? Number(oldFloor.z)
+            : null;
+        let newX = oldX + vel[0] * dt;
+        let newY = oldY + vel[1] * dt;
+        const newFloor = this.collisionWorld?.resolveGround?.(newX, newY, oldFeetZ, { preferInterior: true });
+        let newGroundZ = (newFloor?.source === 'ybn' || newFloor?.source === 'interior')
+            ? Number(newFloor.z)
+            : null;
+
+        const maxStepUp = Number(cfg.maxStepUp) || 1.15;
+        if (
+            this._pedOnGround &&
+            Number.isFinite(oldGroundZ) &&
+            Number.isFinite(newGroundZ) &&
+            newGroundZ - oldGroundZ > maxStepUp
+        ) {
+            newX = oldX;
+            newY = oldY;
+            newGroundZ = oldGroundZ;
+            vel[0] *= 0.15;
+            vel[1] *= 0.15;
+        }
+
+        let feetZ = oldFeetZ;
+        const jumpPressed = !!(ks[' '] || ks['space'] || ks['spacebar']);
+        if (jumpPressed && this._pedOnGround) {
+            this._pedVerticalVelocityData = Number(cfg.jumpSpeed) || 6.2;
+            this._pedOnGround = false;
+        }
+
+        if (!this._pedOnGround) {
+            this._pedVerticalVelocityData -= (Number(cfg.gravity) || 22.0) * dt;
+            feetZ += this._pedVerticalVelocityData * dt;
+        }
+
+        if (Number.isFinite(newGroundZ)) {
+            const pad = Number(cfg.groundProbePad) || 0.08;
+            if (this._pedOnGround || feetZ <= newGroundZ + pad) {
+                feetZ = newGroundZ;
+                this._pedVerticalVelocityData = 0.0;
+                this._pedOnGround = true;
+            }
+        }
+
+        this._pedVelocityData = vel;
+        this.ped.posData[0] = newX;
+        this.ped.posData[1] = newY;
+        this.ped.posData[2] = feetZ + eye;
+        this.ped.posView = this._dataToViewer(this.ped.posData);
+        this.pedRenderer.setPositions([this.ped.posData]);
+    }
+
+    _updatePlayerAnimationState(dt) {
+        if (!this.player?.enabled || !this.ped) return;
+        const vel = this._pedVelocityData || [0, 0, 0];
+        const speed = Math.hypot(Number(vel[0]) || 0, Number(vel[1]) || 0);
+        const sprintSpeed = Number(this.gameplayMoveConfig?.sprintSpeed) || 7.4;
+        const target01 = Math.max(0.0, Math.min(1.0, speed / Math.max(0.1, sprintSpeed)));
+        const a = 1.0 - Math.exp(-12.0 * Math.max(0.001, dt));
+        this.player.animMove01 = (Number(this.player.animMove01) || 0.0) * (1 - a) + target01 * a;
+        this.player.animSpeed = speed;
+        const walkSpeed = Number(this.gameplayMoveConfig?.walkSpeed) || 1.7;
+        if (speed < 0.08) {
+            this.player.animGait = 'idle';
+        } else if (this.player._sprintRequested) {
+            this.player.animGait = 'sprint';
+        } else {
+            this.player.animGait = 'walk';
+        }
+
+        // Play each exported GTA YCD clip at its native duration. The clips contain
+        // multiple repeated foot cycles, and animPhase maps one revolution across
+        // the entire clip, so using a single foot-cycle duration would overcrank it.
+        // Scale native playback with actual velocity to preserve distance per cycle.
+        const gaitCycle = this.player.animGait === 'walk'
+            ? { referenceSpeed: walkSpeed, clipDuration: 3.6666667 }
+            : (this.player.animGait === 'sprint'
+                ? { referenceSpeed: sprintSpeed, clipDuration: 1.0666667 }
+                : { referenceSpeed: walkSpeed, clipDuration: 3.6666667 });
+        if (this.player.animMove01 > 0.01) {
+            const speedScale = Math.max(0.2, Math.min(1.35, speed / Math.max(0.1, gaitCycle.referenceSpeed)));
+            const phaseRate = (Math.PI * 2.0 / gaitCycle.clipDuration) * speedScale;
+            this.player.animPhase = (Number(this.player.animPhase) || 0.0) + phaseRate * dt;
+        }
+    }
+
+    _syncWeaponUi() {
+        const status = this.weaponController?.getStatus?.();
+        if (!status) return;
+        const stateLabel = status.phase === 'equipped'
+            ? (status.automatic ? 'AUTO' : 'SEMI')
+            : String(status.phase || 'holstered').toUpperCase();
+        const key = [status.id, stateLabel, status.magazineAmmo, status.reserveAmmo, status.switchItems, status.switchInstalled].join('|');
+        if (key === this._weaponUiKey) return;
+        this._weaponUiKey = key;
+        const hud = document.getElementById('weaponHud');
+        const hudState = document.getElementById('weaponHudState');
+        const hudAmmo = document.getElementById('weaponHudAmmo');
+        const crosshair = document.getElementById('combatCrosshair');
+        if (hud) hud.hidden = false;
+        if (hudState) hudState.textContent = `${status.label} ${stateLabel}`;
+        if (hudAmmo) hudAmmo.textContent = `${status.magazineAmmo} / ${status.reserveAmmo}`;
+        if (crosshair) crosshair.hidden = status.phase !== 'equipped';
+        const toggle = document.getElementById('weaponToggle');
+        if (toggle) {
+            toggle.textContent = status.phase === 'equipped'
+                ? `Holster ${status.label}`
+                : (status.phase === 'drawing' ? 'Drawing...' : (status.phase === 'holstering' ? 'Holstering...' : `Draw ${status.label}`));
+            toggle.disabled = status.phase === 'drawing' || status.phase === 'holstering' || status.phase === 'reloading';
+        }
+        const reload = document.getElementById('weaponReload');
+        if (reload) reload.disabled = status.phase !== 'equipped' || status.magazineAmmo >= status.magazineCapacity || status.reserveAmmo <= 0;
+        const install = document.getElementById('weaponSwitch');
+        if (install) {
+            install.disabled = status.phase !== 'equipped' || status.switchInstalled || status.switchItems <= 0;
+            install.textContent = status.switchInstalled ? 'Glock switch installed' : 'Install Glock switch';
+        }
+        this._syncWeaponInventory();
+    }
+
+    _syncMeleeUi() {
+        const status = this.meleeController?.getStatus?.();
+        const hud = document.getElementById('meleeHud');
+        if (!status || !hud) return;
+        hud.dataset.combatState = status.attacking ? 'attacking' : (status.guarding ? 'guarding' : 'idle');
+        hud.dataset.combo = String(status.combo || 0);
+        hud.dataset.target = String(status.target?.id || '');
+        hud.dataset.renderCombatState = String(this.playerModelRenderer?.characterLocomotion?.combat?.phase || '');
+        hud.dataset.skinPoseVersion = String(this.playerModelRenderer?._skinPoseVersion || 0);
+        hud.dataset.renderClip = String(this.playerModelRenderer?.characterLocomotion?.combat?.clip || '');
+        hud.dataset.meleeAnimations = this._meleeAnimationsLoaded ? 'loaded' : (this._meleeAnimationsUnavailable ? 'unavailable' : 'loading');
+        hud.dataset.lifeState = String(status.lifeState || 'alive');
+        hud.hidden = !this.spawnDistrictDemo;
+        const healthPct = Math.max(0, Math.min(100, (status.health / Math.max(1, status.maxHealth)) * 100));
+        const playerFill = document.getElementById('meleePlayerHealth');
+        const playerText = document.getElementById('meleePlayerHealthText');
+        if (playerFill) playerFill.style.width = `${healthPct.toFixed(1)}%`;
+        if (playerText) playerText.textContent = String(Math.round(status.health));
+        const targetRow = document.getElementById('meleeTargetRow');
+        const targetFill = document.getElementById('meleeTargetHealth');
+        const targetText = document.getElementById('meleeTargetHealthText');
+        if (targetRow) targetRow.hidden = !status.target;
+        if (status.target) {
+            const targetPct = Math.max(0, Math.min(100, (status.target.health / Math.max(1, status.target.maxHealth)) * 100));
+            if (targetFill) targetFill.style.width = `${targetPct.toFixed(1)}%`;
+            if (targetText) targetText.textContent = String(Math.round(status.target.health));
+        }
+        const deathOverlay = document.getElementById('deathOverlay');
+        const deathCountdown = document.getElementById('deathCountdown');
+        const dead = status.lifeState === 'dead';
+        if (dead !== !!this._deathUiActive) {
+            this._deathUiActive = dead;
+            this._weaponUiKey = '';
+        }
+        if (deathOverlay) deathOverlay.hidden = !dead;
+        document.body.classList.toggle('player-dead', dead);
+        const crosshair = document.getElementById('combatCrosshair');
+        const weaponHud = document.getElementById('weaponHud');
+        if (dead && crosshair) crosshair.hidden = true;
+        if (weaponHud) weaponHud.hidden = dead;
+        if (deathCountdown) {
+            deathCountdown.textContent = `RESPAWNING IN ${Math.max(0, Math.ceil(Number(status.respawnRemaining) || 0))}`;
+        }
+    }
+
+    _syncWeaponInventory() {
+        this.inventoryOverlay?.sync?.();
+    }
+
+    _toggleWeaponInventory(forceOpen = null) {
+        return this.inventoryOverlay?.toggle?.(forceOpen) || false;
+    }
+
+    _getPlayerAnimationForRender() {
+        if (!this.player?.enabled) return null;
+        const seated = !!this.vehicleController?.inVehicle;
+        const handsUp = !!this.player.handsUp && !this.vehicleController?.inVehicle;
+        return {
+            phase: Number(this.player.animPhase) || 0.0,
+            move01: Number(this.player.animMove01) || 0.0,
+            speed: Number(this.player.animSpeed) || 0.0,
+            gait: (handsUp || seated) ? 'idle' : String(this.player.animGait || 'idle'),
+            onGround: !!this._pedOnGround,
+            gesture: seated
+                ? { active: true, clip: 'sit' }
+                : (handsUp ? { active: true, clip: 'handsup_base' } : null),
+            combat: (handsUp || seated) ? null : (this.weaponController?.isVisible?.()
+                ? (this.weaponController?.getCharacterPose?.() || null)
+                : (this.meleeController?.getCharacterPose?.() || null)),
+        };
+    }
+
+    _syncPlayerEntityMesh(forceFullInit = false) {
+        if (!this.player?.enabled || !this.ped) return;
+        if (!this.showPlayer) return;
+        if (!this.modelsInitialized) return;
+        if (!this.playerModelRenderer?.ready) {
+            void this._ensurePlayerModelRenderer().then((ok) => {
+                if (ok) this._syncPlayerEntityMesh(true);
+            });
+            return;
+        }
+        let hashes = Array.isArray(this.player.hashes) ? this.player.hashes.map((h) => String(h || '').trim()).filter(Boolean) : [];
+        if (!hashes.length && this.player.hash) hashes = [String(this.player.hash)];
+        if (!hashes.length) return;
+
+        // Appearance targets can be selected before the sharded model manifest is
+        // initialized. Retry missing component metadata here so startup ordering
+        // cannot leave a composite ped permanently stuck on its fallback marker.
+        for (const h of hashes) {
+            if (this.modelManager?.isShardLoadedForHash?.(h)) continue;
+            try {
+                const pending = this.modelManager?.prefetchMeta?.(h, { priority: 'high' });
+                if (pending && typeof pending.then === 'function') {
+                    void pending.then((ok) => {
+                        if (ok) this._syncPlayerEntityMesh(true);
+                    });
+                }
+            } catch {
+                // The normal frame retry will try again after model initialization.
+            }
+        }
+
+        // During aim the body follows the targeting direction; otherwise retain the
+        // normal movement-driven heading used by third-person locomotion.
+        const inVehicle = !!this.vehicleController?.inVehicle;
+        const md = this.player._lastMoveDirData;
+        const mv2 = Math.hypot(Number(md[0]) || 0, Number(md[1]) || 0);
+        const combatPose = this.weaponController?.getCharacterPose?.() || null;
+        let targetHeading = null;
+        if (!inVehicle && combatPose?.aiming && this.camera?.direction && typeof this._viewerDirToDataDir === 'function') {
+            const aimDirection = this._getGameplayAimDirectionData();
+            const aimLength = Math.hypot(Number(aimDirection?.[0]) || 0.0, Number(aimDirection?.[1]) || 0.0);
+            if (aimLength > 1e-4) targetHeading = Math.atan2(aimDirection[1], aimDirection[0]);
+        }
+        if (!inVehicle && targetHeading === null && mv2 > 1e-4) targetHeading = Math.atan2(md[1], md[0]);
+        if (inVehicle && Number.isFinite(Number(this.vehicleController?.vehicle?.headingRad))) {
+            this.player.headingRad = Number(this.vehicleController.vehicle.headingRad);
+        }
+        if (targetHeading !== null) {
+            const dt = Number(this._lastUpdateDt) || (1 / 60);
+            const turnA = 1.0 - Math.exp(-(Number(this.gameplayMoveConfig?.turnSharpness) || 14.0) * dt);
+            this.player.headingRad = this._lerpAngleRad(Number(this.player.headingRad) || targetHeading, targetHeading, turnA);
+        }
+
+        // Build a data-space transform. Keep `headingRad` in gameplay space so
+        // controls/camera remain unchanged; align the GTA drawable root axis here.
         const q = glMatrix.quat.create();
-        glMatrix.quat.setAxisAngle(q, [0, 0, 1], this.player.headingRad || 0.0);
+        const drawableHeading = (this.player.headingRad || 0.0) + PLAYER_DRAWABLE_FORWARD_OFFSET_RAD;
+        glMatrix.quat.setAxisAngle(q, [0, 0, 1], drawableHeading);
         // `ped.posData` tracks the *eye* position for camera targeting.
-        // Player meshes are authored with origin at/near the feet, so compensate to keep feet on ground.
+        // Component mesh bounds are in pre-skinning space, so they cannot
+        // reliably establish a shoe sole. Keeping this tied directly to the
+        // collision floor prevents an async component load from lifting the ped.
         const px = this.ped.posData[0];
         const py = this.ped.posData[1];
-        const pz = this.ped.posData[2] - (Number(this.pedEyeHeightData) || 0.0);
+        const feetZ = this.ped.posData[2] - (Number(this.pedEyeHeightData) || 0.0);
+        const pz = feetZ;
         glMatrix.mat4.fromRotationTranslation(this.player._mat, q, [px, py, pz]);
         this.player._matBuf.set(this.player._mat);
 
-        if (forceFullInit) {
-            // Ensure instance entry exists and submeshes are discovered once.
-            void this.instancedModelRenderer.setInstancesForArchetype(h, this.player.lod, this.player._matBuf, 0.0);
+        const active = this.player._activeMeshKeys instanceof Set ? this.player._activeMeshKeys : new Set();
+        if (!(this.player._activeMeshKeys instanceof Set)) this.player._activeMeshKeys = active;
+        const desiredKeys = new Set(hashes.map((h) => `${h}:${String(this.player.lod || 'high').toLowerCase()}`));
+        for (const oldKey of Array.from(active)) {
+            if (desiredKeys.has(oldKey)) continue;
+            const oldHash = String(oldKey).split(':')[0];
+            if (oldHash) {
+                try { void this.playerModelRenderer.setInstancesForArchetype(oldHash, this.player.lod, new Float32Array(0), 0.0); } catch { /* ignore */ }
+            }
+            active.delete(oldKey);
+        }
+
+        for (const h of hashes) {
+            const key = `${h}:${String(this.player.lod || 'high').toLowerCase()}`;
+            if (forceFullInit) {
+                // Ensure instance entry exists and submeshes are discovered once.
+                void this.playerModelRenderer.setInstancesForArchetype(h, this.player.lod, this.player._matBuf, -1.0, { loadPriority: 100 });
+                active.add(key);
+                continue;
+            }
+
+            // Fast path update each frame.
+            const ok = this.playerModelRenderer.updateInstanceMatricesForArchetype(h, this.player.lod, this.player._matBuf, 0.0);
+            if (!ok) {
+                // Entry doesn't exist yet (first frame after spawn / async init); create it.
+                void this.playerModelRenderer.setInstancesForArchetype(h, this.player.lod, this.player._matBuf, -1.0, { loadPriority: 100 });
+            }
+            active.add(key);
+        }
+    }
+
+    _clearWeaponModelMesh() {
+        const key = String(this._weaponModelActiveKey || '');
+        const renderer = this.weaponModelRenderer;
+        if (key && renderer?.ready && renderer.setInstancesForArchetype) {
+            const [hash, lod = 'high'] = key.split(':');
+            if (hash) {
+                try { void renderer.setInstancesForArchetype(hash, lod, new Float32Array(0), 0.0); } catch { /* ignore */ }
+            }
+        }
+        this._weaponModelActiveKey = null;
+        this._weaponModelMeshReady = false;
+    }
+
+    _getWeaponRightHandMatrix(out = this._weaponHandDataMat) {
+        if (!this.player?._mat || !this.playerModelRenderer?.getSkinningBoneTransform) return null;
+        // GTA weapon attachments use the visible hand bone. PH_R_Hand is a
+        // physics helper whose independent animated basis makes a rigid prop
+        // drift from the rendered fingers in the pistol clips.
+        const handLocal = this.playerModelRenderer.getSkinningBoneTransform('SKEL_R_Hand', this._weaponHandBoneMat)
+            || this.playerModelRenderer.getSkinningBoneTransform('IK_R_Hand', this._weaponHandBoneMat)
+            || this.playerModelRenderer.getSkinningBoneTransform('PH_R_Hand', this._weaponHandBoneMat);
+        if (!handLocal) return null;
+        glMatrix.mat4.multiply(out, this.player._mat, handLocal);
+        return out;
+    }
+
+    _getWeaponRightHandPose() {
+        const hand = this._getWeaponRightHandMatrix();
+        if (!hand) return null;
+        const grip = this._weaponGripDataMat;
+        glMatrix.mat4.multiply(grip, hand, GLOCK_RIGHT_HAND_ATTACHMENT_TRANSFORM);
+        const normalize = (x, y, z) => {
+            const length = Math.hypot(x, y, z) || 1.0;
+            return [x / length, y / length, z / length];
+        };
+        return {
+            hand: [grip[12], grip[13], grip[14]],
+            forward: normalize(grip[0], grip[1], grip[2]),
+            right: normalize(grip[4], grip[5], grip[6]),
+            up: normalize(grip[8], grip[9], grip[10]),
+        };
+    }
+
+    _alignWeaponBarrelToAim(modelMatrix, handMatrix, aimDirection) {
+        if (!modelMatrix || !handMatrix || !Array.isArray(aimDirection)) return false;
+        const tx = Number(aimDirection[0]) || 0.0;
+        const ty = Number(aimDirection[1]) || 0.0;
+        const tz = Number(aimDirection[2]) || 0.0;
+        const targetLength = Math.hypot(tx, ty, tz);
+        if (targetLength < 1e-5) return false;
+
+        const fx = Number(modelMatrix[0]) || 0.0;
+        const fy = Number(modelMatrix[1]) || 0.0;
+        const fz = Number(modelMatrix[2]) || 0.0;
+        const forwardLength = Math.hypot(fx, fy, fz);
+        if (forwardLength < 1e-5) return false;
+
+        const forward = [fx / forwardLength, fy / forwardLength, fz / forwardLength];
+        const target = [tx / targetLength, ty / targetLength, tz / targetLength];
+        const dot = Math.max(-1.0, Math.min(1.0, forward[0] * target[0] + forward[1] * target[1] + forward[2] * target[2]));
+        const angle = Math.acos(dot);
+        if (angle < 0.0005) return false;
+
+        const correction = this._weaponAdsCorrectionQuat;
+        glMatrix.quat.rotationTo(correction, forward, target);
+        if (angle > GLOCK_ADS_MAX_BARREL_CORRECTION_RAD) {
+            glMatrix.quat.slerp(correction, this._weaponAdsIdentityQuat, correction, GLOCK_ADS_MAX_BARREL_CORRECTION_RAD / angle);
+        }
+
+        const pivot = [Number(handMatrix[12]) || 0.0, Number(handMatrix[13]) || 0.0, Number(handMatrix[14]) || 0.0];
+        const rotation = this._weaponAdsRotationMat;
+        const aroundHand = this._weaponAdsCorrectionMat;
+        glMatrix.mat4.fromQuat(rotation, correction);
+        glMatrix.mat4.identity(aroundHand);
+        glMatrix.mat4.translate(aroundHand, aroundHand, pivot);
+        glMatrix.mat4.multiply(aroundHand, aroundHand, rotation);
+        glMatrix.mat4.translate(aroundHand, aroundHand, [-pivot[0], -pivot[1], -pivot[2]]);
+        glMatrix.mat4.multiply(modelMatrix, aroundHand, modelMatrix);
+        return true;
+    }
+
+    _syncWeaponModelMesh(forceFullInit = false) {
+        const visible = !!this.showPlayer && !!this.ped && !this.vehicleController?.inVehicle && !!this.weaponController?.isVisible?.();
+        if (!visible) {
+            this._clearWeaponModelMesh();
+            return;
+        }
+        if (!this.modelsInitialized) return;
+        if (!this.weaponModelRenderer?.ready || !this.weaponModelAsset?.hash) {
+            void this._ensureWeaponModelRenderer().then((ok) => {
+                if (ok) this._syncWeaponModelMesh(true);
+            });
             return;
         }
 
-        // Fast path update each frame.
-        const ok = this.instancedModelRenderer.updateInstanceMatricesForArchetype(h, this.player.lod, this.player._matBuf, 0.0);
-        if (!ok) {
-            // Entry doesn't exist yet (first frame after spawn / async init); create it.
-            void this.instancedModelRenderer.setInstancesForArchetype(h, this.player.lod, this.player._matBuf, 0.0);
+        const pose = this.weaponController?.getWeaponPoseData?.();
+        if (!pose?.hand || !Array.isArray(pose.direction) || !Array.isArray(pose.right)) return;
+        const hash = String(this.weaponModelAsset.hash);
+        const lod = String(this.weaponModelAsset.lod || 'high').toLowerCase();
+        const key = `${hash}:${lod}`;
+        // The exported YDR bounds are already in GTA metres (a 20 cm pistol),
+        // so rescaling it oversized the grip and made its hand offset obvious.
+        const scale = 1.0;
+        const weaponRenderState = this.weaponController?.getRenderState?.() || null;
+        const recoil = Math.max(0.0, Math.min(1.0, Number(weaponRenderState?.recoil01) || 0.0));
+        const hand = this._getWeaponRightHandMatrix();
+        if (hand) {
+            // Reconstruct the same current hand pose that skinned the ped this
+            // frame, then apply the weapon's authored grip axes below it.
+            glMatrix.mat4.multiply(this._weaponModelMat, hand, GLOCK_RIGHT_HAND_ATTACHMENT_TRANSFORM);
+            this._weaponModelMat[12] -= this._weaponModelMat[0] * recoil * 0.018;
+            this._weaponModelMat[13] -= this._weaponModelMat[1] * recoil * 0.018;
+            this._weaponModelMat[14] -= this._weaponModelMat[2] * recoil * 0.018;
+            if (pose.aiming) this._alignWeaponBarrelToAim(this._weaponModelMat, hand, pose.direction);
+            glMatrix.mat4.scale(this._weaponModelMat, this._weaponModelMat, [scale, scale, scale]);
+        } else {
+            // Static/unskinned fallback for profiles that do not expose SKEL_R_Hand.
+            const forward = pose.direction;
+            const side = [-pose.right[0], -pose.right[1], -pose.right[2]];
+            const tx = Number(pose.hand[0]) + Number(forward[0]) * (0.04 - recoil * 0.025);
+            const ty = Number(pose.hand[1]) + Number(forward[1]) * (0.04 - recoil * 0.025);
+            const tz = Number(pose.hand[2]) + 0.065;
+            glMatrix.mat4.set(this._weaponModelMat,
+                Number(forward[0]) * scale, Number(forward[1]) * scale, Number(forward[2]) * scale, 0.0,
+                Number(side[0]) * scale, Number(side[1]) * scale, Number(side[2]) * scale, 0.0,
+                0.0, 0.0, scale, 0.0,
+                tx, ty, tz, 1.0);
+        }
+        this._weaponModelMatBuf.set(this._weaponModelMat);
+
+        if (this._weaponModelActiveKey && this._weaponModelActiveKey !== key) this._clearWeaponModelMesh();
+        const updated = !forceFullInit && this.weaponModelRenderer.updateInstanceMatricesForArchetype(
+            hash,
+            lod,
+            this._weaponModelMatBuf,
+            0.0,
+        );
+        if (!updated) {
+            void this.weaponModelRenderer.setInstancesForArchetype(
+                hash,
+                lod,
+                this._weaponModelMatBuf,
+                -1.0,
+                { loadPriority: 125 },
+            );
+        }
+        this._weaponModelActiveKey = key;
+
+        const entry = this.weaponModelRenderer.instances?.get?.(key);
+        const submeshes = entry?.submeshes ? Array.from(entry.submeshes.values()) : [];
+        this._weaponModelMeshReady = submeshes.length > 0 && submeshes.every((submesh) => !!submesh?.mesh);
+    }
+
+    _clearVehicleModelMesh() {
+        if (this._vehicleModelActiveKey && this.vehicleModelRenderer?.setInstancesForArchetype) {
+            const [hash, lod] = this._vehicleModelActiveKey.split(':', 2);
+            try { void this.vehicleModelRenderer.setInstancesForArchetype(hash, lod || 'high', null); } catch { /* ignore */ }
+        }
+        this._vehicleModelActiveKey = null;
+        this._vehicleModelMeshReady = false;
+    }
+
+    _syncVehicleModelMesh(forceFullInit = false) {
+        const state = this.vehicleController?.getRenderState?.();
+        if (!state?.hash || !Array.isArray(state.position)) {
+            this._clearVehicleModelMesh();
+            return;
+        }
+        if (!this.modelsInitialized) return;
+        if (!this.vehicleModelRenderer?.ready) {
+            void this._ensureVehicleModelRenderer().then((ok) => {
+                if (ok) this._syncVehicleModelMesh(true);
+            });
+            return;
+        }
+
+        const hash = String(state.hash);
+        const lod = 'high';
+        const key = `${hash}:${lod}`;
+        const q = glMatrix.quat.create();
+        // GTA vehicle drawables face local +Y; gameplay heading is data-space +X.
+        glMatrix.quat.setAxisAngle(q, [0, 0, 1], Number(state.headingRad || 0) - Math.PI * 0.5);
+        glMatrix.quat.rotateY(q, q, Number(state.bodyRoll) || 0);
+        const vehiclePosition = [state.position[0], state.position[1], state.position[2] + (Number(state.suspension) || 0) * 0.025];
+        glMatrix.mat4.fromRotationTranslation(this._vehicleModelMat, q, vehiclePosition);
+        this._vehicleModelMatBuf.set(this._vehicleModelMat);
+
+        if (this._vehicleModelActiveKey && this._vehicleModelActiveKey !== key) this._clearVehicleModelMesh();
+        const updated = !forceFullInit && this.vehicleModelRenderer.updateInstanceMatricesForArchetype(
+            hash, lod, this._vehicleModelMatBuf, 0.0,
+        );
+        if (!updated) {
+            void this.vehicleModelRenderer.setInstancesForArchetype(
+                hash, lod, this._vehicleModelMatBuf, -1.0, { loadPriority: 150 },
+            );
+        }
+        this._vehicleModelActiveKey = key;
+        const entry = this.vehicleModelRenderer.instances?.get?.(key);
+        const submeshes = entry?.submeshes ? Array.from(entry.submeshes.values()) : [];
+        this._vehicleModelMeshReady = submeshes.length > 0 && submeshes.every((submesh) => !!submesh?.mesh);
+    }
+
+    _mergePlayerLocalBoundsData(a, b) {
+        if (!b || !Number.isFinite(Number(b.minZ)) || !Number.isFinite(Number(b.maxZ))) return a || null;
+        if (!a || !Number.isFinite(Number(a.minZ)) || !Number.isFinite(Number(a.maxZ))) {
+            return { minZ: Number(b.minZ), maxZ: Number(b.maxZ), height: Number(b.maxZ) - Number(b.minZ) };
+        }
+        const minZ = Math.min(Number(a.minZ), Number(b.minZ));
+        const maxZ = Math.max(Number(a.maxZ), Number(b.maxZ));
+        return { minZ, maxZ, height: maxZ - minZ };
+    }
+
+    _isPlayerFootAnchorComponent(component, label = '') {
+        const id = Number(component?.componentId ?? component?.component_id ?? component?.id);
+        if (id === 4 || id === 6) return true; // GTA freemode lower body + feet/shoes.
+        const s = `${label || ''} ${component?.assetName || ''} ${component?.drawableName || ''}`.toLowerCase();
+        return s.includes('lowr_') || s.includes('feet_') || s.includes('shoe');
+    }
+
+    _isPlausiblePlayerFootBounds(bounds) {
+        const minZ = Number(bounds?.minZ);
+        const maxZ = Number(bounds?.maxZ);
+        const height = Number(bounds?.height ?? (maxZ - minZ));
+        // Reject component-bound outliers. A bad accessory/hair bound here lifts the whole mesh.
+        return Number.isFinite(minZ)
+            && Number.isFinite(maxZ)
+            && Number.isFinite(height)
+            && minZ >= -1.75
+            && minZ <= 0.35
+            && height > 0.05
+            && height <= 2.6;
+    }
+
+    _getPlayerMeshFootLocalZData(status = null) {
+        try {
+            const render = this.runtimeCharacterProfile?.render || null;
+            if (!render?.skinning) return 0.0;
+            const ps = status || this._getPlayerMeshStatus();
+            const preferred = ps?.contactBoundsData || null;
+            const fallback = ps?.localBoundsData || null;
+            const candidate = this._isPlausiblePlayerFootBounds(preferred) ? preferred : fallback;
+            const z = Number(candidate?.minZ);
+            return this._isPlausiblePlayerFootBounds(candidate) && Number.isFinite(z) ? z : 0.0;
+        } catch {
+            return 0.0;
         }
     }
-    
+
+    _getPlayerMeshStatus() {
+        const hashes = Array.isArray(this.player?.hashes)
+            ? this.player.hashes.map((h) => String(h || '').trim()).filter(Boolean)
+            : [];
+        if (!hashes.length && this.player?.hash) hashes.push(String(this.player.hash));
+        const lod = String(this.player?.lod || 'high').toLowerCase();
+        const required = hashes.length
+            ? Math.min(hashes.length, Math.max(1, Number(this.player?.requireRenderableCount) || 1))
+            : 0;
+        const status = {
+            enabled: !!this.player?.enabled && !!this.showPlayer,
+            ready: false,
+            fallbackVisible: true,
+            renderMode: String(this.player?.renderMode || 'single'),
+            skinningExpected: !!this.runtimeCharacterProfile?.render?.skinning,
+            skinningSkeletonReady: !!this.playerModelRenderer?.hasSkinningSkeleton?.(),
+            skinningAnimationsReady: !!this.playerModelRenderer?.hasSkinningAnimations?.(),
+            skinningAnimationClips: this.playerModelRenderer?.getSkinningAnimationStatus?.()?.clips || [],
+            lod,
+            targetCount: hashes.length,
+            required,
+            readyCount: 0,
+            loadedRealSubmeshes: 0,
+            loadedSkinnedSubmeshes: 0,
+            loadedSkinInfluenceSubmeshes: 0,
+            queued: this.playerModelRenderer?.getMeshLoadStats?.()?.queued ?? 0,
+            inFlight: this.playerModelRenderer?.getMeshLoadStats?.()?.inFlight ?? 0,
+            entries: [],
+            activeComponents: this._activeRuntimeCharacterComponents(this.runtimeCharacterProfile || null)
+                .map((c) => ({
+                    componentId: Number(c.componentId ?? c.component_id ?? c.id),
+                    assetName: String(c.assetName || ''),
+                    drawable: Number(c.drawable ?? c.drawable_id ?? c.drawableId),
+                    texture: Number(c.texture ?? c.texture_id ?? c.textureId),
+                })),
+            disabledComponentIds: Array.from(this.runtimeCharacterDisabledComponentIds || []),
+            localBoundsData: null,
+            contactBoundsData: null,
+            footAnchorEntries: 0,
+        };
+        if (!status.enabled || !this.playerModelRenderer?.instances || !hashes.length) {
+            this._playerMeshStatus = status;
+            return status;
+        }
+
+        for (let i = 0; i < hashes.length; i++) {
+            const h = hashes[i];
+            const entry = this.playerModelRenderer.instances.get(`${h}:${lod}`);
+            const component = Array.isArray(status.activeComponents) ? (status.activeComponents[i] || null) : null;
+            const label = String(this.player?.labels?.[i] || component?.assetName || h);
+            const isFootAnchor = this._isPlayerFootAnchorComponent(component, label);
+            let loadedReal = 0;
+            let placeholders = 0;
+            let submeshes = 0;
+            let skinnedSubmeshes = 0;
+            let skinInfluenceSubmeshes = 0;
+            let minZ = Number.POSITIVE_INFINITY;
+            let maxZ = Number.NEGATIVE_INFINITY;
+            for (const sm of entry?.submeshes?.values?.() || []) {
+                if (!sm) continue;
+                submeshes++;
+                if (sm.file === '__placeholder__') {
+                    placeholders++;
+                    continue;
+                }
+                if (sm.mesh && !this.modelManager?.isMeshDisposed?.(sm.mesh)) {
+                    loadedReal++;
+                    if (sm.skinned && Array.isArray(sm.boneIds) && sm.boneIds.length) skinnedSubmeshes++;
+                    if (sm.mesh.blendWeightsBuffer && sm.mesh.blendIndicesBuffer) skinInfluenceSubmeshes++;
+                    const b = sm.mesh.bounds || null;
+                    const z0 = Number(b?.min?.[2]);
+                    const z1 = Number(b?.max?.[2]);
+                    if (Number.isFinite(z0)) minZ = Math.min(minZ, z0);
+                    if (Number.isFinite(z1)) maxZ = Math.max(maxZ, z1);
+                }
+            }
+            if (loadedReal > 0 && (Number(entry?.instanceCount) || 0) > 0) status.readyCount++;
+            status.loadedRealSubmeshes += loadedReal;
+            status.loadedSkinnedSubmeshes += skinnedSubmeshes;
+            status.loadedSkinInfluenceSubmeshes += skinInfluenceSubmeshes;
+            const localBoundsData = (Number.isFinite(minZ) && Number.isFinite(maxZ))
+                ? { minZ, maxZ, height: maxZ - minZ }
+                : null;
+            if (localBoundsData) {
+                if (!status.localBoundsData) status.localBoundsData = { ...localBoundsData };
+                else {
+                    status.localBoundsData.minZ = Math.min(status.localBoundsData.minZ, localBoundsData.minZ);
+                    status.localBoundsData.maxZ = Math.max(status.localBoundsData.maxZ, localBoundsData.maxZ);
+                    status.localBoundsData.height = status.localBoundsData.maxZ - status.localBoundsData.minZ;
+                }
+                if (isFootAnchor && this._isPlausiblePlayerFootBounds(localBoundsData)) {
+                    status.contactBoundsData = this._mergePlayerLocalBoundsData(status.contactBoundsData, localBoundsData);
+                    status.footAnchorEntries++;
+                }
+            }
+            status.entries.push({
+                hash: h,
+                label,
+                lod,
+                componentId: Number.isFinite(Number(component?.componentId)) ? Number(component.componentId) : null,
+                footAnchor: !!isFootAnchor,
+                shardLoaded: !!this.modelManager?.isShardLoadedForHash?.(h),
+                manifestReady: !!this.modelManager?.hasRealMesh?.(h),
+                entry: !!entry,
+                instanceCount: Number(entry?.instanceCount) || 0,
+                submeshes,
+                loadedReal,
+                skinnedSubmeshes,
+                skinInfluenceSubmeshes,
+                placeholders,
+                localBoundsData,
+            });
+        }
+
+        const skinOk = !status.skinningExpected || (
+            status.skinningSkeletonReady &&
+            status.skinningAnimationsReady &&
+            status.loadedSkinnedSubmeshes > 0 &&
+            status.loadedSkinInfluenceSubmeshes >= status.loadedSkinnedSubmeshes
+        );
+        status.ready = status.readyCount >= required && required > 0 && skinOk;
+        status.fallbackVisible = !status.ready;
+        this._playerMeshStatus = status;
+        return status;
+    }
+
+    _isPlayerMeshRenderable() {
+        return !!this._getPlayerMeshStatus()?.ready;
+    }
+
     async loadTextures() {
         try {
             console.log('Loading terrain textures...');
-            
+
             // Load terrain info first to get texture information
             // LOW priority: terrain textures are optional and load in the background.
             const info = await fetchJSON('assets/terrain_info.json', { priority: 'low' });
@@ -1896,10 +5044,222 @@ export class App {
             console.error('Error stack:', error.stack);
         }
     }
+
+    _initAssetInspector() {
+        this._assetInspectorEl = document.getElementById('assetInspector');
+        this._assetInspectorTitleEl = document.getElementById('assetInspectorTitle');
+        this._assetInspectorSummaryEl = document.getElementById('assetInspectorSummary');
+        this._assetInspectorBodyEl = document.getElementById('assetInspectorBody');
+        this._assetInspectorCopyBtn = document.getElementById('copyAssetMetadata');
+        const closeBtn = document.getElementById('closeAssetInspector');
+        if (this._assetInspectorCopyBtn) {
+            this._assetInspectorCopyBtn.addEventListener('click', () => {
+                void this._copyAssetInspectorMetadata();
+            });
+        }
+        if (closeBtn) {
+            closeBtn.addEventListener('click', () => {
+                this._setAssetPickerEnabled(false);
+                const picker = document.getElementById('assetPicker');
+                if (picker) picker.checked = false;
+                this._scheduleSaveSettings();
+            });
+        }
+        this._setAssetPickerEnabled(!!document.getElementById('assetPicker')?.checked);
+    }
+
+    _setAssetPickerEnabled(enabled) {
+        this.assetPickerEnabled = !!enabled;
+        if (!this.assetPickerEnabled && this._assetInspectorEl) this._assetInspectorEl.style.display = 'none';
+    }
+
+    _inspectDemoAssetAtClientPoint(clientX, clientY) {
+        if (!this.assetPickerEnabled || this.weaponController?.isVisible?.() || !this.spawnDistrictDemo) return;
+        if (!this.canvas || !this.instancedModelRenderer?.pickAssetAtScreen) return;
+        const rect = this.canvas.getBoundingClientRect();
+        if (!rect || !(rect.width > 0) || !(rect.height > 0)) return;
+        const x = (Number(clientX) - rect.left) * (this.canvas.width / rect.width);
+        const y = (Number(clientY) - rect.top) * (this.canvas.height / rect.height);
+        const report = this.instancedModelRenderer.pickAssetAtScreen({
+            x,
+            y,
+            viewportWidth: this.canvas.width,
+            viewportHeight: this.canvas.height,
+            viewProjectionMatrix: this.camera?.viewProjectionMatrix,
+            maxPixelDistance: 28,
+            nearbyLimit: 10,
+        }) || {
+            schema: 'webglgta-demo-asset-pick-v1',
+            click: { x, y, viewportWidth: this.canvas.width, viewportHeight: this.canvas.height },
+            selected: null,
+            nearby: [],
+        };
+        report.app = this._buildAssetInspectorAppState();
+        this._showAssetInspectorReport(report);
+    }
+
+    _buildAssetInspectorAppState() {
+        const cov = (() => { try { return this.drawableStreamer?.getCoverageStats?.() || null; } catch { return null; } })();
+        const tex = (() => { try { return this.textureStreamer?.getStats?.() || null; } catch { return null; } })();
+        const occ = (() => { try { return this.occlusionCuller?.getStats?.() || null; } catch { return null; } })();
+        const renderStats = (() => { try { return this.instancedModelRenderer?.getRenderStats?.() || null; } catch { return null; } })();
+        return {
+            page: (() => { try { return window.location.href; } catch { return null; } })(),
+            route: this.spawnDistrictDemo ? '/demo' : '/',
+            spawnDistrictDemo: !!this.spawnDistrictDemo,
+            spawnDistrictBounds: this.spawnDistrictBounds || null,
+            demoDescriptor: this._spawnDistrictDescriptor ? {
+                instanceCount: Number(this._spawnDistrictDescriptor.instanceCount || 0),
+                sourceInstanceCount: Number(this._spawnDistrictDescriptor.sourceInstanceCount || 0),
+                archetypeCount: Number(this._spawnDistrictDescriptor.archetypeCount || 0),
+                manifestArchetypeCount: Number(this._spawnDistrictDescriptor.manifestArchetypeCount || 0),
+                instanceFile: this._spawnDistrictDescriptor.instanceFile || null,
+                manifestFile: this._spawnDistrictDescriptor.manifestFile || null,
+            } : null,
+            toggles: {
+                showTerrain: !!this.showTerrain,
+                showBuildings: !!this.showBuildings,
+                showModels: !!this.showModels,
+                objectsWireframeMode: !!this.objectsWireframeMode,
+                forcedModelLod: this.forcedModelLod || null,
+                enableOcclusionCulling: !!this.enableOcclusionCulling,
+                enableWorkerFrustumCulling: !!this.drawableStreamer?.enableWorkerFrustumCulling,
+                enableWasmCulling: !!this.drawableStreamer?.enableWasmCulling,
+                enableWebGpuCulling: !!this.drawableStreamer?.enableWebGpuCulling,
+                enableCrossArchetypeInstancing: !!this.drawableStreamer?.enableCrossArchetypeInstancing,
+                enableEntityLodTraversal: !!this.drawableStreamer?.enableEntityLodTraversal,
+            },
+            streaming: {
+                radiusChunks: this.drawableStreamer?.radiusChunks ?? null,
+                maxLoadedChunks: this.drawableStreamer?.maxLoadedChunks ?? null,
+                maxArchetypes: this.drawableStreamer?.maxArchetypes ?? null,
+                maxModelDistance: this.drawableStreamer?.maxModelDistance ?? null,
+                maxVisibleInstances: this.drawableStreamer?.maxVisibleInstances ?? null,
+                maxInstancesPerArchetype: this.drawableStreamer?.maxInstancesPerArchetype ?? null,
+                maxBehindModelDistance: this.drawableStreamer?.maxBehindModelDistance ?? null,
+                workerFrustumPadding: this.drawableStreamer?.workerFrustumPadding ?? null,
+            },
+            coverage: cov,
+            renderStats,
+            textureStats: tex,
+            occlusionStats: occ,
+        };
+    }
+
+    _showAssetInspectorReport(report) {
+        if (!this.assetPickerEnabled) return;
+        this._lastAssetInspectorReport = report || null;
+        this._assetInspectorText = JSON.stringify(report || {}, null, 2);
+        if (this._assetInspectorTitleEl) {
+            const selected = report?.selected;
+            const hash = selected?.identity?.hash || 'none';
+            const file = selected?.identity?.file || 'no hit';
+            this._assetInspectorTitleEl.textContent = selected ? `${hash} / ${file}` : 'No asset selected';
+        }
+        if (this._assetInspectorSummaryEl) {
+            this._assetInspectorSummaryEl.textContent = this._buildAssetInspectorSummary(report);
+        }
+        if (this._assetInspectorBodyEl) {
+            this._assetInspectorBodyEl.textContent = this._assetInspectorText;
+        }
+        if (this._assetInspectorCopyBtn) {
+            this._assetInspectorCopyBtn.textContent = 'Copy metadata';
+        }
+        if (this._assetInspectorEl) {
+            this._assetInspectorEl.style.display = 'block';
+        }
+    }
+
+    _buildAssetInspectorSummary(report) {
+        const selected = report?.selected;
+        if (!selected) {
+            const n = Array.isArray(report?.nearby) ? report.nearby.length : 0;
+            return `hit=none nearby=${n}`;
+        }
+        const id = selected.identity || {};
+        const mat = selected.material || {};
+        const diff = selected.textures?.diffuse || {};
+        const inst = selected.instance || {};
+        const pick = selected.pick || {};
+        return [
+            `hash=${id.hash || 'n/a'} lod=${id.lod || 'n/a'} file=${id.file || 'n/a'}`,
+            `shader=${mat.shaderName || 'n/a'} family=${mat.shaderFamily || 'basic'} diffuse=${diff.state || 'none'}`,
+            `pos=${Array.isArray(inst.dataPosition) ? inst.dataPosition.join(', ') : 'n/a'} pickPx=${pick.distancePx ?? 'n/a'}`,
+        ].join('\n');
+    }
+
+    async _copyAssetInspectorMetadata() {
+        const text = this._assetInspectorText || JSON.stringify(this._lastAssetInspectorReport || {}, null, 2);
+        if (!text) return false;
+        try {
+            await navigator.clipboard.writeText(text);
+            if (this._assetInspectorCopyBtn) {
+                this._assetInspectorCopyBtn.textContent = 'Copied';
+                setTimeout(() => {
+                    if (this._assetInspectorCopyBtn) this._assetInspectorCopyBtn.textContent = 'Copy metadata';
+                }, 900);
+            }
+            return true;
+        } catch {
+            try { window.prompt('Asset metadata:', text); } catch { /* ignore */ }
+            return false;
+        }
+    }
+
+    _requestGameplayPointerLock() {
+        const canCapture = !this.settingsMenuOpen
+            && !!this.followPed
+            && !!this.ped
+            && !document.querySelector('dialog[open]');
+        if (!canCapture || document.pointerLockElement === this.canvas) return false;
+        try {
+            const lock = this.canvas.requestPointerLock?.();
+            if (lock && typeof lock.catch === 'function') void lock.catch(() => {});
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    _setSettingsMenuOpen(open, { recapturePointer = false } = {}) {
+        const nextOpen = !!open;
+        this.settingsMenuOpen = nextOpen;
+
+        const menu = this._settingsMenuEl || document.getElementById('controls');
+        const backdrop = this._settingsBackdropEl || document.getElementById('settingsBackdrop');
+        if (menu) {
+            menu.hidden = !nextOpen;
+            menu.setAttribute('aria-hidden', nextOpen ? 'false' : 'true');
+        }
+        if (backdrop) backdrop.hidden = !nextOpen;
+
+        if (nextOpen) {
+            for (const key of Object.keys(this.keyState || {})) this.keyState[key] = false;
+            if (Array.isArray(this._pedVelocityData)) {
+                this._pedVelocityData[0] = 0.0;
+                this._pedVelocityData[1] = 0.0;
+            }
+            if (this.player) this.player._sprintRequested = false;
+            try { this.weaponController?.clearPointerState?.(); } catch { /* ignore */ }
+            try { this.meleeController?.clearInput?.(); } catch { /* ignore */ }
+            this._suppressPointerUnlockMenu = true;
+            try { document.exitPointerLock?.(); } catch { /* ignore */ }
+            requestAnimationFrame(() => document.getElementById('closeSettings')?.focus());
+            return;
+        }
+
+        const active = document.activeElement;
+        if (active instanceof HTMLElement && menu?.contains(active)) active.blur();
+        try { this.canvas.focus({ preventScroll: true }); } catch { /* ignore */ }
+        if (recapturePointer) this._requestGameplayPointerLock();
+    }
     
     setupEventListeners() {
         // Apply persisted UI state first so all the "read initial values" logic below picks it up.
         this._restoreUiFromStorage();
+        // Route mode is deliberately not persisted: / remains the full-world viewer while
+        // /demo owns the bounded YBN spawn district regardless of earlier UI state.
+        this.spawnDistrictDemo = isSpawnDistrictDemoRoute();
         const hasSavedSettings = !!this._safeLocalStorageGet(_LS_SETTINGS_KEY);
 
         // Window resize
@@ -1911,49 +5271,163 @@ export class App {
         let activePointerId = null;
         let lastX = 0;
         let lastY = 0;
-
-        // Prevent context menu from stealing focus while looking around.
-        this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-
-        this.canvas.addEventListener('pointerdown', (e) => {
-            // Left button only for now; prevents accidental camera motion while interacting with the page.
-            if (e.button !== 0) return;
-            activePointerId = e.pointerId;
-            lastX = e.clientX;
-            lastY = e.clientY;
-            try { this.canvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
-        });
-
-        this.canvas.addEventListener('pointermove', (e) => {
-            if (activePointerId === null || e.pointerId !== activePointerId) return;
-
-            const deltaX = e.clientX - lastX;
-            const deltaY = e.clientY - lastY;
-
-            // In follow-ped mode, orbit around the ped instead of rotating the camera target away.
+        let dragStartX = 0;
+        let dragStartY = 0;
+        let dragDistancePx = 0;
+        let activeCombatPointer = false;
+        const combatInputActive = () => !!this.weaponController?.isVisible?.()
+            && !!this.followPed
+            && !!this.ped
+            && !this._weaponInventoryDialog?.open;
+        const gameplayLookActive = () => !this.settingsMenuOpen
+            && !!this.followPed
+            && !!this.ped
+            && !document.querySelector('dialog[open]');
+        const meleeInputActive = () => gameplayLookActive() && !!this.meleeController?.canUse?.();
+        const syncCombatButtons = (e) => {
+            if (!combatInputActive() || !Number.isFinite(Number(e?.buttons))) return;
+            const buttons = Number(e.buttons);
+            const aiming = (buttons & 2) !== 0;
+            // Establish ADS before evaluating fire. This keeps a simultaneous
+            // RMB + LMB press from being discarded as a non-ADS click.
+            this.weaponController?.setAimHeld?.(aiming);
+            this.weaponController?.setFireHeld?.(aiming && (buttons & 1) !== 0);
+        };
+        const syncMeleeButtons = (e) => {
+            if (!Number.isFinite(Number(e?.buttons))) return;
+            this.meleeController?.setGuardHeld?.(meleeInputActive() && (Number(e.buttons) & 2) !== 0);
+        };
+        const applyPointerCameraDelta = (deltaX, deltaY) => {
             if (this.followPed && this.ped) {
                 if (this.gameplayCamEnabled) this._applyGameplayCameraInputDelta(deltaX, deltaY);
                 else this._orbitFollowPed(deltaX, deltaY);
             } else {
                 this.camera.rotate(deltaX, deltaY);
             }
+        };
+
+        // Prevent context menu from stealing focus while looking around.
+        this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        this.canvas.addEventListener('pointerdown', (e) => {
+            if (this.settingsMenuOpen) return;
+            keyState.shift = !!e.shiftKey;
+            keyState.control = !!e.ctrlKey;
+            keyState.ctrl = !!e.ctrlKey;
+            keyState.alt = !!e.altKey;
+            syncCombatButtons(e);
+            syncMeleeButtons(e);
+            if (gameplayLookActive()) this._requestGameplayPointerLock();
+            if (combatInputActive()) {
+                // Keep a normal captured-pointer path as a fallback when pointer
+                // lock is unavailable or rejected by the embedding browser.
+                activePointerId = e.pointerId;
+                activeCombatPointer = true;
+                lastX = e.clientX;
+                lastY = e.clientY;
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+                dragDistancePx = 0;
+                try { this.canvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+                e.preventDefault();
+                return;
+            }
+            if (meleeInputActive() && (e.button === 0 || e.button === 2)) {
+                if (e.button === 0) this.meleeController?.pressAttack?.();
+                activeCombatPointer = true;
+                e.preventDefault();
+                return;
+            }
+            // Both mouse buttons steer the third-person view. The left button
+            // also drives fire; the right button drives aim while armed.
+            if (e.button !== 0 && e.button !== 2) return;
+            activePointerId = e.pointerId;
+            activeCombatPointer = false;
+            lastX = e.clientX;
+            lastY = e.clientY;
+            dragStartX = e.clientX;
+            dragStartY = e.clientY;
+            dragDistancePx = 0;
+            try { this.canvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+        });
+
+        this.canvas.addEventListener('pointermove', (e) => {
+            if (this.settingsMenuOpen) return;
+            keyState.shift = !!e.shiftKey;
+            keyState.control = !!e.ctrlKey;
+            keyState.ctrl = !!e.ctrlKey;
+            keyState.alt = !!e.altKey;
+            // Pointer Lock in an embedded browser can interrupt the original
+            // pointer capture. Reconcile the real button bitmask on every move
+            // so ADS/fire recover without requiring another click.
+            syncCombatButtons(e);
+            syncMeleeButtons(e);
+            if (document.pointerLockElement === this.canvas && gameplayLookActive()) {
+                applyPointerCameraDelta(Number(e.movementX) || 0.0, Number(e.movementY) || 0.0);
+                return;
+            }
+            if (activePointerId === null || e.pointerId !== activePointerId) return;
+
+            const deltaX = e.clientX - lastX;
+            const deltaY = e.clientY - lastY;
+            dragDistancePx = Math.max(
+                dragDistancePx,
+                Math.hypot(e.clientX - dragStartX, e.clientY - dragStartY),
+            );
+
+            applyPointerCameraDelta(deltaX, deltaY);
 
             lastX = e.clientX;
             lastY = e.clientY;
         });
 
         const stopDrag = (e) => {
+            syncCombatButtons(e);
+            syncMeleeButtons(e);
+            if (e?.button === 0) this.weaponController?.setFireHeld?.(false);
+            if (e?.button === 2) this.weaponController?.setAimHeld?.(false);
+            if (e?.button === 2) this.meleeController?.setGuardHeld?.(false);
+            if (e?.type === 'blur' || e?.type === 'pointercancel') {
+                this.weaponController?.clearPointerState?.();
+                this.meleeController?.clearInput?.();
+            }
             if (activePointerId === null) return;
-            try { this.canvas.releasePointerCapture(activePointerId); } catch { /* ignore */ }
+            const endedPointerId = activePointerId;
+            const endX = Number(e?.clientX);
+            const endY = Number(e?.clientY);
+            const clickDistancePx = (Number.isFinite(endX) && Number.isFinite(endY))
+                ? Math.max(dragDistancePx, Math.hypot(endX - dragStartX, endY - dragStartY))
+                : dragDistancePx;
+            const wasClick = e?.type === 'pointerup' && e.pointerId === endedPointerId && clickDistancePx <= 4.0;
+            try { this.canvas.releasePointerCapture(endedPointerId); } catch { /* ignore */ }
             activePointerId = null;
+            const wasCombatPointer = activeCombatPointer;
+            activeCombatPointer = false;
+            if (wasClick && !wasCombatPointer && e?.button === 0) this._inspectDemoAssetAtClientPoint(e.clientX, e.clientY);
         };
         this.canvas.addEventListener('pointerup', stopDrag);
         this.canvas.addEventListener('pointercancel', stopDrag);
         window.addEventListener('blur', stopDrag);
+        document.addEventListener('pointerlockchange', () => {
+            if (document.pointerLockElement === this.canvas) {
+                this._gameplayPointerWasLocked = true;
+                this._suppressPointerUnlockMenu = false;
+                return;
+            }
+            const shouldOpenMenu = !!this._gameplayPointerWasLocked
+                && !this._suppressPointerUnlockMenu
+                && !this.settingsMenuOpen
+                && !document.querySelector('dialog[open]')
+                && document.hasFocus();
+            this._gameplayPointerWasLocked = false;
+            this._suppressPointerUnlockMenu = false;
+            if (shouldOpenMenu) this._setSettingsMenuOpen(true);
+        });
         
         // Mouse wheel
         this.canvas.addEventListener('wheel', (e) => {
             e.preventDefault();
+            if (this.settingsMenuOpen) return;
             if (this.followPed && this.ped) {
                 if (this.gameplayCamEnabled) this._applyGameplayCameraZoomDelta(e.deltaY);
                 else this._zoomFollowPed(e.deltaY);
@@ -1965,16 +5439,85 @@ export class App {
         
         // Keyboard controls
         const keyState = {};
+        const movementKeyForEvent = (e) => {
+            const code = String(e?.code || '').toLowerCase();
+            if (code === 'shiftleft' || code === 'shiftright') return 'shift';
+            if (code === 'controlleft' || code === 'controlright') return 'control';
+            if (code === 'altleft' || code === 'altright') return 'alt';
+            if (code === 'space') return 'space';
+            if (code === 'keyw') return 'w';
+            if (code === 'keya') return 'a';
+            if (code === 'keys') return 's';
+            if (code === 'keyd') return 'd';
+            return String(e?.key || '').toLowerCase();
+        };
+        const setMovementKey = (e, pressed) => {
+            const key = movementKeyForEvent(e);
+            if (key) keyState[key] = !!pressed;
+            // Keep legacy aliases synchronized for the existing movement code.
+            if (key === 'control') keyState.ctrl = !!pressed;
+            if (key === 'space') {
+                keyState[' '] = !!pressed;
+                keyState.spacebar = !!pressed;
+            }
+        };
         
         window.addEventListener('keydown', (e) => {
-            const k = String(e.key || '').toLowerCase();
+            const k = movementKeyForEvent(e);
+            if (k === 'escape' && !e.repeat) {
+                const modalOpen = !!document.querySelector('dialog[open]');
+                if (!modalOpen) {
+                    this._setSettingsMenuOpen(!this.settingsMenuOpen, { recapturePointer: this.settingsMenuOpen });
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+                return;
+            }
+            if (this.settingsMenuOpen) {
+                e.preventDefault();
+                return;
+            }
+            const target = e.target;
+            if (target instanceof HTMLElement && (
+                target.isContentEditable
+                || target.tagName === 'INPUT'
+                || target.tagName === 'SELECT'
+                || target.tagName === 'TEXTAREA'
+                || target.tagName === 'BUTTON'
+            )) return;
+            if (this.audioSystem?.handleKeyDown?.(e)) return;
             // One-shot debug toggles (don't spam while held).
             if (!e.repeat) {
-                if (k === 'i') {
-                    if (this.drawableStreamer) {
-                        this.drawableStreamer.enableInteriors = !this.drawableStreamer.enableInteriors;
-                        this.drawableStreamer._dirty = true;
-                        console.log(`Interiors enabled: ${this.drawableStreamer.enableInteriors}`);
+                if (k === 'tab' || k === 'i') {
+                    this._toggleWeaponInventory();
+                    e.preventDefault();
+                    return;
+                }
+                if (k === 'z') {
+                    if (!this._weaponInventoryDialog?.open) this.inventoryOverlay?.showHotbar?.();
+                    e.preventDefault();
+                    return;
+                }
+                if (k === '1') {
+                    if (this.weaponController?.toggleDraw?.()) e.preventDefault();
+                    return;
+                }
+                if (k === 'r') {
+                    if (this.weaponController?.reload?.()) e.preventDefault();
+                    return;
+                }
+                if (k === 'b') {
+                    if (this.weaponController?.installSwitch?.()) e.preventDefault();
+                    return;
+                }
+                if (k === 'x') {
+                    if (this.player?.enabled && !this.vehicleController?.inVehicle) {
+                        this.player.handsUp = !this.player.handsUp;
+                        if (this.player.handsUp) {
+                            this.weaponController?.holsterImmediate?.();
+                            this._resetPedMotion?.();
+                        }
+                        e.preventDefault();
                     }
                     return;
                 }
@@ -2002,11 +5545,12 @@ export class App {
                     return;
                 }
             }
-            keyState[k] = true;
+            setMovementKey(e, true);
         });
         
         window.addEventListener('keyup', (e) => {
-            keyState[e.key.toLowerCase()] = false;
+            this.audioSystem?.handleKeyUp?.(e);
+            setMovementKey(e, false);
         });
         
         // Update movement in animation loop
@@ -2014,14 +5558,99 @@ export class App {
         
         // UI controls
         const controlsRoot = document.getElementById('controls');
+        this._settingsMenuEl = controlsRoot;
+        this._settingsBackdropEl = document.getElementById('settingsBackdrop');
+        this._setSettingsMenuOpen(false);
         if (controlsRoot) {
             // One central persistence hook for most UI widgets.
             controlsRoot.addEventListener('change', () => this._scheduleSaveSettings());
             controlsRoot.addEventListener('input', () => this._scheduleSaveSettings());
         }
-        document.getElementById('wireframe').addEventListener('change', (e) => {
-            this.terrainRenderer.setWireframeMode(e.target.checked);
-        });
+        document.getElementById('closeSettings')?.addEventListener('click', () => this._setSettingsMenuOpen(false, { recapturePointer: true }));
+        this._settingsBackdropEl?.addEventListener('click', () => this._setSettingsMenuOpen(false, { recapturePointer: true }));
+        const ambientAudio = document.getElementById('ambientAudio');
+        if (ambientAudio) {
+            this.audioSystem.setAmbientEnabled(!!ambientAudio.checked);
+            ambientAudio.addEventListener('change', (event) => this.audioSystem.setAmbientEnabled(!!event.target.checked));
+        }
+        const ambientVolume = document.getElementById('ambientVolume');
+        if (ambientVolume) {
+            this.audioSystem.setAmbientVolume(ambientVolume.value);
+            ambientVolume.addEventListener('input', (event) => this.audioSystem.setAmbientVolume(event.target.value));
+        }
+        const gameplayAudio = document.getElementById('gameplayAudio');
+        if (gameplayAudio) {
+            this.audioSystem.setGameplayEnabled(!!gameplayAudio.checked);
+            gameplayAudio.addEventListener('change', (event) => this.audioSystem.setGameplayEnabled(!!event.target.checked));
+        }
+        const sfxVolume = document.getElementById('sfxVolume');
+        if (sfxVolume) {
+            this.audioSystem.setSfxVolume(sfxVolume.value);
+            sfxVolume.addEventListener('input', (event) => this.audioSystem.setSfxVolume(event.target.value));
+        }
+        const voiceVolume = document.getElementById('voiceVolume');
+        if (voiceVolume) {
+            this.audioSystem.setVoiceVolume(voiceVolume.value);
+            voiceVolume.addEventListener('input', (event) => this.audioSystem.setVoiceVolume(event.target.value));
+        }
+        const voiceMode = document.getElementById('voiceMode');
+        if (voiceMode) {
+            this.audioSystem.setVoiceMode(voiceMode.value);
+            voiceMode.addEventListener('change', (event) => this.audioSystem.setVoiceMode(event.target.value));
+        }
+        document.getElementById('voiceMicToggle')?.addEventListener('click', () => { void this.audioSystem.toggleMicrophone(); });
+        const weaponToggle = document.getElementById('weaponToggle');
+        if (weaponToggle) weaponToggle.addEventListener('click', () => this.weaponController?.toggleDraw?.());
+        const weaponReload = document.getElementById('weaponReload');
+        if (weaponReload) weaponReload.addEventListener('click', () => this.weaponController?.reload?.());
+        const weaponSwitch = document.getElementById('weaponSwitch');
+        if (weaponSwitch) weaponSwitch.addEventListener('click', () => this.weaponController?.installSwitch?.());
+        const weaponInventory = document.getElementById('weaponInventory');
+        if (weaponInventory) weaponInventory.addEventListener('click', () => this._toggleWeaponInventory());
+        this._weaponInventoryDialog = document.getElementById('weaponInventoryDialog');
+        const assetPicker = document.getElementById('assetPicker');
+        if (assetPicker) {
+            this._setAssetPickerEnabled(!!assetPicker.checked);
+            assetPicker.addEventListener('change', (e) => this._setAssetPickerEnabled(!!e.target.checked));
+        }
+        this._syncWeaponUi();
+        const showPlayerEl = document.getElementById('showPlayer');
+        if (showPlayerEl) {
+            this.showPlayer = !!showPlayerEl.checked;
+            showPlayerEl.addEventListener('change', (e) => {
+                this.showPlayer = !!e.target.checked;
+                if (!this.showPlayer) {
+                    this._clearPlayerEntityMeshes();
+                    return;
+                }
+                void this.ensureModelsInitialized().then((ok) => {
+                    if (ok) this._syncPlayerEntityMesh(true);
+                });
+            });
+        }
+        const showNpcsEl = document.getElementById('showNpcs');
+        if (showNpcsEl) {
+            this.showNpcs = !!showNpcsEl.checked;
+            showNpcsEl.addEventListener('change', (e) => {
+                this.showNpcs = !!e.target.checked;
+                if (this.npcSystem) this.npcSystem.enabled = this.showNpcs;
+                if (!this.showNpcs) this._clearNpcEntityMeshes();
+                else this._syncNpcEntityMeshes(true);
+            });
+        }
+
+        const bindTexturedToggle = (id, property) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            this[property] = !el.checked;
+            el.addEventListener('change', (e) => {
+                this[property] = !e.target.checked;
+            });
+        };
+        bindTexturedToggle('playerTextured', 'playerWireframeMode');
+        bindTexturedToggle('objectsTextured', 'objectsWireframeMode');
+        bindTexturedToggle('terrainTextured', 'terrainWireframeMode');
+        bindTexturedToggle('buildingsTextured', 'buildingsWireframeMode');
 
         const spawnBtn = document.getElementById('spawnPedCity');
         if (spawnBtn) {
@@ -2033,6 +5662,137 @@ export class App {
             // Ensure label matches current state (e.g. restored sessions).
             this._setSpawnCharacterButtonLabel();
             spawnCharBtn.addEventListener('click', () => { void this.spawnCharacter(); });
+        }
+        const characterModelEl = document.getElementById('characterModel');
+        if (characterModelEl) {
+            characterModelEl.addEventListener('change', () => {
+                if (!this.player?.enabled) return;
+                this.runtimeCharacterProfile = null;
+                this.runtimeCharacterSelectedIndex = -1;
+                this.runtimeCharacterDisabledComponentIds = new Set();
+                const sel = document.getElementById('runtimeAppearanceSelect');
+                if (sel) sel.value = '';
+                this._renderRuntimeAppearanceComponents();
+                this._applyPlayerRenderTargetsFromProfileOrUi();
+                try { this._syncPlayerEntityMesh(true); } catch { /* ignore */ }
+            });
+        }
+        const runtimeAppearanceEl = document.getElementById('runtimeAppearanceSelect');
+        if (runtimeAppearanceEl) {
+            runtimeAppearanceEl.addEventListener('change', () => {
+                const idx = Number(runtimeAppearanceEl.value);
+                const profile = Number.isInteger(idx) ? this.runtimeCharacterOptions?.[idx] : null;
+                this.runtimeCharacterSelectedIndex = profile ? idx : -1;
+                this.runtimeCharacterDisabledComponentIds = new Set();
+                if (profile) {
+                    this.runtimeCharacterProfile = structuredClone(profile);
+                    this.runtimeCharacterBaseProfile = structuredClone(profile);
+                    this._applyRuntimeCharacterProfileToUi(profile);
+                    void this._loadRuntimePlayerSkeleton(profile);
+                    void this._loadRuntimePlayerAnimations(profile);
+                } else {
+                    this.runtimeCharacterProfile = null;
+                    this._runtimeCharacterLoadPromise = null;
+                    void this._loadRuntimeCharacterProfile({ timeoutMs: 5_000 }).then(() => {
+                        this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+                        if (this.player?.enabled) this._syncPlayerEntityMesh(true);
+                    });
+                }
+                this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+                if (this.player?.enabled) this._syncPlayerEntityMesh(true);
+            });
+            void this._loadRuntimeCharacterOptions({ timeoutMs: 1100 });
+            void this._loadRuntimeCharacterComponentCatalog();
+        }
+        const creatorDialog = document.getElementById('characterCreatorDialog');
+        document.getElementById('openCharacterCreator')?.addEventListener('click', () => {
+            this._characterCreatorOpenSnapshot = this.runtimeCharacterProfile
+                ? structuredClone(this.runtimeCharacterProfile)
+                : null;
+            this._renderRuntimeAppearanceComponents();
+            this._renderCompleteAppearanceControls();
+            this._syncRuntimeCharacterSexControls();
+            if (creatorDialog?.showModal) creatorDialog.showModal();
+            else if (creatorDialog) creatorDialog.setAttribute('open', '');
+        });
+        const restoreCreatorSnapshot = async () => {
+            const snapshot = this._characterCreatorOpenSnapshot;
+            this._characterCreatorOpenSnapshot = null;
+            if (!snapshot) return;
+            this.runtimeCharacterProfile = structuredClone(snapshot);
+            this.runtimeCharacterDisabledComponentIds = new Set();
+            this._applyRuntimeCharacterProfileToUi(this.runtimeCharacterProfile);
+            this._applyPlayerRenderTargetsFromProfileOrUi();
+            await Promise.all([
+                this._loadRuntimePlayerSkeleton(this.runtimeCharacterProfile),
+                this._loadRuntimePlayerAnimations(this.runtimeCharacterProfile),
+            ]);
+            if (this.player?.enabled) this._syncPlayerEntityMesh(true);
+        };
+        const cancelCreator = async () => {
+            await restoreCreatorSnapshot();
+            creatorDialog?.close?.();
+        };
+        document.getElementById('closeCharacterCreator')?.addEventListener('click', () => { void cancelCreator(); });
+        document.getElementById('cancelCharacterCreator')?.addEventListener('click', () => { void cancelCreator(); });
+        document.getElementById('saveCharacterCreator')?.addEventListener('click', () => {
+            this.runtimeCharacterBaseProfile = this.runtimeCharacterProfile
+                ? structuredClone(this.runtimeCharacterProfile)
+                : null;
+            this._characterCreatorOpenSnapshot = null;
+            this._saveRuntimeAppearanceDraft();
+            creatorDialog?.close?.();
+        });
+        document.getElementById('copyCharacterCreator')?.addEventListener('click', async (event) => {
+            const button = event.currentTarget;
+            const text = JSON.stringify(this._getIlleniumAppearancePayload(), null, 2);
+            try {
+                await navigator.clipboard.writeText(text);
+                button.textContent = 'Copied';
+                window.setTimeout(() => { button.textContent = 'Copy JSON'; }, 1200);
+            } catch {
+                console.log(text);
+            }
+        });
+        creatorDialog?.addEventListener('cancel', (event) => {
+            event.preventDefault();
+            void cancelCreator();
+        });
+        document.querySelectorAll('[data-character-sex]').forEach((button) => {
+            button.addEventListener('click', () => { void this._switchRuntimeCharacterSex(button.dataset.characterSex); });
+        });
+        document.querySelectorAll('[data-character-tab]').forEach((button) => {
+            button.addEventListener('click', () => {
+                const selected = String(button.dataset.characterTab || 'clothing');
+                document.querySelectorAll('[data-character-tab]').forEach((item) => item.setAttribute('aria-selected', String(item === button)));
+                document.querySelectorAll('[data-character-panel]').forEach((panel) => { panel.hidden = panel.dataset.characterPanel !== selected; });
+            });
+        });
+        const resetAppearance = document.getElementById('resetRuntimeAppearance');
+        if (resetAppearance) {
+            resetAppearance.addEventListener('click', () => {
+                if (!this.runtimeCharacterBaseProfile) return;
+                this.runtimeCharacterProfile = structuredClone(this.runtimeCharacterBaseProfile);
+                this.runtimeCharacterDisabledComponentIds = new Set();
+                this._renderRuntimeAppearanceComponents();
+                this._renderCompleteAppearanceControls();
+                this._syncPlayerHairAppearance();
+                this._applyPlayerRenderTargetsFromProfileOrUi({ preserveStored: true });
+                if (this.player?.enabled) this._syncPlayerEntityMesh(true);
+            });
+        }
+        const copyAppearance = document.getElementById('copyRuntimeAppearance');
+        if (copyAppearance) {
+            copyAppearance.addEventListener('click', async () => {
+                const text = JSON.stringify(this._getIlleniumAppearancePayload(), null, 2);
+                try {
+                    await navigator.clipboard.writeText(text);
+                    copyAppearance.textContent = 'Copied';
+                    window.setTimeout(() => { copyAppearance.textContent = 'Copy appearance JSON'; }, 1200);
+                } catch {
+                    console.log(text);
+                }
+            });
         }
 
         const gpCam = document.getElementById('enableGameplayCamera');
@@ -2096,6 +5856,8 @@ export class App {
             });
         }
 
+        this._setSpawnDistrictDemo(this.spawnDistrictDemo, { dropResident: false });
+
         const groundDelta = document.getElementById('groundPedMaxDelta');
         if (groundDelta) {
             const apply = () => {
@@ -2109,9 +5871,11 @@ export class App {
         this._pedDebugEl = document.getElementById('pedDebug');
         this._streamDebugEl = document.getElementById('streamDebug');
         this._bootStatusEl = document.getElementById('bootStatus');
+        this._vehiclePromptEl = document.getElementById('vehiclePrompt');
         this._liveCoordsEl = document.getElementById('liveCoords');
         this._perfHudEl = document.getElementById('perfHud');
         this._rpfStatusEl = document.getElementById('rpfStatus');
+        this._initAssetInspector();
         if (this._streamDebugEl) {
             // Allow multi-line status in the debug HUD.
             this._streamDebugEl.style.whiteSpace = 'pre-line';
@@ -2264,6 +6028,8 @@ export class App {
                             e.target.checked = false;
                         }
                     });
+                } else {
+                    this._dropStreamedResidency({ dropEntities: false });
                 }
             });
         }
@@ -2317,11 +6083,27 @@ export class App {
             });
         }
 
+        const resolveMissing = document.getElementById('resolveMissingArchetypes');
+        if (resolveMissing) {
+            resolveMissing.addEventListener('click', () => {
+                const top = this.drawableStreamer?.getMissingArchetypesTop?.(12) ?? [];
+                if (!top.length) {
+                    console.log('No exportable missing archetypes in the current resident area.');
+                    return;
+                }
+                // Deliberate, bounded local export. The streamer remains resident while this runs.
+                this.modelManager.enableLiveExport = true;
+                this.modelManager.requestLiveExportForHashes?.(top.map((e) => e.hash), { exportTextures: false });
+                console.log(`Queued local export for ${top.length} current-area archetypes.`);
+            });
+        }
+
         const lodSel = document.getElementById('lodLevel');
         if (lodSel) {
             const applyLod = () => {
-                const v = String(lodSel.value ?? '0');
+                let v = String(lodSel.value ?? '0');
                 // UI: 0=Full Detail, 1=Medium, 2=Low.
+                const prev = this.forcedModelLod || null;
                 if (v === '0') this.forcedModelLod = 'high';
                 else if (v === '1') this.forcedModelLod = 'med';
                 else if (v === '2') this.forcedModelLod = 'low';
@@ -2329,6 +6111,11 @@ export class App {
 
                 if (this.drawableStreamer) {
                     this.drawableStreamer.forcedLod = this.forcedModelLod;
+                    this.drawableStreamer._dirty = true;
+                    this.drawableStreamer._dirtyEntityLod = true;
+                }
+                if (prev !== (this.forcedModelLod || null)) {
+                    try { this.instancedModelRenderer?.clearScene?.(); } catch { /* ignore */ }
                 }
                 console.log(`Model LOD: ${this.forcedModelLod ?? 'auto'}`);
                 this._scheduleSaveSettings();
@@ -2341,8 +6128,69 @@ export class App {
         const texSel = document.getElementById('textureQuality');
         if (texSel) {
             const applyTexQ = () => {
-                const q = String(texSel.value ?? 'high').toLowerCase();
+                let q = String(texSel.value ?? 'high').toLowerCase();
+                if (q !== 'high' && q !== 'medium' && q !== 'low') q = 'high';
                 this.textureStreamer?.setQuality?.(q);
+                if (this.spawnDistrictDemo && this.textureStreamer) {
+                    const deviceMemoryGb = Number(this._defaultRuntimeCaps?.deviceMemoryGb);
+                    const constrainedDevice = Number.isFinite(deviceMemoryGb) && deviceMemoryGb <= 4;
+                    if (q === 'high') {
+                        this.textureStreamer.setCacheCaps({
+                            maxTextures: constrainedDevice ? 768 : 1536,
+                            maxBytes: constrainedDevice ? (256 * 1024 * 1024) : (640 * 1024 * 1024),
+                        });
+                        this.textureStreamer.setStreamingConfig({
+                            maxLoadsInFlight: constrainedDevice ? 6 : 10,
+                            maxNewLoadsPerFrame: constrainedDevice ? 18 : 32,
+                        });
+                        this.textureStreamer.setDistanceTierConfig({
+                            highDist: constrainedDevice ? 180 : 420,
+                            mediumDist: constrainedDevice ? 320 : 520,
+                            minResidentMs: constrainedDevice ? 12000 : 24000,
+                        });
+                    } else if (q === 'medium') {
+                        this.textureStreamer.setCacheCaps({
+                            maxTextures: constrainedDevice ? 512 : 1024,
+                            maxBytes: constrainedDevice ? (192 * 1024 * 1024) : (384 * 1024 * 1024),
+                        });
+                        this.textureStreamer.setStreamingConfig({
+                            maxLoadsInFlight: constrainedDevice ? 4 : 6,
+                            maxNewLoadsPerFrame: constrainedDevice ? 8 : 12,
+                        });
+                        this.textureStreamer.setDistanceTierConfig({
+                            highDist: constrainedDevice ? 28 : 45,
+                            mediumDist: constrainedDevice ? 170 : 260,
+                            minResidentMs: constrainedDevice ? 6000 : 12000,
+                        });
+                    } else {
+                        this.textureStreamer.setCacheCaps({
+                            maxTextures: constrainedDevice ? 320 : 512,
+                            maxBytes: constrainedDevice ? (128 * 1024 * 1024) : (192 * 1024 * 1024),
+                        });
+                        this.textureStreamer.setStreamingConfig({
+                            maxLoadsInFlight: constrainedDevice ? 3 : 4,
+                            maxNewLoadsPerFrame: constrainedDevice ? 6 : 8,
+                        });
+                        this.textureStreamer.setDistanceTierConfig({
+                            highDist: 0,
+                            mediumDist: constrainedDevice ? 80 : 120,
+                            minResidentMs: constrainedDevice ? 4000 : 8000,
+                        });
+                    }
+                }
+                try {
+                    this._lastTexPrefetchMs = 0;
+                    this.textureStreamer?.beginFrame?.();
+                    const high = q === 'high';
+                    const limit = high ? (this.spawnDistrictDemo ? 512 : 256) : (q === 'medium' ? 128 : 64);
+                    if (!this.objectsWireframeMode) {
+                        this.instancedModelRenderer?.prefetchDiffuseTextures?.(limit, { includeSecondary: high });
+                    }
+                    if (!this.playerWireframeMode) {
+                        this.playerModelRenderer?.prefetchDiffuseTextures?.(high ? 128 : 48, { includeSecondary: high });
+                    }
+                    this.textureStreamer?.endFrame?.();
+                } catch { /* ignore */ }
                 console.log(`Texture quality: ${q}`);
                 this._scheduleSaveSettings();
             };
@@ -2356,19 +6204,33 @@ export class App {
             const m = Number(document.getElementById('maxLoadedChunks')?.value ?? 25);
             const a = Number(document.getElementById('maxArchetypes')?.value ?? (this.drawableStreamer?.maxArchetypes ?? 250));
             const md = Number(document.getElementById('maxModelDistance')?.value ?? (this.drawableStreamer?.maxModelDistance ?? 350));
+            const vi = Number(document.getElementById('maxVisibleInstances')?.value ?? (this.drawableStreamer?.maxVisibleInstances ?? 12000));
+            const pa = Number(document.getElementById('maxInstancesPerArchetype')?.value ?? (this.drawableStreamer?.maxInstancesPerArchetype ?? 128));
             const ml = Number(document.getElementById('maxMeshLoadsInFlight')?.value ?? (this.instancedModelRenderer?.maxMeshLoadsInFlight ?? 6));
             const fc = !!document.getElementById('frustumCulling')?.checked;
-            const cross = !!document.getElementById('crossArchetypeInstancing')?.checked;
-            const entLod = !!document.getElementById('entityLodTraversal')?.checked;
+            const webgpu = !!document.getElementById('enableWebGpuCulling')?.checked
+                && getWebGpuCullingAvailability().available;
+            let cross = !!document.getElementById('crossArchetypeInstancing')?.checked;
+            if (this.spawnDistrictDemo) {
+                cross = false;
+                this._setControlValue('crossArchetypeInstancing', false);
+            }
+            let entLod = !!document.getElementById('entityLodTraversal')?.checked;
+            if (this.spawnDistrictDemo) {
+                entLod = false;
+                this._setControlValue('entityLodTraversal', false);
+            }
             const radius = Number.isFinite(r) ? Math.max(1, Math.min(24, Math.floor(r))) : 2;
             const maxLoaded = Number.isFinite(m) ? Math.max(9, Math.min(4000, Math.floor(m))) : 25;
             // 0 means "no cap" (distance cutoff still applies).
             const maxArch = Number.isFinite(a) ? Math.max(0, Math.floor(a)) : 250;
             const maxDist = Number.isFinite(md) ? Math.max(0, Math.min(100000, md)) : 350;
+            const maxVisible = Number.isFinite(vi) ? Math.max(1, Math.min(1000000, Math.floor(vi))) : 12000;
+            const maxPerArch = Number.isFinite(pa) ? Math.max(1, Math.min(100000, Math.floor(pa))) : 128;
             const maxLoads = Number.isFinite(ml) ? Math.max(1, Math.min(64, Math.floor(ml))) : 6;
 
             // Cache UI params so boot/ramp can use them without reading DOM repeatedly.
-            this._streamingUiParams = { radius, maxLoaded, maxArch, maxDist, maxLoads, fc };
+            this._streamingUiParams = { radius, maxLoaded, maxArch, maxDist, maxVisible, maxPerArch, maxLoads, fc, webgpu };
             this._cancelStreamingRamp();
 
             // Apply to both point-entity streamer and drawable streamer.
@@ -2381,9 +6243,12 @@ export class App {
                 this.drawableStreamer.radiusChunks = radius;
                 this.drawableStreamer.maxLoadedChunks = maxLoaded;
                 this.drawableStreamer.enableFrustumCulling = fc;
+                this.drawableStreamer.enableWebGpuCulling = webgpu;
                 this.drawableStreamer.forcedLod = this.forcedModelLod;
                 this.drawableStreamer.maxArchetypes = maxArch;
                 this.drawableStreamer.maxModelDistance = maxDist;
+                this.drawableStreamer.maxVisibleInstances = maxVisible;
+                this.drawableStreamer.maxInstancesPerArchetype = maxPerArch;
                 this.drawableStreamer.enableCrossArchetypeInstancing = cross;
                 // Entity-level LOD traversal: selects parent-vs-children leaves like CodeWalker.
                 // This changes chunk parsing + instance selection, so treat as a streaming-mode change.
@@ -2400,7 +6265,7 @@ export class App {
             if (this.instancedModelRenderer) {
                 this.instancedModelRenderer.maxMeshLoadsInFlight = maxLoads;
             }
-            console.log(`Streaming: radiusChunks=${radius}, maxLoadedChunks=${maxLoaded}, maxArchetypes=${maxArch}, maxModelDistance=${maxDist}, maxMeshLoadsInFlight=${maxLoads}, frustumCulling=${fc}`);
+            console.log(`Streaming: radiusChunks=${radius}, maxLoadedChunks=${maxLoaded}, maxArchetypes=${maxArch}, maxModelDistance=${maxDist}, maxVisibleInstances=${maxVisible}, maxInstancesPerArchetype=${maxPerArch}, maxMeshLoadsInFlight=${maxLoads}, frustumCulling=${fc}, webGpuCulling=${webgpu}`);
 
             // Apply chunk-cache toggle (persists across refresh if enabled).
             const cacheChunks = !!document.getElementById('cacheStreamedChunks')?.checked;
@@ -2415,10 +6280,28 @@ export class App {
         if (radiusInput) radiusInput.addEventListener('change', applyStreaming);
         const maxInput = document.getElementById('maxLoadedChunks');
         if (maxInput) maxInput.addEventListener('change', applyStreaming);
+        const maxArchInput = document.getElementById('maxArchetypes');
+        if (maxArchInput) maxArchInput.addEventListener('change', applyStreaming);
         const maxDistInput = document.getElementById('maxModelDistance');
         if (maxDistInput) maxDistInput.addEventListener('change', applyStreaming);
+        const maxVisibleInput = document.getElementById('maxVisibleInstances');
+        if (maxVisibleInput) maxVisibleInput.addEventListener('change', applyStreaming);
+        const maxPerArchInput = document.getElementById('maxInstancesPerArchetype');
+        if (maxPerArchInput) maxPerArchInput.addEventListener('change', applyStreaming);
+        const maxMeshLoadsInput = document.getElementById('maxMeshLoadsInFlight');
+        if (maxMeshLoadsInput) maxMeshLoadsInput.addEventListener('change', applyStreaming);
         const fcInput = document.getElementById('frustumCulling');
         if (fcInput) fcInput.addEventListener('change', applyStreaming);
+        const webGpuInput = document.getElementById('enableWebGpuCulling');
+        if (webGpuInput) {
+            const webGpuAvailability = getWebGpuCullingAvailability();
+            webGpuInput.disabled = !webGpuAvailability.available;
+            webGpuInput.title = webGpuAvailability.available
+                ? 'WebGPU compute culling available'
+                : `WebGPU compute culling unavailable: ${webGpuAvailability.reason}`;
+            if (!webGpuAvailability.available) webGpuInput.checked = false;
+            webGpuInput.addEventListener('change', applyStreaming);
+        }
         const crossInput = document.getElementById('crossArchetypeInstancing');
         if (crossInput) crossInput.addEventListener('change', applyStreaming);
         const entLodInput = document.getElementById('entityLodTraversal');
@@ -2430,6 +6313,9 @@ export class App {
             this.enableOcclusionCulling = !!occ.checked;
             occ.addEventListener('change', (e) => {
                 this.enableOcclusionCulling = !!e.target.checked;
+                if (this.spawnDistrictDemo && this.enableOcclusionCulling) {
+                    this._configureSpawnDistrictDemoOcclusion();
+                }
                 // Keep culler "enabled" in sync so it can early-out cheaply.
                 if (this.occlusionCuller) this.occlusionCuller.enabled = this.enableOcclusionCulling;
             });
@@ -2492,10 +6378,9 @@ export class App {
 
         const cacheChunksEl = document.getElementById('cacheStreamedChunks');
         if (cacheChunksEl) {
-            // If the user hasn't saved settings yet, default to enabling persistent chunk cache
-            // when CacheStorage is available (feels much more game-like on revisits).
+            // Keep persistent chunk cache opt-in. These files can be large and can hide stale exports.
             if (!hasSavedSettings) {
-                try { cacheChunksEl.checked = supportsAssetCacheStorage(); } catch { /* ignore */ }
+                try { cacheChunksEl.checked = !!PERF_PROFILES.gameplay.cacheStreamedChunks; } catch { /* ignore */ }
             }
             this.cacheStreamedChunks = !!cacheChunksEl.checked;
             if (this.entityStreamer) this.entityStreamer.usePersistentCacheForChunks = this.cacheStreamedChunks;
@@ -2511,7 +6396,7 @@ export class App {
         const cacheStatus = document.getElementById('cacheStatus');
         if (cacheStatus) {
             cacheStatus.textContent = supportsAssetCacheStorage()
-                ? 'Cache: enabled (CacheStorage available)'
+                ? 'Cache: available (off by default)'
                 : 'Cache: unavailable (need https/localhost or Vite preview)';
         }
 
@@ -2543,6 +6428,8 @@ export class App {
         const streamCity = document.getElementById('streamCity');
         if (streamCity) {
             streamCity.addEventListener('click', () => {
+                this._applyPerformanceProfile('city', { updateUi: true, dropResident: true, save: true, startModels: true });
+                return;
                 // Reasonable “city feels filled” defaults without going totally unbounded.
                 const r = document.getElementById('streamRadius');
                 const m = document.getElementById('maxLoadedChunks');
@@ -2573,6 +6460,10 @@ export class App {
         if (applyPresetBtn) {
             applyPresetBtn.addEventListener('click', () => {
                 const preset = String(document.getElementById('streamPreset')?.value ?? 'game');
+                const profile = (preset === 'game' || preset === 'gameplay') ? 'gameplay'
+                    : ((preset === 'extreme') ? 'high' : preset);
+                this._applyPerformanceProfile(profile, { updateUi: true, dropResident: true, save: true, startModels: true });
+                return;
                 const r = document.getElementById('streamRadius');
                 const m = document.getElementById('maxLoadedChunks');
                 const a = document.getElementById('maxArchetypes');
@@ -2619,6 +6510,14 @@ export class App {
         }
 
         // One-click “make it look like GTA”: enable world layers + bump streaming.
+        const memorySaverBtn = document.getElementById('applyMemorySaver');
+        if (memorySaverBtn) {
+            memorySaverBtn.addEventListener('click', () => {
+                this._applyPerformanceProfile('gameplay', { updateUi: true, dropResident: true, save: true, startModels: true });
+                this._setBootStatus('Memory saver applied: low LOD, wireframe, bounded caches, resident chunks trimmed.');
+            });
+        }
+
         const highDetailBtn = document.getElementById('applyHighDetail');
         if (highDetailBtn) {
             highDetailBtn.addEventListener('click', () => {
@@ -2627,21 +6526,25 @@ export class App {
                     if (el) el.checked = !!val;
                 };
 
-                // Full scene layers on.
-                setCheck('showTerrain', true);
-                setCheck('showBuildings', true);
+                // Streamed drawables are the authoritative city layer. The heightfield and OBJ
+                // shell remain available as manual fallbacks for coverage gaps.
+                setCheck('showTerrain', false);
+                setCheck('showBuildings', false);
                 setCheck('showWater', true);
                 setCheck('showModels', true);
                 // Dots are debug; keep off for “GTA view”.
                 setCheck('showEntityDots', false);
                 setCheck('entityDotsOverlay', false);
 
-                this.showTerrain = true;
-                this.showBuildings = true;
+                this.showTerrain = false;
+                this.showBuildings = false;
                 this.showWater = true;
                 this.showModels = true;
                 this.showEntityDots = false;
                 this.entityDotsOverlay = false;
+
+                this._applyPerformanceProfile('high', { updateUi: true, dropResident: true, save: true, startModels: true });
+                return;
 
                 // Quality knobs.
                 const texQ = document.getElementById('textureQuality');
@@ -3015,15 +6918,55 @@ export class App {
     }
     
     update() {
-        // Delta time (seconds), clamped to avoid huge jumps on tab-switch.
+        // Simulation delta is clamped to avoid huge jumps on tab-switch, but
+        // diagnostics must retain wall time or stalls below 20 FPS are hidden.
         const now = performance.now();
-        const dt = Math.max(0.001, Math.min(0.05, (now - this._lastFrameMs) / 1000.0));
+        const wallDt = Math.max(0.001, (now - this._lastFrameMs) / 1000.0);
+        const dt = Math.min(0.05, wallDt);
         this._lastFrameMs = now;
+        this._lastUpdateDt = dt;
 
         // Perf HUD timing
-        this._perfDtMs = dt * 1000.0;
-        const fps = 1.0 / dt;
+        this._perfDtMs = wallDt * 1000.0;
+        const fps = 1.0 / wallDt;
         this._fpsEma = (this._fpsEma === null || this._fpsEma === undefined) ? fps : (this._fpsEma * 0.9 + fps * 0.1);
+
+        // Browser-native gameplay systems.
+        let gameplayAction = null;
+        try {
+            gameplayAction = this.interactionSystem?.update?.({
+                posData: this.ped?.posData || null,
+                keyState: this.keyState || {},
+            }) || null;
+            this._lastGameplayAction = gameplayAction;
+        } catch {
+            gameplayAction = null;
+        }
+        try {
+            this.vehicleController?.update?.({
+                action: gameplayAction,
+                keyState: this.keyState || {},
+                dt,
+            });
+        } catch {
+            // ignore
+        }
+        try {
+            const prompt = this.vehicleController?.getPrompt?.() || '';
+            if (this._vehiclePromptEl) {
+                this._vehiclePromptEl.textContent = prompt;
+                this._vehiclePromptEl.hidden = !prompt;
+            }
+        } catch { /* ignore */ }
+        try { this.weaponController?.update?.(dt); } catch { /* ignore */ }
+        try { this.meleeController?.update?.(dt); } catch { /* ignore */ }
+        if (this.spawnDistrictDemo && !this._meleeAnimationsLoaded) void this._ensureMeleeAnimations();
+        if (this.weaponController?.isVisible?.() && !this._weaponCombatAnimationsLoaded) {
+            void this._ensureWeaponCombatAnimations();
+        }
+        try { this._syncWeaponUi(); } catch { /* ignore */ }
+        try { this._syncMeleeUi(); } catch { /* ignore */ }
+        try { this.gtaHud?.update?.(); } catch { /* ignore */ }
 
         // Handle keyboard input
         const moveDir = glMatrix.vec3.create();
@@ -3036,55 +6979,23 @@ export class App {
         if (this.keyState['q']) moveDir[1] += moveSpeed;
         if (this.keyState['e']) moveDir[1] -= moveSpeed;
         
-        if (glMatrix.vec3.length(moveDir) > 0) {
+        if (this.controlPed && this.ped) {
+            this._updateControlledPed(dt);
+        } else if (glMatrix.vec3.length(moveDir) > 0) {
             glMatrix.vec3.normalize(moveDir, moveDir);
-            if (this.controlPed && this.ped) {
-                // Move ped in data space relative to camera facing (character-like).
-                const sprint = !!this.keyState['shift'];
-                const speed = sprint ? 240.0 : 140.0; // units per second in GTA/data space-ish
-
-                // Build a horizontal forward/right basis from camera direction.
-                const fwdView = glMatrix.vec3.fromValues(this.camera.direction[0], this.camera.direction[1], this.camera.direction[2]);
-                fwdView[1] = 0.0; // keep movement on ground plane (viewer-space up is Y)
-                if (glMatrix.vec3.length(fwdView) < 1e-5) fwdView[2] = -1.0;
-                glMatrix.vec3.normalize(fwdView, fwdView);
-                const rightView = glMatrix.vec3.create();
-                glMatrix.vec3.cross(rightView, fwdView, this.camera.up);
-                glMatrix.vec3.normalize(rightView, rightView);
-
-                const fwdData = this._viewerDirToDataDir(fwdView);
-                const rightData = this._viewerDirToDataDir(rightView);
-
-                // moveDir: x=left/right, z=forward/back (per key mapping above)
-                const vx = (moveDir[0] * rightData[0] + moveDir[2] * fwdData[0]) * speed * dt;
-                const vy = (moveDir[0] * rightData[1] + moveDir[2] * fwdData[1]) * speed * dt;
-                const vz = (moveDir[0] * rightData[2] + moveDir[2] * fwdData[2]) * speed * dt;
-
-                this.ped.posData[0] += vx;
-                this.ped.posData[1] += vy;
-                this.ped.posData[2] += vz;
-
-                // Track last movement direction in data space (for player mesh heading).
-                if (this.player) this.player._lastMoveDirData = [vx, vy, vz];
-
-                const hz = this.terrainRenderer.getHeightAtXY?.(this.ped.posData[0], this.ped.posData[1]);
-                if (hz !== null && hz !== undefined) this.ped.posData[2] = hz + this.pedEyeHeightData;
-                this.pedRenderer.setPositions([this.ped.posData]);
-            } else {
-                // Map view (not following a ped): fly camera in the air (move along look direction).
-                // Ped view/follow: keep WASD level to avoid unwanted bobbing while orbiting around the character.
-                // Only flatten in *actual* ped-follow mode (a ped exists). The UI defaults "Follow ped" to checked,
-                // but in the default map view there is no ped, and movement should be true fly (move along look).
-                const flattenForward = !!(this.followPed && this.ped);
-                this.camera.move(moveDir, dt, { flattenForward });
-            }
+            // Map view (not following a ped): fly camera in the air (move along look direction).
+            // Ped view/follow: keep WASD level to avoid unwanted bobbing while orbiting around the character.
+            // Only flatten in *actual* ped-follow mode (a ped exists). The UI defaults "Follow ped" to checked,
+            // but in the default map view there is no ped, and movement should be true fly (move along look).
+            const flattenForward = !!(this.followPed && this.ped);
+            this.camera.move(moveDir, dt, { flattenForward });
         }
 
         // If following a spawned ped, keep target locked to it.
         if (this.followPed && this.ped) {
             // Tighten camera for close-up character-level viewing.
             // (This avoids the old 5km min zoom / huge near plane behavior.)
-            this.camera.setFovDegrees?.(60.0);
+            this.camera.setFovDegrees?.(this.weaponController?.isAiming?.() ? 48.0 : 60.0);
             this.camera.setZoomLimits?.(2.0, 20000.0);
 
             // Use distance-based clip planes so the ped feels correctly scaled and doesn't clip.
@@ -3124,25 +7035,54 @@ export class App {
         // Map-view clip planes: prevent near-plane clipping of close meshes after map framing/zooming.
         try { this._updateMapViewClipPlanes(); } catch { /* ignore */ }
 
-        // Keep the player mesh instance updated (single-instance archetype render).
+        // Keep the player mesh/component instances updated.
+        try { this._updatePlayerAnimationState(dt); } catch { /* ignore */ }
+        try { this.audioSystem?.updateGameplay?.(dt); } catch { /* ignore */ }
         try { this._syncPlayerEntityMesh(false); } catch { /* ignore */ }
+        // The player waits for a complete skinned residency set before drawing.
+        // Pump its focused mesh queue here so that guard cannot stall loading.
+        try { this.playerModelRenderer?.pumpMeshLoadsOnce?.(); } catch { /* ignore */ }
+        try {
+            if (this.npcSystem) this.npcSystem.enabled = !!(this.showNpcs && this.spawnDistrictDemo);
+            this.npcSystem?.update?.(dt);
+            this._npcAnimPhase = (this._npcAnimPhase + (Math.PI * 2.0 / 3.6666667) * dt) % (Math.PI * 2.0);
+            this._syncNpcEntityMeshes(false);
+            this.npcModelRenderer?.pumpMeshLoadsOnce?.();
+            this.npcCombatModelRenderer?.pumpMeshLoadsOnce?.();
+        } catch { /* ignore */ }
+        try {
+            this.multiplayer?.update?.();
+            this._syncRemotePlayerMeshes(false);
+            this.remotePlayerRenderer?.pumpMeshLoadsOnce?.();
+        } catch { /* ignore */ }
+        try { this._syncWeaponModelMesh(false); } catch { /* ignore */ }
+        try { this.weaponModelRenderer?.pumpMeshLoadsOnce?.(); } catch { /* ignore */ }
+        try { this._syncVehicleModelMesh(false); } catch { /* ignore */ }
+        try { this.vehicleModelRenderer?.pumpMeshLoadsOnce?.(); } catch { /* ignore */ }
+        try { this.gameplayPersistence?.update?.(this, this.runtimeGameplayManifest); } catch { /* ignore */ }
 
         // Stream entities based on camera (client-like chunk loading)
-        if (this.entityReady) {
-            const center = (!this.streamFromCamera && this.followPed && this.ped) ? this.ped.posData : null;
+        if (this.entityReady && this.showEntityDots) {
+            const center = this._getStreamingFocusDataPos();
             this.entityStreamer.update(this.camera, this.entityRenderer, center);
         }
 
         // Stream drawables based on camera (requires exported meshes manifest)
         if (this.showModels && this.modelsInitialized) {
-            const center = (!this.streamFromCamera && this.followPed && this.ped) ? this.ped.posData : null;
+            const center = this._getStreamingFocusDataPos();
             try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             this.drawableStreamer.update(this.camera, center);
         }
 
+        // Diagnostics are useful but component-residency scans and large DOM
+        // strings do not belong on the gameplay tick.
+        const debugHudNow = performance.now();
+        const updateDebugHud = debugHudNow - (this._debugHudLastUpdateMs || 0) >= 250;
+        if (updateDebugHud) this._debugHudLastUpdateMs = debugHudNow;
+
         // Streaming debug HUD (helps diagnose "nothing loaded")
-        if (this._streamDebugEl) {
+        if (updateDebugHud && this._streamDebugEl) {
             const eLoaded = this.entityStreamer?.loaded?.size ?? 0;
             const eLoading = this.entityStreamer?.loading?.size ?? 0;
             const eChunks = this.entityRenderer?.chunkBuffers?.size ?? 0;
@@ -3158,12 +7098,55 @@ export class App {
                 ? (
                     `Coverage (loaded area): missing=${cov.missingEntities ?? 0}/${cov.missingArchetypes ?? 0} ` +
                     `unexported(placeholders)=${cov.unexportedEntities ?? 0}/${cov.unexportedArchetypes ?? 0} ` +
+                    `nonrenderable=${cov.nonRenderableEntities ?? 0}/${cov.nonRenderableArchetypes ?? 0} ` +
+                    `deduped=${cov.duplicateInstancesDropped ?? 0} ` +
+                    `frustum=${cov.frustumCulledInstances ?? 0}/${cov.frustumTestedInstances ?? 0} ` +
+                    `wasm=${cov.wasmCullingKeptInstances ?? 0}/${cov.wasmCullingTestedInstances ?? 0} ` +
+                    `webgpu=${cov.webGpuCullingKeptInstances ?? 0}/${cov.webGpuCullingTestedInstances ?? 0}` +
+                    `${cov.webGpuCullingReason ? `(${cov.webGpuCullingReason})` : ''} ` +
                     `cappedInstances=${cov.droppedInstances ?? 0} ` +
                     `cappedArchetypes=${cov.droppedArchetypes ?? 0}`
                 )
                 : 'Coverage (loaded area): n/a';
+            const spawnPoint = this._runtimeSpawnInfo?.ped;
+            const spawnCoords = Array.isArray(spawnPoint) && Number.isFinite(Number(spawnPoint[0])) && Number.isFinite(Number(spawnPoint[1]))
+                ? ` @ ${Number(spawnPoint[0]).toFixed(2)}, ${Number(spawnPoint[1]).toFixed(2)}, ${Number(spawnPoint[2]).toFixed(2)}`
+                : '';
+            const spawnLine = this._runtimeSpawnInfo
+                ? `Spawn: ${this._runtimeSpawnInfo.kind}${spawnCoords}${this._runtimeSpawnInfo.source ? ` (${this._runtimeSpawnInfo.source})` : ''}`
+                : 'Spawn: local fallback';
+            const district = this.spawnDistrictBounds;
+            const districtLine = this.spawnDistrictDemo && district
+                ? `District: demo ${Math.round(district.maxX - district.minX)}m x ${Math.round(district.maxY - district.minY)}m, boundary active`
+                : 'District: full-map streaming';
+            const charProfile = this.runtimeCharacterProfile || null;
+            const ps = this._playerMeshStatus || this._getPlayerMeshStatus();
+            const skinLine = (ps.loadedSkinnedSubmeshes || ps.loadedSkinInfluenceSubmeshes)
+                ? ` skinData=${ps.loadedSkinInfluenceSubmeshes || 0}/${ps.loadedSkinnedSubmeshes || 0} skeleton=${ps.skinningSkeletonReady ? 'on' : (ps.skinningExpected ? 'loading' : 'off')} ycd=${ps.skinningAnimationsReady ? ps.skinningAnimationClips.join('/') : 'off'}`
+                : ' skinData=none';
+            const compTotal = Array.isArray(charProfile?.components) ? charProfile.components.length : 0;
+            const compActive = Array.isArray(ps.activeComponents) ? ps.activeComponents.length : 0;
+            const compLine = compTotal ? ` components=${compActive}/${compTotal}` : '';
+            const playerMeshLine = ` player=${ps.readyCount}/${ps.required || ps.targetCount || 0}${compLine} submeshes=${ps.loadedRealSubmeshes || 0}${skinLine} q=${ps.queued || 0}/${ps.inFlight || 0} fallback=${ps.fallbackVisible ? 'on' : 'off'}`;
+            const playerEntryLine = Array.isArray(ps.entries) && ps.entries.length
+                ? `Components: ${ps.entries.map((entry) => `${entry.label}[shard=${entry.shardLoaded ? 1 : 0},meta=${entry.manifestReady ? 1 : 0},entry=${entry.entry ? 1 : 0},mesh=${entry.loadedReal || 0}]`).join(' ')}`
+                : 'Components: n/a';
+            const charRenderKind = charProfile?.render?.skinning ? 'skinned components' : 'static components';
+            const charLine = charProfile
+                ? `Character: ${charProfile.modelName || 'unknown'} render=${charProfile.render?.mode || 'unknown'} meshes=${this.player?.hashes?.length || 0} gait=${this.player?.animGait || 'idle'} (${charRenderKind})${playerMeshLine}\n${playerEntryLine}`
+                : `Character: ${document.getElementById('characterModel')?.value || DEFAULT_CHARACTER_MODEL_NAME} render=single gait=${this.player?.animGait || 'idle'} (static drawable)${playerMeshLine}\n${playerEntryLine}`;
+            const gameplayLine = [
+                this._gameplayManifestStatus ? `Manifest: ${this._gameplayManifestStatus}` : 'Manifest: n/a',
+                this.interactionSystem?.getStatusLine?.() || '',
+                this.vehicleController?.getStatusLine?.() || '',
+                this.gameplayPersistence?.getStatusLine?.() || '',
+            ].filter(Boolean).join('\n');
 
             this._streamDebugEl.textContent =
+                `${spawnLine}\n` +
+                `${districtLine}\n` +
+                `${charLine}\n` +
+                `${gameplayLine}\n` +
                 `Entities: ready=${!!this.entityReady} chunks=${eChunks} loaded=${eLoaded} loading=${eLoading} dots=${!!this.showEntityDots}` +
                 (es ? ` started=${es.started ?? 0} ok=${es.loaded ?? 0} abort=${es.aborted ?? 0} fail=${es.failed ?? 0}` : '') +
                 (es && es.lastError ? ` lastErr=${String(es.lastError).slice(0, 80)}` : '') +
@@ -3173,7 +7156,7 @@ export class App {
         }
 
         // Live camera coords HUD (copy/paste friendly)
-        if (this._liveCoordsEl) {
+        if (updateDebugHud && this._liveCoordsEl) {
             const pv = this.camera?.position || [0, 0, 0];
             const pd = this._viewerPosToDataPos(pv);
             const fmt3 = (v) => `${v[0].toFixed(3)}, ${v[1].toFixed(3)}, ${v[2].toFixed(3)}`;
@@ -3184,14 +7167,35 @@ export class App {
         }
 
         // Debug readout for spawned ped grounding.
-        if (this._pedDebugEl && this._pedGroundingDebug) {
+        if (updateDebugHud && this._pedDebugEl && this._pedGroundingDebug) {
             const d = this._pedGroundingDebug;
             const gz = (d.groundZ === null || d.groundZ === undefined) ? 'n/a' : d.groundZ.toFixed(2);
+            const dgz = (d.demoGroundZ === null || d.demoGroundZ === undefined) ? 'n/a' : d.demoGroundZ.toFixed(2);
             const iz = (d.interiorFloorZ === null || d.interiorFloorZ === undefined) ? 'n/a' : d.interiorFloorZ.toFixed(2);
+            const hz = Number.isFinite(d.terrainEnvelopeZ) ? d.terrainEnvelopeZ.toFixed(2) : 'n/a';
+            const heightVisualZ = Number.isFinite(d.terrainEnvelopeZ)
+                ? d.terrainEnvelopeZ + (Number(this._terrainDebugVisualOffset) || 0.0)
+                : NaN;
+            const hvz = Number.isFinite(heightVisualZ) ? heightVisualZ.toFixed(2) : 'n/a';
+            const yz = Number.isFinite(d.ybnZ) ? d.ybnZ.toFixed(2) : 'n/a';
+            const ryz = Number.isFinite(d.rawYbnZ) ? d.rawYbnZ.toFixed(2) : 'n/a';
+            const yoff = Number.isFinite(d.ybnAlignmentOffset) ? d.ybnAlignmentOffset.toFixed(2) : 'n/a';
             const dz = Number.isFinite(d.desiredZ) ? d.desiredZ.toFixed(2) : 'n/a';
-            const mode = d.usedInterior ? 'interior' : (d.usedGround ? 'terrain' : 'kept');
-            this._pedDebugEl.textContent = `Z desired=${dz} | ground=${gz} | interiorFloor=${iz} | final=${d.finalZ.toFixed(2)} | ${mode}`;
-        } else if (this._pedDebugEl) {
+            const mode = d.usedInterior
+                ? 'interior'
+                : ((d.groundSource === 'ybn' || d.usedYbnGround)
+                    ? 'YBN collision'
+                    : (d.usedDemoGround ? 'demo' : (d.usedGround ? 'terrain' : 'kept')));
+            const blocked = d.blocked ? ` | blocked=${d.blockReason || 'yes'}` : '';
+            const playerMeshStatus = this._playerMeshStatus || this._getPlayerMeshStatus?.() || null;
+            const meshFootZ = this._getPlayerMeshFootLocalZData?.(playerMeshStatus);
+            const footBounds = playerMeshStatus?.contactBoundsData || null;
+            const meshFoot = Number.isFinite(meshFootZ) ? Number(meshFootZ).toFixed(3) : 'n/a';
+            const meshBounds = footBounds
+                ? `${Number(footBounds.minZ).toFixed(3)}..${Number(footBounds.maxZ).toFixed(3)}`
+                : 'n/a';
+            this._pedDebugEl.textContent = `Z savedRoot=${dz} | heightmap raw=${hz} visual=${hvz} | YBN raw=${ryz} aligned=${yz} offset=${yoff} | selectedFloor=${gz} | demo=${dgz} | interiorFloor=${iz} | finalEye=${d.finalZ.toFixed(2)} | meshFoot=${meshFoot} bounds=${meshBounds} anchors=${playerMeshStatus?.footAnchorEntries || 0} | ${mode}${blocked}`;
+        } else if (updateDebugHud && this._pedDebugEl) {
             this._pedDebugEl.textContent = '';
         }
 
@@ -3200,6 +7204,12 @@ export class App {
     }
     
     render() {
+        const terrainWireframe = !!this.terrainWireframeMode;
+        const buildingsWireframe = !!this.buildingsWireframeMode;
+        const objectsWireframe = !!this.objectsWireframeMode;
+        const playerWireframe = !!this.playerWireframeMode;
+        const allVisibleGeometryWireframe = terrainWireframe && buildingsWireframe && objectsWireframe && (!this.showPlayer || playerWireframe);
+
         // Color pipeline note:
         // The UI stores colors in sRGB-ish space (what humans pick), but our shaders do lighting/fog math in *linear*.
         // Passing sRGB colors directly into linear math causes an overly strong blue/purple cast (especially fog/env).
@@ -3276,7 +7286,7 @@ export class App {
         const ambientIntensity = 0.08 + 0.35 * day01;
 
         // Draw sky gradient (atmosphere). This is a pure background pass.
-        if (this.atmosphereEnabled && this.skyRenderer?.ready) {
+        if (!allVisibleGeometryWireframe && this.atmosphereEnabled && this.skyRenderer?.ready) {
             // Simple timecycle-ish sky colors (blend between a night palette and the configured day palette).
             const nightTop = [0.02, 0.03, 0.06];
             const nightBottom = [0.01, 0.02, 0.03];
@@ -3305,16 +7315,19 @@ export class App {
                 moonColor: _srgbToLinear3([0.70, 0.78, 0.90]),
                 moonIntensity: moonI,
                 starIntensity: starI,
+                fastStateRestore: !!this.spawnDistrictDemo,
             });
         }
         
         // Enable depth testing
         this.gl.enable(this.gl.DEPTH_TEST);
         
-        // Check for WebGL errors
-        const error = this.gl.getError();
-        if (error !== this.gl.NO_ERROR) {
-            console.error('WebGL error before render:', error);
+        // Driver error polling is opt-in; gl.getError() can synchronize WebGL.
+        if (this.debugFrameGlErrors) {
+            const error = this.gl.getError();
+            if (error !== this.gl.NO_ERROR) {
+                console.error('WebGL error before render:', error);
+            }
         }
         
         // Render terrain (heightmap)
@@ -3332,6 +7345,8 @@ export class App {
                 lightColor,
                 ambientIntensity,
                 outputSrgb,
+                wireframe: terrainWireframe,
+                wireframeColor: [0.0, 1.0, 0.72],
             });
         }
 
@@ -3354,13 +7369,15 @@ export class App {
                         ambientIntensity,
                     },
                     cameraPos: this.camera.position,
+                    wireframe: buildingsWireframe,
+                    wireframeColor: [0.70, 0.86, 1.0],
                 }
             );
         }
 
         // Render real models
         if (this.showModels && this.modelsInitialized && this.instancedModelRenderer?.ready) {
-            // Optional occlusion depth prepass (terrain/buildings) into an offscreen depth buffer.
+            // Optional occlusion depth prepass into an offscreen depth buffer.
             // This MUST happen before we ask InstancedModelRenderer to cull by depth.
             if (this.enableOcclusionCulling && this.occlusionCuller) {
                 this.occlusionCuller.enabled = true;
@@ -3386,6 +7403,14 @@ export class App {
                                 }
                             );
                         }
+                        // Streamed GTA drawables are the primary occluders. The earlier
+                        // terrain/OBJ-only pass could not let a nearby high-rise hide the
+                        // material work for city drawables behind it.
+                        this.instancedModelRenderer.renderOccluderDepth?.(this.camera.viewProjectionMatrix, {
+                            maxDistance: this.spawnDistrictDemo ? 160 : 130,
+                            maxDrawItems: this.spawnDistrictDemo ? 96 : 48,
+                            minRadius: this.spawnDistrictDemo ? 3.0 : 4.0,
+                        });
                     },
                 });
 
@@ -3427,9 +7452,17 @@ export class App {
                 shadowEnabled: !!this.enableShadows,
                 shadowMapSize: Number(this.shadowMapSize) || 2048,
                 occlusion: (this.enableOcclusionCulling ? this.occlusionCuller : null),
+                gpuFrustumCulling: !!(this.spawnDistrictDemo && this.drawableStreamer?.enableWorkerFrustumCulling),
+                fastStateRestore: !!this.spawnDistrictDemo,
+                alphaToCoverageEnabled: !this.spawnDistrictDemo,
+                restoreFramebuffer: sceneFbo || null,
+                restoreViewportWidth: this.canvas.width,
+                restoreViewportHeight: this.canvas.height,
                 viewportWidth: this.canvas.width,
                 viewportHeight: this.canvas.height,
                 outputSrgb,
+                wireframe: objectsWireframe,
+                wireframeColor: [0.82, 0.92, 1.0],
             });
 
             // Kick texture streaming even if the first few frames are mesh-bound or camera is far away.
@@ -3438,11 +7471,25 @@ export class App {
             try {
                 if (!this._lastTexPrefetchMs) this._lastTexPrefetchMs = 0;
                 const now = performance.now();
-                if (now - this._lastTexPrefetchMs > 900) {
+                const textureQuality = String(this.textureStreamer?.quality || 'medium').toLowerCase();
+                const highDemoQuality = this.spawnDistrictDemo && textureQuality === 'high';
+                const prefetchIntervalMs = highDemoQuality ? 700 : (this.spawnDistrictDemo ? 1200 : 900);
+                const prefetchLimit = highDemoQuality ? 256 : (this.spawnDistrictDemo ? 96 : 64);
+                if (!this.objectsWireframeMode && now - this._lastTexPrefetchMs > prefetchIntervalMs) {
                     this._lastTexPrefetchMs = now;
-                    this.instancedModelRenderer.prefetchDiffuseTextures?.(256);
+                    this.instancedModelRenderer.prefetchDiffuseTextures?.(prefetchLimit, { includeSecondary: highDemoQuality });
                 }
             } catch { /* ignore */ }
+        }
+
+        if (this.spawnDistrictDemo && this.demoBoundaryRenderer?.ready) {
+            try {
+                this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+                this.demoBoundaryRenderer.render(this.camera.viewProjectionMatrix, { fastStateRestore: true });
+            } catch (error) {
+                console.warn('Demo boundary render failed:', error);
+            }
         }
 
         // Render streamed entities on top
@@ -3465,15 +7512,330 @@ export class App {
             }
         }
 
-        // Render the spawned ped marker last
-        if (this.ped && this.pedRenderer?.ready) {
+        // Render the player's components in their own pass so player wireframe and city/object wireframe stay independent.
+        const playerMeshStatus = this._getPlayerMeshStatus();
+        const vehicleMeshActive = !!this._vehicleModelMeshReady && !!this.vehicleModelRenderer?.ready;
+        if (vehicleMeshActive) {
+            try {
+                this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+                this.vehicleModelRenderer.render(this.camera.viewProjectionMatrix, true, this.camera.position, {
+                    enabled: this.atmosphereEnabled && this.fogEnabled,
+                    color: fogColorLinear,
+                    start: this.fogStart,
+                    end: this.fogEnd,
+                    lightDir: sunDir,
+                    lightColor,
+                    ambientIntensity,
+                    showWater: false,
+                    shadowEnabled: false,
+                    occlusion: null,
+                    fastStateRestore: true,
+                    restoreFramebuffer: sceneFbo || null,
+                    restoreViewportWidth: this.canvas.width,
+                    restoreViewportHeight: this.canvas.height,
+                    viewportWidth: this.canvas.width,
+                    viewportHeight: this.canvas.height,
+                    outputSrgb,
+                    wireframe: false,
+                    allowTextureIndexMiss: true,
+                    characterLocomotion: null,
+                    vehicleWheels: {
+                        spinRad: Number(this.vehicleController?.vehicle?.wheelRotationRad) || 0.0,
+                        steeringRad: (Number(this.vehicleController?.vehicle?.steering) || 0.0) * 0.55,
+                    },
+                });
+                this.vehicleModelRenderer.prefetchDiffuseTextures?.(48, { allowIndexMiss: true, includeSecondary: true });
+            } catch (error) {
+                console.warn('Vehicle model render failed:', error);
+            }
+        }
+
+        if (this.showNpcs && this.spawnDistrictDemo && this.npcSystem?.npcs?.length && this.npcModelRenderer?.ready) {
+            try {
+                this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+                this.npcModelRenderer.render(this.camera.viewProjectionMatrix, true, this.camera.position, {
+                    enabled: this.atmosphereEnabled && this.fogEnabled,
+                    color: fogColorLinear,
+                    start: this.fogStart,
+                    end: this.fogEnd,
+                    lightDir: sunDir,
+                    lightColor,
+                    ambientIntensity,
+                    showWater: false,
+                    shadowEnabled: false,
+                    occlusion: null,
+                    fastStateRestore: true,
+                    restoreFramebuffer: sceneFbo || null,
+                    restoreViewportWidth: this.canvas.width,
+                    restoreViewportHeight: this.canvas.height,
+                    viewportWidth: this.canvas.width,
+                    viewportHeight: this.canvas.height,
+                    outputSrgb,
+                    wireframe: false,
+                    allowTextureIndexMiss: false,
+                    characterLocomotion: {
+                        enabled: true,
+                        move01: 0.72,
+                        phase: this._npcAnimPhase,
+                        gait: 'walk',
+                        stride: 0.72,
+                        combat: null,
+                    },
+                });
+                this.npcModelRenderer.prefetchDiffuseTextures?.(64);
+            } catch (error) {
+                console.warn('NPC render failed:', error);
+            }
+        }
+
+        if (this.showNpcs && this.spawnDistrictDemo && this._npcAnimatedNpcs.length && this.npcCombatModelRenderer?.ready) {
+            try {
+                for (const npc of this._npcAnimatedNpcs) {
+                    const pose = this.npcSystem?.getAnimationPose?.(npc);
+                    if (!pose) continue;
+                    this._setNpcRendererInstances(
+                        this.npcCombatModelRenderer,
+                        this._npcCombatActiveMeshKeys,
+                        this._npcAnimationHashes,
+                        [npc],
+                        false,
+                    );
+                    this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                    this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+                    this.npcCombatModelRenderer.render(this.camera.viewProjectionMatrix, true, this.camera.position, {
+                        enabled: this.atmosphereEnabled && this.fogEnabled,
+                        color: fogColorLinear,
+                        start: this.fogStart,
+                        end: this.fogEnd,
+                        lightDir: sunDir,
+                        lightColor,
+                        ambientIntensity,
+                        showWater: false,
+                        shadowEnabled: false,
+                        occlusion: null,
+                        fastStateRestore: true,
+                        restoreFramebuffer: sceneFbo || null,
+                        restoreViewportWidth: this.canvas.width,
+                        restoreViewportHeight: this.canvas.height,
+                        viewportWidth: this.canvas.width,
+                        viewportHeight: this.canvas.height,
+                        outputSrgb,
+                        wireframe: false,
+                        allowTextureIndexMiss: false,
+                        characterLocomotion: {
+                            enabled: false,
+                            move01: 0.0,
+                            phase: 0.0,
+                            gait: 'idle',
+                            stride: 1.0,
+                            combat: {
+                                armed: false,
+                                melee: true,
+                                phase: pose.phase,
+                                clip: pose.clip,
+                                clipProgress: pose.progress,
+                                progress: pose.progress,
+                                blend: 1.0,
+                            },
+                        },
+                    });
+                }
+                this.npcCombatModelRenderer.prefetchDiffuseTextures?.(64);
+            } catch (error) {
+                console.warn('Combat NPC render failed:', error);
+            }
+        }
+
+        if (this.spawnDistrictDemo && this._remotePlayers.length && this.remotePlayerRenderer?.ready) {
+            try {
+                for (const remote of this._remotePlayers) {
+                    const remoteHashes = Array.isArray(remote.appearance?.hashes) && remote.appearance.hashes.length
+                        ? remote.appearance.hashes.slice(0, 32).map((hash) => String(hash)).filter(Boolean)
+                        : this._remotePlayerAnimationHashes;
+                    this._setNpcRendererInstances(
+                        this.remotePlayerRenderer,
+                        this._remotePlayerActiveMeshKeys,
+                        remoteHashes,
+                        [remote],
+                        false,
+                    );
+                    this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                    this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+                    const gait = String(remote.gait || 'idle');
+                    let remoteCombat = null;
+                    if (remote.dead) {
+                        remoteCombat = { phase: 'dead', clip: 'melee_death_a', clipProgress: 0.96, progress: 0.96, blend: 1.0, incapacitated: true };
+                    } else if (remote.meleeAttacking) {
+                        const clips = { right_punch: 'melee_punch_right', left_punch: 'melee_punch_left', front_kick: 'melee_kick' };
+                        remoteCombat = { armed: false, melee: true, phase: 'attack', attackType: remote.meleeAction, clip: clips[remote.meleeAction] || 'melee_punch_right', progress: Number(remote.meleeProgress) || 0, clipProgress: Number(remote.meleeProgress) || 0, blend: 1.0 };
+                    } else if (remote.weaponPhase && remote.weaponPhase !== 'holstered') {
+                        remoteCombat = { armed: true, phase: remote.weaponPhase, firing: !!remote.weaponFiring, aiming: remote.weaponPhase === 'equipped', blend: 1.0, clipProgress: remote.weaponFiring ? 0.35 : 1.0 };
+                    }
+                    this.remotePlayerRenderer.render(this.camera.viewProjectionMatrix, true, this.camera.position, {
+                        enabled: this.atmosphereEnabled && this.fogEnabled,
+                        color: fogColorLinear,
+                        start: this.fogStart,
+                        end: this.fogEnd,
+                        lightDir: sunDir,
+                        lightColor,
+                        ambientIntensity,
+                        showWater: false,
+                        shadowEnabled: false,
+                        occlusion: null,
+                        fastStateRestore: true,
+                        restoreFramebuffer: sceneFbo || null,
+                        restoreViewportWidth: this.canvas.width,
+                        restoreViewportHeight: this.canvas.height,
+                        viewportWidth: this.canvas.width,
+                        viewportHeight: this.canvas.height,
+                        outputSrgb,
+                        wireframe: false,
+                        allowTextureIndexMiss: false,
+                        characterLocomotion: {
+                            enabled: !remote.dead && !remote.inVehicle && Number(remote.move01) > 0.005,
+                            move01: remote.inVehicle ? 0.0 : Number(remote.move01) || 0.0,
+                            phase: Number(remote.phase) || 0.0,
+                            gait: remote.inVehicle ? 'idle' : gait,
+                            stride: gait === 'sprint' ? 1.25 : (gait === 'walk' ? 0.72 : 1.0),
+                            combat: remoteCombat,
+                            gesture: remote.inVehicle ? { active: true, clip: 'sit' } : null,
+                        },
+                    });
+                }
+                this.remotePlayerRenderer.prefetchDiffuseTextures?.(64);
+            } catch (error) {
+                console.warn('Remote player render failed:', error);
+            }
+        }
+
+        if (this.showPlayer && playerMeshStatus.ready && this.modelsInitialized && this.playerModelRenderer?.ready) {
+            const playerAnimation = this._getPlayerAnimationForRender();
+            const gait = String(playerAnimation?.gait || 'idle');
+            const stride = gait === 'sprint' ? 1.25 : (gait === 'walk' ? 0.72 : 1.0);
+            try {
+                this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+            } catch { /* ignore */ }
+            this.playerModelRenderer.render(this.camera.viewProjectionMatrix, true, this.camera.position, {
+                enabled: this.atmosphereEnabled && this.fogEnabled,
+                color: fogColorLinear,
+                start: this.fogStart,
+                end: this.fogEnd,
+                lightDir: sunDir,
+                lightColor,
+                ambientIntensity,
+                showWater: false,
+                shadowEnabled: false,
+                occlusion: null,
+                fastStateRestore: true,
+                restoreFramebuffer: sceneFbo || null,
+                restoreViewportWidth: this.canvas.width,
+                restoreViewportHeight: this.canvas.height,
+                viewportWidth: this.canvas.width,
+                viewportHeight: this.canvas.height,
+                outputSrgb,
+                wireframe: playerWireframe,
+                wireframeColor: [0.82, 1.0, 0.9],
+                allowTextureIndexMiss: false,
+                characterLocomotion: playerAnimation ? {
+                    enabled: !playerAnimation.gesture?.active && Number(playerAnimation.move01) > 0.005,
+                    move01: playerAnimation.gesture?.active ? 0.0 : playerAnimation.move01,
+                    phase: playerAnimation.phase,
+                    gait,
+                    stride,
+                    combat: playerAnimation.combat,
+                    gesture: playerAnimation.gesture,
+                } : null,
+            });
+
+            try {
+                if (!this.playerWireframeMode) this.playerModelRenderer.prefetchDiffuseTextures?.(48);
+            } catch { /* ignore */ }
+        }
+
+        // The player pass samples the current YCD palette. Update the held prop
+        // immediately afterwards so it uses this frame's SKEL_R_Hand transform,
+        // not the previous frame's wrist position.
+        try { this._syncWeaponModelMesh(false); } catch { /* ignore */ }
+
+        const weaponMeshActive = !!this._weaponModelMeshReady
+            && !!this.weaponController?.isVisible?.()
+            && !!this.weaponModelRenderer?.ready;
+        if (weaponMeshActive) {
+            try {
+                this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+                this.weaponModelRenderer.render(this.camera.viewProjectionMatrix, true, this.camera.position, {
+                    enabled: this.atmosphereEnabled && this.fogEnabled,
+                    color: fogColorLinear,
+                    start: this.fogStart,
+                    end: this.fogEnd,
+                    lightDir: sunDir,
+                    lightColor,
+                    ambientIntensity,
+                    showWater: false,
+                    shadowEnabled: false,
+                    occlusion: null,
+                    fastStateRestore: true,
+                    restoreFramebuffer: sceneFbo || null,
+                    restoreViewportWidth: this.canvas.width,
+                    restoreViewportHeight: this.canvas.height,
+                    viewportWidth: this.canvas.width,
+                    viewportHeight: this.canvas.height,
+                    outputSrgb,
+                    wireframe: playerWireframe,
+                    wireframeColor: [0.82, 1.0, 0.9],
+                    // This isolated FiveM weapon manifest intentionally sits outside
+                    // the world texture index. Its paths are local and known, so do
+                    // not let the base-world index gate its texture request.
+                    allowTextureIndexMiss: true,
+                    characterLocomotion: null,
+                });
+                if (!playerWireframe) this.weaponModelRenderer.prefetchDiffuseTextures?.(4, { allowIndexMiss: true });
+            } catch (error) {
+                console.warn('Glock-17 model render failed:', error);
+            }
+        }
+
+        if (this.showPlayer && !this.vehicleController?.inVehicle && this.ped && this.weaponRenderer?.ready) {
+            try {
+                this.weaponRenderer.render(this, this.camera.viewProjectionMatrix, {
+                    wireframe: playerWireframe,
+                    drawFallbackModel: !weaponMeshActive,
+                });
+            } catch (error) {
+                console.warn('Weapon render failed:', error);
+            }
+        }
+
+        // Render the spawned ped/player marker last.
+        if (this.showPlayer && !this.vehicleController?.inVehicle && this.ped && this.pedRenderer?.ready) {
             const dist = this.camera.getDistance();
             const pt = Math.max(6.0, Math.min(18.0, dist / 1200.0));
-            // Render as overlay for the same reason as entity dots.
-            const depthWasEnabled = this.gl.isEnabled(this.gl.DEPTH_TEST);
-            if (depthWasEnabled) this.gl.disable(this.gl.DEPTH_TEST);
-            this.pedRenderer.render(this.camera.viewProjectionMatrix, pt, [0.15, 0.8, 1.0, 1.0]);
-            if (depthWasEnabled) this.gl.enable(this.gl.DEPTH_TEST);
+            const playerMeshStatus = this._getPlayerMeshStatus();
+            const playerMeshReady = !!playerMeshStatus.ready;
+            if (!playerMeshReady) {
+                // Render fallback as overlay for the same reason as entity dots.
+                const depthWasEnabled = this.gl.isEnabled(this.gl.DEPTH_TEST);
+                if (depthWasEnabled) this.gl.disable(this.gl.DEPTH_TEST);
+                if (this.player?.enabled && this.pedRenderer.renderCharacter) {
+                    this.pedRenderer.renderCharacter(
+                        this.camera.viewProjectionMatrix,
+                        this.ped.posData,
+                        Number(this.player.headingRad) || 0.0,
+                        {
+                            eyeHeightData: this.pedEyeHeightData,
+                            color: playerWireframe ? [0.82, 1.0, 0.9, 1.0] : [0.1, 0.95, 1.0, 1.0],
+                            animation: this._getPlayerAnimationForRender(),
+                        }
+                    );
+                } else {
+                    this.pedRenderer.render(this.camera.viewProjectionMatrix, pt, [0.15, 0.8, 1.0, 1.0]);
+                }
+                if (depthWasEnabled) this.gl.enable(this.gl.DEPTH_TEST);
+            }
         }
         
         // If postFX is enabled (and active), tonemap+encode to the canvas now.
@@ -3483,15 +7845,17 @@ export class App {
             } catch { /* ignore */ }
         }
 
-        // Check for WebGL errors after render
-        const errorAfter = this.gl.getError();
-        if (errorAfter !== this.gl.NO_ERROR) {
-            console.error('WebGL error after render:', errorAfter);
-            // If models are enabled and the model renderer recorded a culprit drawable, surface it here too.
-            try {
-                const e = this.instancedModelRenderer?._lastGlError || null;
-                if (e) console.error('InstancedModelRenderer last GL error detail:', e);
-            } catch { /* ignore */ }
+        // gl.getError() can synchronize the command queue. Keep it out of the
+        // gameplay frame unless explicit driver diagnostics are enabled.
+        if (this.debugFrameGlErrors) {
+            const errorAfter = this.gl.getError();
+            if (errorAfter !== this.gl.NO_ERROR) {
+                console.error('WebGL error after render:', errorAfter);
+                try {
+                    const e = this.instancedModelRenderer?._lastGlError || null;
+                    if (e) console.error('InstancedModelRenderer last GL error detail:', e);
+                } catch { /* ignore */ }
+            }
         }
 
         // End-of-frame: allow streamer to do eviction/housekeeping.
@@ -3529,22 +7893,45 @@ export class App {
 
         const r = this.instancedModelRenderer?.getRenderStats?.() || null;
         const occ = this.instancedModelRenderer?._occlusionStats || null;
+        let occCull = null;
+        try { occCull = this.occlusionCuller?.getStats?.() || null; } catch { occCull = null; }
         const mesh = this.modelManager?.getMeshCacheStats?.() || null;
         const tex = this.textureStreamer?.getStats?.() || null;
 
         const lines = [];
         lines.push(`Frame: ${dtMs.toFixed(2)} ms  |  FPS(avg): ${fpsAvg.toFixed(1)}${Number.isFinite(gpuMs) ? `  |  GPU: ${gpuMs.toFixed(2)} ms` : ''}`);
+        lines.push(
+            `CPU: update=${Number(this._cpuUpdateMs || 0).toFixed(2)} ms  ` +
+            `render=${Number(this._cpuRenderMs || 0).toFixed(2)} ms  ` +
+            `frame=${Number(this._cpuFrameMs || 0).toFixed(2)} ms`
+        );
 
         if (r) {
             lines.push(
                 `Models: draws=${r.drawCalls ?? 0} items=${r.drawItems ?? 0} ` +
                 `buckets=${r.bucketDraws ?? 0} submeshes=${r.submeshDraws ?? 0}`
             );
-            lines.push(`        inst=${r.instances ?? 0} tris≈${r.triangles ?? 0}${occ ? `  |  occ tested=${occ.tested ?? 0} culled=${occ.culled ?? 0}` : ''}`);
+            lines.push(`        inst=${r.instances ?? 0} tris≈${r.triangles ?? 0}${occ ? `  |  occ tested=${occ.tested ?? 0} culled=${occ.culled ?? 0} depth=${occ.depthDraws ?? 0}` : ''}`);
             // Texture diagnostics:
             if (r.diffuseWanted !== undefined) {
                 lines.push(
-                    `        tex(diffuse): wanted=${r.diffuseWanted ?? 0} real=${r.diffuseReal ?? 0} placeholder=${r.diffusePlaceholder ?? 0} missingUvItems=${r.drawItemsMissingUv ?? 0}`
+                    `        tex(diffuse): wanted=${r.diffuseWanted ?? 0} real=${r.diffuseReal ?? 0} ` +
+                    `placeholder=${r.diffusePlaceholder ?? 0} missingIndex=${r.diffuseMissingFromIndex ?? 0} ` +
+                    `missingUvItems=${r.drawItemsMissingUv ?? 0}`
+                );
+                if ((r.diffuseMissingFromIndex ?? 0) > 0 && Array.isArray(r.diffuseMissingFromIndexTop) && r.diffuseMissingFromIndexTop.length) {
+                    const top = r.diffuseMissingFromIndexTop
+                        .slice(0, 5)
+                        .map((x) => `${x.hash || x.rel}x${x.count ?? 0}`)
+                        .join(', ');
+                    lines.push(`        tex missingIndex top: ${top}`);
+                }
+            }
+            if (occCull && this.enableOcclusionCulling) {
+                lines.push(
+                    `        hzb=${occCull.hzbBuilt ? 'on' : 'off'} levels=${occCull.hzbLevels ?? 0} ` +
+                    `hzbCulled=${occCull.hzbCulled ?? 0}/${occCull.hzbTests ?? 0} ` +
+                    `kept=${occCull.temporalKeeps ?? 0} build=${Number(occCull.lastHzbBuildMs ?? 0).toFixed(2)}ms`
                 );
             }
         } else {
@@ -3555,7 +7942,14 @@ export class App {
             lines.push(`Mesh cache: count=${mesh.count ?? 0}  bytes≈${this._formatBytes(mesh.approxBytes ?? 0)} / ${this._formatBytes(mesh.maxBytes ?? 0)}  evict=${mesh.evictions ?? 0}`);
         }
         if (tex) {
-            lines.push(`Tex cache:  count=${tex.textures ?? 0}  bytes≈${this._formatBytes(tex.bytes ?? 0)} / ${this._formatBytes(tex.maxBytes ?? 0)}  evict=${tex.evictions ?? 0}`);
+            lines.push(
+                `Tex cache: resident=${tex.textures ?? 0} entries=${tex.cacheEntries ?? 0} loading=${tex.loading ?? 0} ` +
+                `bytes≈${this._formatBytes(tex.bytes ?? 0)} / ${this._formatBytes(tex.maxBytes ?? 0)} evict=${tex.evictions ?? 0}`
+            );
+            lines.push(
+                `Tex stream: inFlight=${tex.loadsInFlight ?? 0}/${tex.maxLoadsInFlight ?? 0} ` +
+                `requests=${tex.lastFrameRequests ?? 0} touches=${tex.lastFrameTouches ?? 0} missing404=${tex.missing404 ?? 0}`
+            );
             if (tex.lastErrorUrl || tex.lastErrorMsg) {
                 const u = tex.lastErrorUrl ? String(tex.lastErrorUrl) : 'n/a';
                 const m = tex.lastErrorMsg ? String(tex.lastErrorMsg) : 'n/a';
@@ -3567,8 +7961,14 @@ export class App {
     }
     
     animate() {
+        const frameStart = performance.now();
         this.update();
+        const renderStart = performance.now();
+        this._cpuUpdateMs = renderStart - frameStart;
         this.render();
+        const frameEnd = performance.now();
+        this._cpuRenderMs = frameEnd - renderStart;
+        this._cpuFrameMs = frameEnd - frameStart;
         requestAnimationFrame(() => this.animate());
     }
 
@@ -3577,13 +7977,23 @@ export class App {
      * (Not all browsers guarantee this runs, but it's cheap and helps long dev sessions.)
      */
     destroy() {
+        try { this.gameplayPersistence?.save?.(this, this.runtimeGameplayManifest); } catch { /* ignore */ }
+        try { this.multiplayer?.destroy?.(); } catch { /* ignore */ }
+        try { this.audioSystem?.destroy?.(); } catch { /* ignore */ }
+        try { this.gtaHud?.destroy?.(); } catch { /* ignore */ }
         try { this.drawableStreamer?.destroy?.(); } catch { /* ignore */ }
+        try { this._clearRemotePlayerMeshes(); } catch { /* ignore */ }
+        try { this.remotePlayerRenderer?.destroy?.(); } catch { /* ignore */ }
+        try { this._clearVehicleModelMesh(); } catch { /* ignore */ }
+        try { this.vehicleModelRenderer?.destroy?.(); } catch { /* ignore */ }
+        try { this._clearWeaponModelMesh(); } catch { /* ignore */ }
+        try { this.weaponRenderer?.destroy?.(); } catch { /* ignore */ }
         // We could add more teardown here later (textures, buffers, etc.) if needed.
     }
 }
 
-// Start application when page loads
-window.addEventListener('load', () => {
+// Start after document load, or immediately when a cached module arrives after it.
+const startApplication = () => {
     const canvas = document.getElementById('glCanvas');
     const app = new App(canvas);
     // Tear down background workers when leaving the page.
@@ -3629,6 +8039,101 @@ window.addEventListener('load', () => {
                 if (el && el.type === 'checkbox') el.checked = !!on;
                 // Re-apply streaming params so it takes effect immediately.
                 app?._applyStreamingFromUI?.();
+                return true;
+            } catch {
+                return false;
+            }
+        };
+        window.__viewerPlayerStatus = () => {
+            try { return app?._getPlayerMeshStatus?.() || null; } catch { return null; }
+        };
+        window.__viewerWeaponAnimationDiagnostics = () => {
+            try {
+                return {
+                    schema: 'webglgta-weapon-animation-diagnostics-v2',
+                    characterPose: app?.weaponController?.getCharacterPose?.() || null,
+                    weapon: app?.weaponController?.getStatus?.() || null,
+                    renderer: app?.playerModelRenderer?.getWeaponAnimationDiagnostics?.() || null,
+                };
+            } catch {
+                return null;
+            }
+        };
+        window.__viewerMeleeDiagnostics = () => {
+            try {
+                return {
+                    schema: 'webglgta-melee-diagnostics-v1',
+                    status: app?.meleeController?.getStatus?.() || null,
+                    playerCombat: app?._getPlayerCharacterLocomotion?.()?.combat || null,
+                    meleeAnimations: {
+                        loaded: !!app?._meleeAnimationsLoaded,
+                        unavailable: !!app?._meleeAnimationsUnavailable,
+                    },
+                };
+            } catch {
+                return null;
+            }
+        };
+        window.__viewerVehicleStatus = () => {
+            try {
+                const state = app?.vehicleController?.getRenderState?.() || null;
+                return {
+                    schema: 'webglgta-vehicle-status-v1',
+                    state,
+                    distanceToPlayer: app?.vehicleController?.getDistanceToPlayer?.() ?? null,
+                    prompt: app?.vehicleController?.getPrompt?.() || '',
+                    meshReady: !!app?._vehicleModelMeshReady,
+                    rendererReady: !!app?.vehicleModelRenderer?.ready,
+                    lastEvent: app?.vehicleController?.lastEvent || '',
+                };
+            } catch {
+                return null;
+            }
+        };
+        window.__viewerGroundingStatus = () => {
+            try {
+                const ps = app?._getPlayerMeshStatus?.() || null;
+                const ped = app?.ped?.posData || null;
+                const eye = Number(app?.pedEyeHeightData) || 0.0;
+                return {
+                    schema: 'webglgta-grounding-status-v1',
+                    ped: ped ? {
+                        posData: [Number(ped[0]), Number(ped[1]), Number(ped[2])],
+                        eyeHeightData: eye,
+                        feetZ: Number(ped[2]) - eye,
+                    } : null,
+                    grounding: app?._pedGroundingDebug || null,
+                    playerMesh: {
+                        ready: !!ps?.ready,
+                        footLocalZ: app?._getPlayerMeshFootLocalZData?.(ps) ?? 0.0,
+                        contactBoundsData: ps?.contactBoundsData || null,
+                        footAnchorEntries: ps?.footAnchorEntries || 0,
+                        localBoundsData: ps?.localBoundsData || null,
+                        entries: Array.isArray(ps?.entries) ? ps.entries.map((e) => ({
+                            label: e.label,
+                            componentId: e.componentId,
+                            footAnchor: !!e.footAnchor,
+                            loadedReal: e.loadedReal,
+                            localBoundsData: e.localBoundsData || null,
+                        })) : [],
+                    },
+                };
+            } catch {
+                return null;
+            }
+        };
+        window.__viewerSetRuntimeComponentEnabled = (componentId, enabled) => {
+            try {
+                const id = Number(componentId);
+                if (!Number.isFinite(id)) return false;
+                if (!(app.runtimeCharacterDisabledComponentIds instanceof Set)) {
+                    app.runtimeCharacterDisabledComponentIds = new Set();
+                }
+                if (enabled) app.runtimeCharacterDisabledComponentIds.delete(id);
+                else app.runtimeCharacterDisabledComponentIds.add(id);
+                app._renderRuntimeAppearanceComponents?.();
+                app._applyPlayerRenderTargetsFromProfileOrUi?.({ preserveStored: true });
+                if (app.player?.enabled) app._syncPlayerEntityMesh?.(true);
                 return true;
             } catch {
                 return false;
@@ -3807,7 +8312,25 @@ window.addEventListener('load', () => {
                 return { schema: 'webglgta-texture-frame-dump-v1', error: String(e?.message || e || 'unknown') };
             }
         };
+
+        window.__viewerLastAssetPick = () => {
+            try {
+                return app?._lastAssetInspectorReport || app?.instancedModelRenderer?.getLastPickReport?.() || null;
+            } catch {
+                return null;
+            }
+        };
+
+        window.__viewerCopyLastAssetPick = async () => {
+            try {
+                return await app?._copyAssetInspectorMetadata?.();
+            } catch {
+                return false;
+            }
+        };
     } catch {
         // ignore
     }
-}); 
+};
+if (document.readyState === 'loading') window.addEventListener('load', startApplication, { once: true });
+else startApplication();

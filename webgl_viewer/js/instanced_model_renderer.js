@@ -1,6 +1,14 @@
 import { glMatrix } from './glmatrix.js';
 import { ShaderProgram } from './shader_program.js';
 import { TexturePathResolver } from './texture_path_resolver.js';
+import { extractFrustumPlanes } from './frustum_culling.js';
+
+const VEHICLE_WHEEL_PIVOTS = Object.freeze({
+    27922: Object.freeze([-0.7025, 1.3375, -0.0775]),
+    26418: Object.freeze([0.7025, 1.3375, -0.0775]),
+    27902: Object.freeze([-0.7025, -1.3375, -0.0775]),
+    26398: Object.freeze([0.7025, -1.3375, -0.0775]),
+});
 
 const vsSource = `#version 300 es
 layout(location=0) in vec3 aPosition;
@@ -11,6 +19,8 @@ layout(location=8) in vec4 aColor0;
 layout(location=11) in vec4 aColor1;
 layout(location=9) in vec2 aTexcoord1;
 layout(location=10) in vec2 aTexcoord2;
+layout(location=13) in vec4 aBlendWeights;
+layout(location=14) in vec4 aBlendIndices;
 
 // mat4 takes 4 attribute slots; we bind at locations 4..7
 layout(location=4) in vec4 aI0;
@@ -23,6 +33,9 @@ layout(location=12) in float aTintIndex;
 
 uniform mat4 uViewProjectionMatrix;
 uniform mat4 uModelMatrix;
+uniform bool uGpuFrustumCulling;
+uniform vec4 uGpuFrustumPlanes[6];
+uniform float uGpuCullRadius;
 // Directional shadow mapping (light-space transform for current frame).
 uniform mat4 uLightViewProj;
 uniform vec4 uUv0ScaleOffset; // (scaleU, scaleV, offsetU, offsetV)
@@ -30,6 +43,14 @@ uniform vec4 uUv1ScaleOffset; // (scaleU, scaleV, offsetU, offsetV)
 uniform vec4 uUv2ScaleOffset; // (scaleU, scaleV, offsetU, offsetV)
 uniform vec3 uGlobalAnimUV0;  // dot(globalAnimUV0, vec3(uv,1))
 uniform vec3 uGlobalAnimUV1;  // dot(globalAnimUV1, vec3(uv,1))
+// Optional low-cost locomotion fallback for static ped component drawables.
+// x=enabled, y=movement 0..1, z=phase radians, w=stride multiplier.
+uniform vec4 uCharacterLocomotion;
+uniform bool uFragmentTransformEnabled;
+uniform vec3 uFragmentPivot;
+uniform mat3 uFragmentRotation;
+uniform bool uSkinningEnabled;
+uniform sampler2D uBoneTexture; // 1 x (paletteBoneCount * 3), RGBA32F rows
 
 out vec3 vWorldPos;
 out vec3 vN;
@@ -47,9 +68,146 @@ vec3 safeNormalize(vec3 v) {
     return (l > 1e-8) ? (v / l) : vec3(0.0, 1.0, 0.0);
 }
 
+bool instanceSphereOutsideFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        if (dot(uGpuFrustumPlanes[i].xyz, center) + uGpuFrustumPlanes[i].w < -radius) return true;
+    }
+    return false;
+}
+
+void emitCulledVertex() {
+    vWorldPos = vec3(0.0);
+    vN = vec3(0.0, 1.0, 0.0);
+    vT = vec4(1.0, 0.0, 0.0, 1.0);
+    vUv = aTexcoord;
+    vUv1 = aTexcoord1;
+    vUv2 = aTexcoord2;
+    vColor0 = aColor0;
+    vColor1 = aColor1;
+    vTintIndex = aTintIndex;
+    vLightSpacePos = vec4(0.0);
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+}
+
+vec3 rotateAboutX(vec3 v, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return vec3(v.x, c * v.y - s * v.z, s * v.y + c * v.z);
+}
+
+float gaitAngle(vec3 sourcePosition, bool arm) {
+    float move = clamp(uCharacterLocomotion.y, 0.0, 1.0);
+    float sidePhase = sourcePosition.x < 0.0 ? 0.0 : 3.14159265;
+    float base = sin(uCharacterLocomotion.z + sidePhase);
+    float stride = max(0.35, uCharacterLocomotion.w);
+    return base * move * stride * (arm ? -0.34 : 0.30);
+}
+
+vec3 characterDeformPosition(vec3 sourcePosition) {
+    if (uCharacterLocomotion.x < 0.5 || uCharacterLocomotion.y < 0.005) return sourcePosition;
+
+    // Freemode components share GTA ped-local coordinates: Z is up, legs sit near
+    // the centerline below the pelvis, and arms are outboard of the torso. This is
+    // intentionally limited to the player renderer; world drawables stay static.
+    bool isLeg = abs(sourcePosition.x) < 0.32 && sourcePosition.z < 0.10;
+    if (isLeg) {
+        vec3 pivot = vec3(0.0, 0.0, 0.08);
+        return pivot + rotateAboutX(sourcePosition - pivot, gaitAngle(sourcePosition, false));
+    }
+
+    bool isArm = abs(sourcePosition.x) > 0.30 && sourcePosition.z > -0.30 && sourcePosition.z < 0.56;
+    if (isArm) {
+        float shoulderX = sourcePosition.x < 0.0 ? -0.33 : 0.33;
+        vec3 pivot = vec3(shoulderX, 0.0, 0.50);
+        return pivot + rotateAboutX(sourcePosition - pivot, gaitAngle(sourcePosition, true));
+    }
+    return sourcePosition;
+}
+
+vec3 characterDeformDirection(vec3 direction, vec3 sourcePosition) {
+    if (uCharacterLocomotion.x < 0.5 || uCharacterLocomotion.y < 0.005) return direction;
+    bool isLeg = abs(sourcePosition.x) < 0.32 && sourcePosition.z < 0.10;
+    if (isLeg) return rotateAboutX(direction, gaitAngle(sourcePosition, false));
+    bool isArm = abs(sourcePosition.x) > 0.30 && sourcePosition.z > -0.30 && sourcePosition.z < 0.56;
+    if (isArm) return rotateAboutX(direction, gaitAngle(sourcePosition, true));
+    return direction;
+}
+
+vec4 boneRow(int paletteIndex, int row) {
+    ivec2 sz = textureSize(uBoneTexture, 0);
+    int maxPaletteBones = max(0, sz.y / 3);
+    if (maxPaletteBones <= 0) {
+        if (row == 0) return vec4(1.0, 0.0, 0.0, 0.0);
+        if (row == 1) return vec4(0.0, 1.0, 0.0, 0.0);
+        return vec4(0.0, 0.0, 1.0, 0.0);
+    }
+    int pi = clamp(paletteIndex, 0, maxPaletteBones - 1);
+    return texelFetch(uBoneTexture, ivec2(0, pi * 3 + clamp(row, 0, 2)), 0);
+}
+
+vec3 skinPositionByBone(int paletteIndex, vec3 p) {
+    vec4 hp = vec4(p, 1.0);
+    vec4 r0 = boneRow(paletteIndex, 0);
+    vec4 r1 = boneRow(paletteIndex, 1);
+    vec4 r2 = boneRow(paletteIndex, 2);
+    return vec3(dot(r0, hp), dot(r1, hp), dot(r2, hp));
+}
+
+vec3 skinDirectionByBone(int paletteIndex, vec3 d) {
+    vec4 r0 = boneRow(paletteIndex, 0);
+    vec4 r1 = boneRow(paletteIndex, 1);
+    vec4 r2 = boneRow(paletteIndex, 2);
+    return vec3(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d));
+}
+
+ivec4 blendPaletteIndices() {
+    return ivec4(
+        int(floor(aBlendIndices.x + 0.5)),
+        int(floor(aBlendIndices.y + 0.5)),
+        int(floor(aBlendIndices.z + 0.5)),
+        int(floor(aBlendIndices.w + 0.5))
+    );
+}
+
+vec4 normalizedBlendWeights() {
+    vec4 w = max(aBlendWeights, vec4(0.0));
+    float s = w.x + w.y + w.z + w.w;
+    return (s > 1e-6) ? (w / s) : vec4(1.0, 0.0, 0.0, 0.0);
+}
+
+vec3 skinPosition(vec3 p) {
+    ivec4 bi = blendPaletteIndices();
+    vec4 w = normalizedBlendWeights();
+    return skinPositionByBone(bi.x, p) * w.x
+        + skinPositionByBone(bi.y, p) * w.y
+        + skinPositionByBone(bi.z, p) * w.z
+        + skinPositionByBone(bi.w, p) * w.w;
+}
+
+vec3 skinDirection(vec3 d) {
+    ivec4 bi = blendPaletteIndices();
+    vec4 w = normalizedBlendWeights();
+    return skinDirectionByBone(bi.x, d) * w.x
+        + skinDirectionByBone(bi.y, d) * w.y
+        + skinDirectionByBone(bi.z, d) * w.z
+        + skinDirectionByBone(bi.w, d) * w.w;
+}
+
 void main() {
     mat4 inst = mat4(aI0, aI1, aI2, aI3);
-    vec4 dataPos = inst * vec4(aPosition, 1.0);
+    if (uGpuFrustumCulling) {
+        float instScale = max(length(aI0.xyz), max(length(aI1.xyz), length(aI2.xyz)));
+        float radius = max(0.0, uGpuCullRadius) * max(1.0, instScale);
+        if (instanceSphereOutsideFrustum(aI3.xyz, radius)) {
+            emitCulledVertex();
+            return;
+        }
+    }
+    vec3 sourcePosition = uFragmentTransformEnabled
+        ? uFragmentPivot + uFragmentRotation * (aPosition - uFragmentPivot)
+        : aPosition;
+    vec3 localPosition = uSkinningEnabled ? skinPosition(sourcePosition) : characterDeformPosition(sourcePosition);
+    vec4 dataPos = inst * vec4(localPosition, 1.0);
     vec4 worldPos = uModelMatrix * dataPos;
     vWorldPos = worldPos.xyz;
     // Correct normal/tangent transform includes the instance transform too.
@@ -61,8 +219,12 @@ void main() {
     mat3 m3 = mat3(uModelMatrix * inst);
     float detM3 = determinant(m3);
     mat3 nmat = (abs(detM3) > 1e-10) ? transpose(inverse(m3)) : mat3(uModelMatrix);
-    vN = safeNormalize(nmat * aNormal);
-    vec3 tw = safeNormalize(nmat * aTangent.xyz);
+    vec3 sourceNormal = uFragmentTransformEnabled ? uFragmentRotation * aNormal : aNormal;
+    vec3 sourceTangent = uFragmentTransformEnabled ? uFragmentRotation * aTangent.xyz : aTangent.xyz;
+    vec3 localNormal = uSkinningEnabled ? skinDirection(sourceNormal) : characterDeformDirection(sourceNormal, sourcePosition);
+    vec3 localTangent = uSkinningEnabled ? skinDirection(sourceTangent) : characterDeformDirection(sourceTangent, sourcePosition);
+    vN = safeNormalize(nmat * localNormal);
+    vec3 tw = safeNormalize(nmat * localTangent);
     vT = vec4(tw, aTangent.w);
     // Match CodeWalker BasicVS GlobalUVAnim() then apply per-material scale/offset (GTA-style).
     vec3 uvw = vec3(aTexcoord, 1.0);
@@ -99,6 +261,8 @@ flat in float vTintIndex;
 out vec4 fragColor;
 
 uniform vec3 uColor;
+uniform int uVertexColorMode; // 0=off, 1=Colour0.rgb, 2=Colour1.rgb
+uniform bool uDoubleSidedLighting;
 uniform vec3 uLightDir;
 uniform vec3 uLightColor;
 uniform float uAmbient;
@@ -149,17 +313,21 @@ uniform sampler2D uAO;
 uniform float uAOStrength;
 uniform int uAOUvSet;
 
-// Tiny tint palette (optional). Index 0 should be white/no-tint.
+// GTA tint palettes are 256 pixels wide. Colour0.b/Colour1.b select X and
+// the entity tint index selects the palette row.
 uniform bool uEnableTintPalette;
 uniform sampler2D uTintPalette;
-uniform vec2 uTintPaletteSelector; // best-effort: (u,v) base selector; y selects palette row
 // Tint modes (CodeWalker-ish):
 // 0 = none
-// 1 = instance tint index (vTintIndex 0..255) sampled across a 256-wide palette row
+// 1 = legacy viewer instance index sampled across X (kept for old custom assets)
 // 2 = weapon palette: derive palette X from diffuse alpha (round(a*255)-32) * (1/128)
 // 3 = vertex colour 0: use vColor0.b directly as palette X (0..1)
 // 4 = vertex colour 1: use vColor1.b directly as palette X (0..1)
 uniform int uTintMode;
+// Freemode hair texture 0 stores dye masks, not display-ready RGB.
+uniform bool uPedHairTint;
+uniform vec3 uPedHairPrimary;
+uniform vec3 uPedHairHighlight;
 
 // Color pipeline:
 // - When textures are uploaded as sRGB (preferred), sampling returns linear and uDecodeSrgb should be false.
@@ -288,6 +456,8 @@ uniform bool uFogEnabled;
 uniform vec3 uFogColor;
 uniform float uFogStart;
 uniform float uFogEnd;
+uniform bool uWireframe;
+uniform vec3 uWireframeColor;
 
 vec3 decodeSrgb(vec3 c) {
     // Exact-ish sRGB -> linear (matches GPU sRGB decode much better than pow(2.2)).
@@ -327,6 +497,20 @@ vec2 maybeFlipY(vec2 uv, bool flipY) {
     return flipY ? vec2(uv.x, 1.0 - uv.y) : uv;
 }
 
+float tintPaletteEntityRow() {
+    // CodeWalker: (TintPaletteIndex + 0.5) / palette.Height. The index is
+    // per entity, so it must remain a varying rather than a draw-call uniform.
+    int paletteHeight = max(textureSize(uTintPalette, 0).y, 1);
+    float row = clamp(floor(max(vTintIndex, 0.0) + 0.5), 0.0, float(paletteHeight - 1));
+    return (row + 0.5) / float(paletteHeight);
+}
+
+float tintPaletteWeaponRow() {
+    // weapon_*_palette shaders always sample the center of row zero.
+    int paletteHeight = max(textureSize(uTintPalette, 0).y, 1);
+    return 0.5 / float(paletteHeight);
+}
+
 vec2 parallaxUv(vec2 uv, vec3 Vt) {
     // Best-effort parallax offset mapping.
     // uParallaxScaleBias.x controls strength; y is bias.
@@ -359,6 +543,11 @@ vec2 envLatLongUv(vec3 dir) {
 vec3 safeNormalize(vec3 v) {
     float l = length(v);
     return (l > 1e-8) ? (v / l) : vec3(0.0, 1.0, 0.0);
+}
+
+float diffuseAmount(vec3 N, vec3 L) {
+    float ndl = dot(N, L);
+    return uDoubleSidedLighting ? abs(ndl) : max(ndl, 0.0);
 }
 
 float shadowAmount(vec3 N, vec3 L) {
@@ -394,6 +583,11 @@ void main() {
     // CodeWalker BasicVS computes Bitangent as cross(tangent, normal) * tangent.w (see BasicVS_PNCCTTTX.hlsl).
     // Match that handedness here so normal map Y axis matches CodeWalker.
     vec3 B = safeNormalize(cross(T, N) * vT.w);
+    if (uDoubleSidedLighting && !gl_FrontFacing) {
+        N = -N;
+        T = -T;
+        B = -B;
+    }
 
     // --- Terrain path (CodeWalker TerrainPS-style blend, for terrain_cb_* drawables) ---
     // We keep this within WebGL2 minimum texture unit counts by repurposing existing samplers.
@@ -452,18 +646,18 @@ void main() {
 
         // Terrain tint palette (best-effort): multiply by the same tint pipeline as basic.
         if (uEnableTintPalette) {
-            float y = clamp(uTintPaletteSelector.y, 0.0, 1.0);
+            float tintY = tintPaletteEntityRow();
             // Tint palette is a colour lookup texture; decode if it wasn't uploaded as sRGB.
             // (Some compressed upload paths can't use sRGB internal formats.)
             #define TINT_SAMPLE(uv) (uDecodeTintPaletteSrgb ? decodeSrgb(texture(uTintPalette, (uv)).rgb) : texture(uTintPalette, (uv)).rgb)
             if (uTintMode == 1) {
                 float idx = clamp(vTintIndex, 0.0, 255.0);
-                vec2 tuv = vec2((idx + 0.5) / 256.0, y);
+                vec2 tuv = vec2((idx + 0.5) / 256.0, tintY);
                 base *= TINT_SAMPLE(tuv);
             } else if (uTintMode == 3) {
-                base *= TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), y));
+                base *= TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), tintY));
             } else if (uTintMode == 4) {
-                base *= TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), y));
+                base *= TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), tintY));
             }
             #undef TINT_SAMPLE
         }
@@ -491,7 +685,7 @@ void main() {
         }
 
         vec3 L = normalize(uLightDir);
-        float diff = max(dot(N, L), 0.0);
+        float diff = diffuseAmount(N, L);
         float sh = shadowAmount(N, L);
         float k = 1.0 - (clamp(uShadowParams.z, 0.0, 1.0) * sh);
         // Lighting model:
@@ -648,6 +842,19 @@ void main() {
         return;
     }
 
+    if (uWireframe) {
+        vec3 L = normalize(uLightDir);
+        float diff = max(dot(N, L), 0.0);
+        vec3 c = uWireframeColor * (0.76 + diff * 0.24);
+        if (uFogEnabled) {
+            float dist = length(vWorldPos - uCameraPos);
+            float fogF = smoothstep(uFogStart, uFogEnd, dist);
+            c = mix(c, uFogColor, fogF);
+        }
+        fragColor = vec4(encodeSrgb(c), 1.0);
+        return;
+    }
+
     // --- Decal path (minimal) ---
     if (uShaderFamily == 1) {
         vec3 base = uColor;
@@ -677,20 +884,20 @@ void main() {
             // Decal tint (best-effort)
             base *= clamp(uDecalTint, 0.0, 10.0);
             if (uEnableTintPalette) {
-                float y = clamp(uTintPaletteSelector.y, 0.0, 1.0);
+                float tintY = tintPaletteEntityRow();
                 #define TINT_SAMPLE(uv) (uDecodeTintPaletteSrgb ? decodeSrgb(texture(uTintPalette, (uv)).rgb) : texture(uTintPalette, (uv)).rgb)
                 if (uTintMode == 1) {
                     float idx = clamp(vTintIndex, 0.0, 255.0);
-                    vec2 tuv = vec2((idx + 0.5) / 256.0, y);
+                    vec2 tuv = vec2((idx + 0.5) / 256.0, tintY);
                     base *= TINT_SAMPLE(tuv);
                 } else if (uTintMode == 2) {
                     float tx = (round(outA * 255.009995) - 32.0) * (1.0 / 128.0);
-                    base *= TINT_SAMPLE(vec2(tx, y));
+                    base *= TINT_SAMPLE(vec2(tx, tintPaletteWeaponRow()));
                     outA = 1.0;
                 } else if (uTintMode == 3) {
-                    base *= TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), y));
+                    base *= TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), tintY));
                 } else if (uTintMode == 4) {
-                    base *= TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), y));
+                    base *= TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), tintY));
                 }
                 #undef TINT_SAMPLE
             }
@@ -723,20 +930,20 @@ void main() {
         }
         // NOTE: CodeWalker BasicPS does NOT multiply base albedo by Colour0.rgb by default.
         if (uEnableTintPalette) {
-            float y = clamp(uTintPaletteSelector.y, 0.0, 1.0);
+            float tintY = tintPaletteEntityRow();
             #define TINT_SAMPLE(uv) (uDecodeTintPaletteSrgb ? decodeSrgb(texture(uTintPalette, (uv)).rgb) : texture(uTintPalette, (uv)).rgb)
             if (uTintMode == 1) {
                 float idx = clamp(vTintIndex, 0.0, 255.0);
-                vec2 tuv = vec2((idx + 0.5) / 256.0, y);
+                vec2 tuv = vec2((idx + 0.5) / 256.0, tintY);
                 base *= TINT_SAMPLE(tuv);
             } else if (uTintMode == 2) {
                 float tx = (round(outA * 255.009995) - 32.0) * (1.0 / 128.0);
-                base *= TINT_SAMPLE(vec2(tx, y));
+                base *= TINT_SAMPLE(vec2(tx, tintPaletteWeaponRow()));
                 outA = 1.0;
             } else if (uTintMode == 3) {
-                base *= TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), y));
+                base *= TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), tintY));
             } else if (uTintMode == 4) {
-                base *= TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), y));
+                base *= TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), tintY));
             }
             #undef TINT_SAMPLE
         }
@@ -804,7 +1011,7 @@ void main() {
     }
 
     vec3 L = normalize(uLightDir);
-    float diff = max(dot(N, L), 0.0);
+    float diff = diffuseAmount(N, L);
     vec3 base = uColor;
     float alphaRaw = 1.0;   // CodeWalker c.a before AlphaScale and before "force opaque" behavior.
     vec3 texRgb0 = vec3(1.0); // raw decoded diffuse rgb (for IsDistMap parity; excludes uColor/tint)
@@ -815,7 +1022,21 @@ void main() {
         vec4 d = texture(uDiffuse, maybeFlipY(uvD0, uFlipDiffuseY));
         vec3 drgb = uDecodeDiffuseSrgb ? decodeSrgb(d.rgb) : d.rgb;
         texRgb0 = drgb;
-        base *= drgb;
+        if (uPedHairTint) {
+            // Hair RGB is a data mask. Gamma-decoding it crushes the low mask values
+            // and makes dark default hair effectively disappear.
+            float primaryMask = clamp(d.r, 0.0, 1.0);
+            float highlightMask = clamp(d.g, 0.0, 1.0);
+            float neutralMask = clamp(d.b, 0.0, 1.0);
+            vec3 dyed = (uPedHairPrimary * primaryMask)
+                + (uPedHairHighlight * highlightMask)
+                + (mix(uPedHairPrimary, uPedHairHighlight, 0.5) * neutralMask);
+            float maskSum = max(primaryMask + highlightMask + neutralMask, 0.001);
+            float strandDetail = clamp(0.65 + max(max(d.r, d.g), d.b), 0.65, 1.15);
+            base *= (dyed / maskSum) * strandDetail;
+        } else {
+            base *= drgb;
+        }
         alphaRaw = d.a;
         hasAlpha = true;
     }
@@ -835,30 +1056,36 @@ void main() {
         hasAlpha = true;
     }
     // NOTE: CodeWalker BasicPS does NOT multiply base albedo by Colour0.rgb by default.
+    // CPV/color-only shaders are the exception: their albedo is carried by vertex color.
+    if (uVertexColorMode == 1) {
+        base *= clamp(vColor0.rgb, 0.0, 1.0);
+    } else if (uVertexColorMode == 2) {
+        base *= clamp(vColor1.rgb, 0.0, 1.0);
+    }
     // Tint ordering parity:
     // - weapon palettes (EnableTint==2) happen BEFORE IsDistMap and BEFORE discard (uses raw alpha)
     // - regular tinting (EnableTint==1, via BasicVS output) happens AFTER IsDistMap/alpha logic
     vec3 tintMulLate = vec3(1.0);
     bool applyTintLate = false;
     if (uEnableTintPalette) {
-        float y = clamp(uTintPaletteSelector.y, 0.0, 1.0);
+        float tintY = tintPaletteEntityRow();
         #define TINT_SAMPLE(uv) (uDecodeTintPaletteSrgb ? decodeSrgb(texture(uTintPalette, (uv)).rgb) : texture(uTintPalette, (uv)).rgb)
         if (uTintMode == 2) {
             // CodeWalker BasicPS "weapon_*_palette": tx = (round(a*255.009995)-32) * 0.007813
             float tx = (round(alphaRaw * 255.009995) - 32.0) * (1.0 / 128.0);
-            base *= TINT_SAMPLE(vec2(tx, y));
+            base *= TINT_SAMPLE(vec2(tx, tintPaletteWeaponRow()));
             // CodeWalker forces alpha=1 after applying weapon tint.
             alphaRaw = 1.0;
         } else if (uTintMode == 1) {
             float idx = clamp(vTintIndex, 0.0, 255.0);
-            vec2 tuv = vec2((idx + 0.5) / 256.0, y);
+            vec2 tuv = vec2((idx + 0.5) / 256.0, tintY);
             tintMulLate = TINT_SAMPLE(tuv);
             applyTintLate = true;
         } else if (uTintMode == 3) {
-            tintMulLate = TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), y));
+            tintMulLate = TINT_SAMPLE(vec2(clamp(vColor0.b, 0.0, 1.0), tintY));
             applyTintLate = true;
         } else if (uTintMode == 4) {
-            tintMulLate = TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), y));
+            tintMulLate = TINT_SAMPLE(vec2(clamp(vColor1.b, 0.0, 1.0), tintY));
             applyTintLate = true;
         } else {
             // unknown -> no-op
@@ -1015,11 +1242,34 @@ export class InstancedModelRenderer {
         this._texWhite = null;
         this._texBlack = null;
         this._texNormalFlat = null;
+        this._skinBaseRows3x4 = [];
+        this._skinTransforms3x4 = [];
+        this._skinBoneNameToIndex = new Map();
+        this._skinBoneBindTransforms = [];
+        this._skinBoneBindInverseTransforms = [];
+        this._skinBoneParents = [];
+        this._skinBoneTransformScratch = glMatrix.mat4.create();
+        this._skinBonePivots = [];
+        this._skinPoseVersion = 1;
+        this._lastSkinPoseKey = '';
+        this._skinTextureCache = new Map();
+        this._identityBoneTexture = null;
+        this._skinAnimationSet = null;
+        // Prefer sampled GTA YCD palettes. The procedural pose below is retained as
+        // a fallback for missing animation data only.
+        this.enableSampledYcdSkinning = true;
+        this.characterLocomotion = null;
+        this.pedHairPrimary = [0.035, 0.012, 0.004];
+        this.pedHairHighlight = [0.035, 0.012, 0.004];
 
         // Match TerrainRenderer's model matrix transforms (data-space -> viewer-space)
         this.modelMatrix = glMatrix.mat4.create();
         glMatrix.mat4.rotateY(this.modelMatrix, this.modelMatrix, Math.PI);
         glMatrix.mat4.rotateX(this.modelMatrix, this.modelMatrix, -Math.PI / 2);
+        this._gpuCullVpData = glMatrix.mat4.create();
+        this._gpuCullPlanes = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+        this._gpuCullPlanesFlat = new Float32Array(24);
+        this._fragmentRotationScratch = new Float32Array(9);
 
         this.ready = false;
         this.uniforms = null;
@@ -1051,8 +1301,24 @@ export class InstancedModelRenderer {
         this._meshLoadPending = new Set(); // key(entryKey:file)
         this._meshLoadSeq = 1;
 
+        // World meshes retain the normal cache policy. The player renderer opts into a
+        // fresh request after an exporter update so stale v7 bins cannot disable skinning.
+        this.meshLoadOptions = {
+            usePersistentCache: true,
+            cacheBust: '',
+            requireBlendAttributes: false,
+        };
+
         // Debug stats (used by Perf HUD / console).
-        this._occlusionStats = { tested: 0, culled: 0 };
+        this._occlusionStats = {
+            tested: 0,
+            culled: 0,
+            depthCandidates: 0,
+            depthDraws: 0,
+            depthInstances: 0,
+            depthDistanceRejected: 0,
+            depthSizeRejected: 0,
+        };
         this._renderStats = {
             drawCalls: 0,
             triangles: 0,
@@ -1064,6 +1330,7 @@ export class InstancedModelRenderer {
             diffuseWanted: 0,
             diffusePlaceholder: 0,
             diffuseReal: 0,
+            diffuseMissingFromIndex: 0,
             drawItemsMissingUv: 0,
         };
 
@@ -1076,6 +1343,25 @@ export class InstancedModelRenderer {
             missingFromExportedSet: new Map(), // rel -> count (resolver returned null)
             placeholderUrls: new Map(),        // url -> count (resolved url but placeholder used)
         };
+        this._lastPickDrawItems = [];
+        this._lastPickReport = null;
+        // gl.getError() after every draw is useful when isolating a corrupt drawable,
+        // but it can serialize WebGL and destroy frame pacing. Keep it opt-in.
+        this.debugDrawGlErrors = false;
+        this._pickTmpInvVp = glMatrix.mat4.create();
+        this._pickTmpInst = glMatrix.mat4.create();
+        this._pickTmpLocalToViewer = glMatrix.mat4.create();
+        this._pickTmpInvLocalToViewer = glMatrix.mat4.create();
+        this._pickTmpNear = glMatrix.vec4.create();
+        this._pickTmpFar = glMatrix.vec4.create();
+        this._pickTmpRayOrigin4 = glMatrix.vec4.create();
+        this._pickTmpRayDir4 = glMatrix.vec4.create();
+        this._pickTmpLocalOrigin = glMatrix.vec4.create();
+        this._pickTmpLocalDir = glMatrix.vec4.create();
+        this._pickTmpLocalHit = glMatrix.vec4.create();
+        this._pickTmpData = glMatrix.vec4.create();
+        this._pickTmpWorld = glMatrix.vec4.create();
+        this._pickTmpClip = glMatrix.vec4.create();
 
         // Avoid spamming console for unknown shader families.
         this._warnedShaderFamilies = new Set();
@@ -1086,6 +1372,1137 @@ export class InstancedModelRenderer {
         // - Track and skip offenders after the first failure so the viewer stays usable and we can identify culprits.
         this._badDrawKeys = new Set(); // key => true
         this._lastGlError = null;      // { err, key, file, shaderName, whenMs }
+    }
+
+    setSkinningSkeleton(skeleton) {
+        const rows = [];
+        try {
+            const top = Array.isArray(skeleton?.skinTransforms3x4) ? skeleton.skinTransforms3x4 : [];
+            if (top.length) {
+                for (const r of top) {
+                    rows.push((Array.isArray(r) && r.length >= 12) ? r.slice(0, 12).map((v) => Number(v) || 0.0) : null);
+                }
+            } else {
+                for (const b of (Array.isArray(skeleton?.bones) ? skeleton.bones : [])) {
+                    const r = b?.skinTransform3x4;
+                    rows.push((Array.isArray(r) && r.length >= 12) ? r.slice(0, 12).map((v) => Number(v) || 0.0) : null);
+                }
+            }
+        } catch {
+            rows.length = 0;
+        }
+
+        this._skinBaseRows3x4 = rows.map((r) => Array.isArray(r) ? r.slice(0, 12) : null);
+        this._skinTransforms3x4 = this._skinBaseRows3x4.map((r) => Array.isArray(r) ? r.slice(0, 12) : null);
+        this._skinBoneNameToIndex = new Map();
+        this._skinBoneBindTransforms = [];
+        this._skinBoneBindInverseTransforms = [];
+        this._skinBoneParents = [];
+        this._skinBonePivots = [];
+        try {
+            const bones = Array.isArray(skeleton?.bones) ? skeleton.bones : [];
+            for (let i = 0; i < bones.length; i++) {
+                const b = bones[i] || {};
+                const name = String(b.name || '').trim();
+                if (name) this._skinBoneNameToIndex.set(name, i);
+                const parentIndex = Number(b.parentIndex);
+                this._skinBoneParents[i] = Number.isInteger(parentIndex) && parentIndex >= 0 && parentIndex < bones.length
+                    ? parentIndex
+                    : -1;
+                const bindInv = Array.isArray(b.bindTransformInv) ? b.bindTransformInv : null;
+                if (bindInv?.length >= 16) {
+                    // GTA serializes TransformationsInverted in its native row-vector
+                    // layout. Copying that scalar layout into glMatrix gives the
+                    // equivalent column-vector matrix used by the browser renderer.
+                    const inverse = glMatrix.mat4.create();
+                    for (let j = 0; j < 16; j++) inverse[j] = Number(bindInv[j]) || 0.0;
+                    inverse[15] = 1.0;
+                    const bind = glMatrix.mat4.create();
+                    if (glMatrix.mat4.invert(bind, inverse)) {
+                        this._skinBoneBindTransforms[i] = bind;
+                        this._skinBoneBindInverseTransforms[i] = inverse;
+                    }
+                }
+                const pivot = this._pivotFromBindTransformInv(b.bindTransformInv);
+                this._skinBonePivots[i] = pivot;
+            }
+        } catch {
+            this._skinBoneNameToIndex = new Map();
+            this._skinBoneBindTransforms = [];
+            this._skinBoneBindInverseTransforms = [];
+            this._skinBoneParents = [];
+            this._skinBonePivots = [];
+        }
+        this._skinPoseVersion++;
+        this._lastSkinPoseKey = '';
+        this._clearSkinTextureCache();
+    }
+
+    setSkinningAnimationSet(animationSet) {
+        const clipsIn = (animationSet && typeof animationSet === 'object') ? (animationSet.clips || {}) : {};
+        const boneCount = Math.max(
+            0,
+            Number(animationSet?.boneCount) | 0,
+            Array.isArray(this._skinBaseRows3x4) ? this._skinBaseRows3x4.length : 0
+        );
+        const clips = {};
+        for (const [nameRaw, clipRaw] of Object.entries(clipsIn || {})) {
+            const name = String(nameRaw || '').trim().toLowerCase();
+            // `mergeSkinningAnimationSet` may feed already-normalized clips
+            // back through this loader. Preserve their Float32Array frames as
+            // well as raw JSON `frames3x4`, otherwise adding combat clips
+            // silently drops the normal locomotion set.
+            const framesRaw = Array.isArray(clipRaw?.frames3x4)
+                ? clipRaw.frames3x4
+                : (Array.isArray(clipRaw?.frames) ? clipRaw.frames : []);
+            const expected = boneCount * 12;
+            if (!name || boneCount <= 0 || expected <= 0 || framesRaw.length < 2) continue;
+            const frames = [];
+            for (const frame of framesRaw) {
+                if ((!Array.isArray(frame) && !ArrayBuffer.isView(frame)) || frame.length < expected) continue;
+                const data = new Float32Array(expected);
+                for (let i = 0; i < expected; i++) data[i] = Number(frame[i]) || 0.0;
+                frames.push(data);
+            }
+            if (frames.length < 2) continue;
+            const fps = Math.max(1.0, Number(clipRaw?.fps) || 30.0);
+            const duration = Math.max(1.0 / fps, Number(clipRaw?.duration) || (frames.length / fps));
+            clips[name] = {
+                name,
+                sourceYcd: String(clipRaw?.sourceYcd || ''),
+                sourceClip: String(clipRaw?.sourceClip || name),
+                composite: clipRaw?.composite === true,
+                weaponLayer: clipRaw?.weaponLayer === true,
+                requiresProceduralRecoil: clipRaw?.requiresProceduralRecoil === true,
+                fullBody: clipRaw?.fullBody === true,
+                duration,
+                frameCount: frames.length,
+                boneCount,
+                frames,
+            };
+        }
+        this._skinAnimationSet = Object.keys(clips).length ? {
+            schema: String(animationSet?.schema || ''),
+            boneCount,
+            clips,
+        } : null;
+        this._skinPoseVersion++;
+        this._lastSkinPoseKey = '';
+    }
+
+    mergeSkinningAnimationSet(animationSet) {
+        const incoming = (animationSet && typeof animationSet === 'object') ? animationSet : null;
+        const incomingClips = incoming?.clips;
+        if (!incomingClips || typeof incomingClips !== 'object' || !Object.keys(incomingClips).length) return false;
+        const current = this._skinAnimationSet || {};
+        this.setSkinningAnimationSet({
+            schema: String(incoming.schema || current.schema || ''),
+            boneCount: Math.max(Number(current.boneCount) || 0, Number(incoming.boneCount) || 0),
+            clips: { ...(current.clips || {}), ...incomingClips },
+        });
+        return !!this._skinAnimationSet?.clips;
+    }
+
+    _clearSkinTextureCache() {
+        const gl = this.gl;
+        try {
+            for (const rec of this._skinTextureCache?.values?.() || []) {
+                if (rec?.tex) gl.deleteTexture(rec.tex);
+            }
+        } catch { /* ignore */ }
+        try { this._skinTextureCache?.clear?.(); } catch { /* ignore */ }
+    }
+
+    _pivotFromBindTransformInv(bindTransformInv) {
+        const src = Array.isArray(bindTransformInv) ? bindTransformInv : null;
+        if (!src || src.length < 16) return null;
+        try {
+            const row = new Float32Array(16);
+            for (let i = 0; i < 16; i++) row[i] = Number(src[i]) || 0.0;
+            row[15] = 1.0;
+            const col = glMatrix.mat4.create();
+            for (let r = 0; r < 4; r++) {
+                for (let c = 0; c < 4; c++) col[c * 4 + r] = row[r * 4 + c];
+            }
+            const inv = glMatrix.mat4.create();
+            if (!glMatrix.mat4.invert(inv, col)) return null;
+            const out = new Float32Array(16);
+            for (let r = 0; r < 4; r++) {
+                for (let c = 0; c < 4; c++) out[r * 4 + c] = inv[c * 4 + r];
+            }
+            return [out[12], out[13], out[14]];
+        } catch {
+            return null;
+        }
+    }
+
+    _identityRowMatrix() {
+        return [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+    }
+
+    _mulRowMatrix(a, b) {
+        const out = new Array(16).fill(0.0);
+        for (let r = 0; r < 4; r++) {
+            for (let c = 0; c < 4; c++) {
+                out[r * 4 + c] =
+                    a[r * 4 + 0] * b[0 * 4 + c] +
+                    a[r * 4 + 1] * b[1 * 4 + c] +
+                    a[r * 4 + 2] * b[2 * 4 + c] +
+                    a[r * 4 + 3] * b[3 * 4 + c];
+            }
+        }
+        return out;
+    }
+
+    _rotationAroundPivotRow(axis, angle, pivot) {
+        const p = Array.isArray(pivot) ? pivot : null;
+        if (!p || !Number.isFinite(angle) || Math.abs(angle) < 1e-8) return this._identityRowMatrix();
+        const px = Number(p[0]) || 0.0;
+        const py = Number(p[1]) || 0.0;
+        const pz = Number(p[2]) || 0.0;
+        const c = Math.cos(angle);
+        const s = Math.sin(angle);
+        if (axis === 'z') {
+            return [
+                c, -s, 0.0, 0.0,
+                s, c, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                px - c * px - s * py,
+                py + s * px - c * py,
+                0.0,
+                1.0,
+            ];
+        }
+        if (axis === 'y') {
+            return [
+                c, 0.0, s, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                -s, 0.0, c, 0.0,
+                px - c * px + s * pz,
+                0.0,
+                pz - s * px - c * pz,
+                1.0,
+            ];
+        }
+        return [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, c, s, 0.0,
+            0.0, -s, c, 0.0,
+            0.0,
+            py - c * py + s * pz,
+            pz - s * py - c * pz,
+            1.0,
+        ];
+    }
+
+    _rows3x4FromRowMatrix(m) {
+        return [
+            m[0], m[4], m[8], m[12],
+            m[1], m[5], m[9], m[13],
+            m[2], m[6], m[10], m[14],
+        ];
+    }
+
+    _rowMatrixFromRows3x4(rows) {
+        if (!rows || rows.length < 12) return null;
+        return [
+            rows[0], rows[4], rows[8], 0.0,
+            rows[1], rows[5], rows[9], 0.0,
+            rows[2], rows[6], rows[10], 0.0,
+            rows[3], rows[7], rows[11], 1.0,
+        ];
+    }
+
+    _applySkinBoneMatrix(rows, boneName, matrix) {
+        const idx = this._skinBoneNameToIndex.get(String(boneName || ''));
+        if (!Number.isInteger(idx) || idx < 0 || idx >= rows.length) return false;
+        rows[idx] = this._rows3x4FromRowMatrix(matrix);
+        return true;
+    }
+
+    _applyCombatUpperBodyPose(rows, combat) {
+        const blend = Math.max(0.0, Math.min(1.0, Number(combat?.blend) || 0.0));
+        if ((!combat?.armed && !combat?.melee) || blend <= 0.001 || !Array.isArray(rows)) return false;
+        const aiming = !!combat.aiming;
+        const reloading = !!combat.reloading;
+        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() * 0.001 : 0.0;
+        const reloadOffset = reloading ? Math.sin(now * 9.0) * 0.18 : 0.0;
+        const apply = (boneName, axis, angle) => {
+            const idx = this._skinBoneNameToIndex.get(boneName);
+            const pivot = this._skinBonePivots[idx];
+            const current = this._rowMatrixFromRows3x4(rows[idx]);
+            if (!Number.isInteger(idx) || !pivot || !current) return;
+            const delta = this._rotationAroundPivotRow(axis, angle * blend, pivot);
+            rows[idx] = this._rows3x4FromRowMatrix(this._mulRowMatrix(current, delta));
+        };
+
+        if (combat?.melee) {
+            const progress = Math.max(0.0, Math.min(1.0, Number(combat.progress) || 0.0));
+            const strike = Math.sin(progress * Math.PI);
+            const recover = Math.sin(Math.min(1.0, progress * 1.6) * Math.PI);
+            const type = String(combat.attackType || '');
+            if (combat.guarding) {
+                apply('SKEL_R_UpperArm', 'x', -0.72);
+                apply('SKEL_R_Forearm', 'x', -0.62);
+                apply('SKEL_L_UpperArm', 'x', -0.72);
+                apply('SKEL_L_Forearm', 'x', -0.62);
+                apply('SKEL_Spine2', 'x', 0.10);
+                return true;
+            }
+            if (combat.hurt) {
+                apply('SKEL_Spine1', 'x', 0.28);
+                apply('SKEL_Spine2', 'z', 0.20);
+                apply('SKEL_R_UpperArm', 'x', -0.28);
+                apply('SKEL_L_UpperArm', 'x', -0.28);
+                return true;
+            }
+            apply('SKEL_Spine2', 'z', (type === 'left_punch' ? -0.24 : 0.24) * recover);
+            apply('SKEL_Spine1', 'x', 0.12 * strike);
+            if (type === 'left_punch') {
+                apply('SKEL_L_Clavicle', 'z', -0.16 * strike);
+                apply('SKEL_L_UpperArm', 'x', -1.18 * strike);
+                apply('SKEL_L_Forearm', 'x', -0.38 * strike);
+                apply('SKEL_R_UpperArm', 'x', -0.34 * recover);
+            } else if (type === 'front_kick') {
+                apply('SKEL_R_Thigh', 'x', -1.05 * strike);
+                apply('SKEL_R_Calf', 'x', 0.62 * strike);
+                apply('SKEL_R_Foot', 'x', -0.22 * strike);
+                apply('SKEL_R_UpperArm', 'x', -0.44 * recover);
+                apply('SKEL_L_UpperArm', 'x', -0.44 * recover);
+            } else {
+                apply('SKEL_R_Clavicle', 'z', 0.16 * strike);
+                apply('SKEL_R_UpperArm', 'x', -1.18 * strike);
+                apply('SKEL_R_Forearm', 'x', -0.38 * strike);
+                apply('SKEL_L_UpperArm', 'x', -0.34 * recover);
+            }
+            return true;
+        }
+
+        const rightRaise = -0.46 - (aiming ? 0.58 : 0.0);
+        const rightForearm = -0.30 - (aiming ? 0.54 : 0.0);
+        const leftRaise = -0.18 - (aiming ? 0.78 : 0.0) + reloadOffset;
+        const leftForearm = -0.12 - (aiming ? 0.64 : 0.0) - reloadOffset * 0.6;
+        apply('SKEL_R_Clavicle', 'z', -0.10 - (aiming ? 0.08 : 0.0));
+        apply('SKEL_R_UpperArm', 'x', rightRaise);
+        apply('SKEL_R_Forearm', 'x', rightForearm);
+        apply('SKEL_R_Hand', 'y', aiming ? 0.10 : 0.04);
+        apply('SKEL_L_Clavicle', 'z', 0.10 + (aiming ? 0.10 : 0.0));
+        apply('SKEL_L_UpperArm', 'x', leftRaise);
+        apply('SKEL_L_Forearm', 'x', leftForearm);
+        apply('SKEL_L_Hand', 'y', aiming ? -0.12 : -0.04);
+        apply('SKEL_Spine2', 'z', aiming ? 0.07 : 0.035);
+        return true;
+    }
+
+    _selectSkinningAnimationClip(characterLocomotion, { ignoreCombat = false } = {}) {
+        const clips = this._skinAnimationSet?.clips || null;
+        if (!clips) return null;
+        const gesture = characterLocomotion?.gesture || null;
+        if (gesture?.active) {
+            const gestureClip = clips[String(gesture.clip || '')];
+            if (gestureClip) return gestureClip;
+        }
+        const move01 = Math.max(0.0, Math.min(1.0, Number(characterLocomotion?.move01) || 0.0));
+        const enabled = !!characterLocomotion?.enabled && move01 > 0.005;
+        const gait = String(characterLocomotion?.gait || '').trim().toLowerCase();
+        const combat = characterLocomotion?.combat || null;
+        if (!ignoreCombat && combat?.melee) {
+            const clip = clips[String(combat.clip || '').trim().toLowerCase()];
+            if (clip?.fullBody) return clip;
+        }
+        if (!ignoreCombat && combat?.armed) {
+            // Weapon YCD dictionaries contain a masked BothArms layer. Only
+            // select combat clips marked composite by the exporter: those have
+            // already been evaluated over the matching full-body locomotion
+            // clip, so every joint has a valid skin transform.
+            const composite = (name) => clips[name]?.composite ? clips[name] : null;
+            const movement = !enabled ? 'idle' : (gait === 'walk' ? 'walk' : 'run');
+            if (combat.phase === 'drawing') {
+                const clip = composite('draw');
+                if (clip) return clip;
+            }
+            if (combat.phase === 'holstering') {
+                const clip = composite('holster');
+                if (clip) return clip;
+            }
+            if (combat.reloading) {
+                const clip = composite(`reload_${movement}`) || composite('reload_idle');
+                if (clip) return clip;
+            }
+            if (combat.aimTransition === 'enter') {
+                const clip = composite(`aim_enter_${movement}`) || composite('aim_enter_idle');
+                if (clip) return clip;
+            }
+            if (combat.firing) {
+                const clip = composite(`fire_${movement}`) || composite('fire_idle');
+                if (clip) return clip;
+            }
+            if (combat.aiming) {
+                const clip = composite(`aim_${movement}`) || composite('aim_idle');
+                if (clip) return clip;
+            }
+            const carry = composite(`armed_${movement}`) || composite('armed_idle');
+            if (carry) return carry;
+        }
+        if (!enabled && clips.idle) return clips.idle;
+        if (gait && clips[gait]) return clips[gait];
+        if (move01 >= 0.82 && clips.sprint) return clips.sprint;
+        if (move01 >= 0.42 && clips.run) return clips.run;
+        if (clips.walk) return clips.walk;
+        return clips.run || clips.sprint || clips.idle || null;
+    }
+
+    _isExactCombatClip(clip, combat) {
+        if (!combat?.armed || !clip) return false;
+        const name = String(clip.name || '').toLowerCase();
+        return name === 'draw'
+            || name === 'holster'
+            || name === 'reload'
+            || name === 'armed_idle'
+            || name === 'armed_walk'
+            || name === 'armed_run'
+            || name === 'aim'
+            || name === 'fire';
+    }
+
+    _sampleSkinningAnimationRows(clip, timeSeconds) {
+        if (!clip?.frames?.length || !clip.boneCount) return null;
+        const frameCount = clip.frames.length;
+        const duration = Math.max(0.0001, Number(clip.duration) || 1.0);
+        const t0 = Number.isFinite(Number(timeSeconds)) ? Number(timeSeconds) : 0.0;
+        const localT = ((t0 % duration) + duration) % duration;
+        const framePos = (localT / duration) * frameCount;
+        const i0 = Math.floor(framePos) % frameCount;
+        const i1 = (i0 + 1) % frameCount;
+        const alpha = Math.max(0.0, Math.min(1.0, framePos - Math.floor(framePos)));
+        const a = clip.frames[i0];
+        const b = clip.frames[i1];
+        if (!a || !b) return null;
+
+        const boneCount = Math.max(0, Number(clip.boneCount) | 0);
+        const rows = new Array(boneCount);
+        for (let bone = 0; bone < boneCount; bone++) {
+            const off = bone * 12;
+            const r = new Array(12);
+            for (let j = 0; j < 12; j++) {
+                const av = a[off + j] || 0.0;
+                r[j] = av + ((b[off + j] || 0.0) - av) * alpha;
+            }
+            rows[bone] = r;
+        }
+        return {
+            rows,
+            key: `ycd:${clip.name}:${i0}:${i1}:${Math.round(alpha * 1000)}`,
+        };
+    }
+
+    _isBothArmsFilterBone(name) {
+        const bone = String(name || '');
+        if (!bone) return false;
+        // `BothArms_filter` from the server weaponanimations.meta is an
+        // upper-limb layer, not a replacement for the pelvis/spine/leg pose.
+        return bone.startsWith('SKEL_L_Clavicle')
+            || bone.startsWith('SKEL_R_Clavicle')
+            || bone.startsWith('SKEL_L_UpperArm')
+            || bone.startsWith('SKEL_R_UpperArm')
+            || bone.startsWith('SKEL_L_Forearm')
+            || bone.startsWith('SKEL_R_Forearm')
+            || bone.startsWith('SKEL_L_Hand')
+            || bone.startsWith('SKEL_R_Hand')
+            || bone.startsWith('SKEL_L_Finger')
+            || bone.startsWith('SKEL_R_Finger')
+            || bone.startsWith('SKEL_L_Thumb')
+            || bone.startsWith('SKEL_R_Thumb')
+            || bone === 'IK_L_Hand'
+            || bone === 'IK_R_Hand'
+            || bone === 'PH_L_Hand'
+            || bone === 'PH_R_Hand';
+    }
+
+    _hasWeaponOverlayTrack(rows) {
+        if (!Array.isArray(rows) || rows.length < 12) return false;
+        const identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        for (let i = 0; i < 12; i++) {
+            if (Math.abs((Number(rows[i]) || 0.0) - identity[i]) > 0.001) return true;
+        }
+        return false;
+    }
+
+    _applyWeaponArmsOverlayRows(baseRows, overlayRows) {
+        if (!Array.isArray(baseRows) || !Array.isArray(overlayRows)) return false;
+        const count = Math.min(baseRows.length, overlayRows.length, this._skinBoneBindTransforms.length);
+        if (!count) return false;
+
+        // YCD palettes are final skin matrices. A weapon clip's identity row means
+        // "leave the base pose alone", not "put this joint in its bind/T pose".
+        // Rebuild keyed joints in local-bone space so their current base parent
+        // (spine, gait, and root) stays intact.
+        const baseWorlds = new Array(count);
+        const overlayWorlds = new Array(count);
+        const finalWorlds = new Array(count);
+        for (let i = 0; i < count; i++) {
+            const bind = this._skinBoneBindTransforms[i];
+            const base = this._rowMatrixFromRows3x4(baseRows[i]);
+            const overlay = this._rowMatrixFromRows3x4(overlayRows[i]);
+            if (!bind || !base || !overlay) continue;
+            const baseWorld = glMatrix.mat4.create();
+            const overlayWorld = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(baseWorld, base, bind);
+            glMatrix.mat4.multiply(overlayWorld, overlay, bind);
+            baseWorlds[i] = baseWorld;
+            overlayWorlds[i] = overlayWorld;
+            finalWorlds[i] = baseWorld;
+        }
+
+        const selected = [];
+        for (const [name, index] of this._skinBoneNameToIndex) {
+            if (index >= 0 && index < count && this._isBothArmsFilterBone(name)) selected.push(index);
+        }
+        selected.sort((a, b) => a - b);
+        let applied = false;
+        for (const index of selected) {
+            const sourceRows = overlayRows[index];
+            const sourceWorld = overlayWorlds[index];
+            const bindInverse = this._skinBoneBindInverseTransforms[index];
+            if (!this._hasWeaponOverlayTrack(sourceRows) || !sourceWorld || !bindInverse) continue;
+
+            const parent = this._skinBoneParents[index];
+            const sourceParent = parent >= 0 ? overlayWorlds[parent] : null;
+            const finalParent = parent >= 0 ? finalWorlds[parent] : null;
+            const local = glMatrix.mat4.create();
+            if (sourceParent) {
+                const sourceParentInverse = glMatrix.mat4.create();
+                if (!glMatrix.mat4.invert(sourceParentInverse, sourceParent)) continue;
+                glMatrix.mat4.multiply(local, sourceParentInverse, sourceWorld);
+            } else {
+                glMatrix.mat4.copy(local, sourceWorld);
+            }
+
+            const finalWorld = glMatrix.mat4.create();
+            if (finalParent) glMatrix.mat4.multiply(finalWorld, finalParent, local);
+            else glMatrix.mat4.copy(finalWorld, local);
+            const finalSkin = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(finalSkin, finalWorld, bindInverse);
+            baseRows[index] = this._rows3x4FromRowMatrix(finalSkin);
+            finalWorlds[index] = finalWorld;
+            applied = true;
+        }
+        return applied;
+    }
+
+    _blendWeaponArmRows(fromRows, toRows, weight) {
+        if (!Array.isArray(fromRows) || !Array.isArray(toRows)) return null;
+        const count = Math.min(fromRows.length, toRows.length, this._skinBoneBindTransforms.length);
+        if (!count) return null;
+        const amount = Math.max(0.0, Math.min(1.0, Number(weight) || 0.0));
+        const out = fromRows.map((row) => Array.isArray(row) ? row.slice(0, 12) : row);
+        const fromWorlds = new Array(count);
+        const toWorlds = new Array(count);
+        const blendedWorlds = new Array(count);
+        for (let i = 0; i < count; i++) {
+            const bind = this._skinBoneBindTransforms[i];
+            const from = this._rowMatrixFromRows3x4(fromRows[i]);
+            const to = this._rowMatrixFromRows3x4(toRows[i]);
+            if (!bind || !from || !to) continue;
+            const fromWorld = glMatrix.mat4.create();
+            const toWorld = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(fromWorld, from, bind);
+            glMatrix.mat4.multiply(toWorld, to, bind);
+            fromWorlds[i] = fromWorld;
+            toWorlds[i] = toWorld;
+            blendedWorlds[i] = fromWorld;
+        }
+
+        const depthByIndex = new Map();
+        const depth = (index) => {
+            if (depthByIndex.has(index)) return depthByIndex.get(index);
+            const parent = this._skinBoneParents[index];
+            const value = parent >= 0 && parent < count ? depth(parent) + 1 : 0;
+            depthByIndex.set(index, value);
+            return value;
+        };
+        const selected = [];
+        for (const [name, index] of this._skinBoneNameToIndex) {
+            if (this._isBothArmsFilterBone(name) && index >= 0 && index < count) selected.push(index);
+        }
+        selected.sort((a, b) => depth(a) - depth(b));
+
+        // Skin matrices cannot be blended element-by-element: that introduces
+        // shear and collapses joints at the ADS transition. Blend arm locals as
+        // translation + rotation, then rebuild the final skin palette.
+        for (const index of selected) {
+            const fromWorld = fromWorlds[index];
+            const toWorld = toWorlds[index];
+            const bindInverse = this._skinBoneBindInverseTransforms[index];
+            if (!fromWorld || !toWorld || !bindInverse) continue;
+            const parent = this._skinBoneParents[index];
+            const fromParent = parent >= 0 ? fromWorlds[parent] : null;
+            const toParent = parent >= 0 ? toWorlds[parent] : null;
+            const blendedParent = parent >= 0 ? blendedWorlds[parent] : null;
+            const fromLocal = glMatrix.mat4.create();
+            const toLocal = glMatrix.mat4.create();
+            if (fromParent && toParent) {
+                const fromParentInverse = glMatrix.mat4.create();
+                const toParentInverse = glMatrix.mat4.create();
+                if (!glMatrix.mat4.invert(fromParentInverse, fromParent) || !glMatrix.mat4.invert(toParentInverse, toParent)) continue;
+                glMatrix.mat4.multiply(fromLocal, fromParentInverse, fromWorld);
+                glMatrix.mat4.multiply(toLocal, toParentInverse, toWorld);
+            } else {
+                glMatrix.mat4.copy(fromLocal, fromWorld);
+                glMatrix.mat4.copy(toLocal, toWorld);
+            }
+            const fromTranslation = glMatrix.vec3.create();
+            const toTranslation = glMatrix.vec3.create();
+            const translation = glMatrix.vec3.create();
+            const fromRotation = glMatrix.quat.create();
+            const toRotation = glMatrix.quat.create();
+            const rotation = glMatrix.quat.create();
+            glMatrix.mat4.getTranslation(fromTranslation, fromLocal);
+            glMatrix.mat4.getTranslation(toTranslation, toLocal);
+            glMatrix.vec3.lerp(translation, fromTranslation, toTranslation, amount);
+            glMatrix.mat4.getRotation(fromRotation, fromLocal);
+            glMatrix.mat4.getRotation(toRotation, toLocal);
+            glMatrix.quat.slerp(rotation, fromRotation, toRotation, amount);
+            const blendedLocal = glMatrix.mat4.create();
+            glMatrix.mat4.fromRotationTranslation(blendedLocal, rotation, translation);
+            const blendedWorld = glMatrix.mat4.create();
+            if (blendedParent) glMatrix.mat4.multiply(blendedWorld, blendedParent, blendedLocal);
+            else glMatrix.mat4.copy(blendedWorld, blendedLocal);
+            const blendedSkin = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(blendedSkin, blendedWorld, bindInverse);
+            out[index] = this._rows3x4FromRowMatrix(blendedSkin);
+            blendedWorlds[index] = blendedWorld;
+        }
+        return out;
+    }
+
+    _applyWeaponFireRecoilPose(rows, combat) {
+        if (!combat?.armed || !combat?.firing || !Array.isArray(rows)) return false;
+        const progress = Math.max(0.0, Math.min(1.0, Number(combat.fireProgress) || 0.0));
+        // `w_fire` does not expose skeletal recoil keys through CodeWalker.
+        // Keep the correct GTA ADS palette intact and modify local bones, then
+        // rebuild the hierarchy. Rotating independent skin matrices would tear
+        // the arm chain and is the cause of the previous broken shooting pose.
+        const attack = Math.max(0.0, Math.min(1.0, progress / 0.10));
+        const release = Math.max(0.0, Math.min(1.0, (progress - 0.14) / 0.86));
+        const recoil = attack * (1.0 - (release * release * (3.0 - 2.0 * release)));
+        if (recoil <= 0.001) return false;
+
+        const count = Math.min(rows.length, this._skinBoneBindTransforms.length, this._skinBoneBindInverseTransforms.length);
+        if (!count) return false;
+        const worlds = new Array(count);
+        const locals = new Array(count);
+        for (let index = 0; index < count; index++) {
+            const skin = this._rowMatrixFromRows3x4(rows[index]);
+            const bind = this._skinBoneBindTransforms[index];
+            if (!skin || !bind) continue;
+            const world = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(world, skin, bind);
+            worlds[index] = world;
+        }
+        for (let index = 0; index < count; index++) {
+            const world = worlds[index];
+            if (!world) continue;
+            const parent = this._skinBoneParents[index];
+            const parentWorld = parent >= 0 && parent < count ? worlds[parent] : null;
+            const local = glMatrix.mat4.create();
+            if (parentWorld) {
+                const inverseParent = glMatrix.mat4.create();
+                if (!glMatrix.mat4.invert(inverseParent, parentWorld)) continue;
+                glMatrix.mat4.multiply(local, inverseParent, world);
+            } else {
+                glMatrix.mat4.copy(local, world);
+            }
+            locals[index] = local;
+        }
+        const applyLocal = (boneName, axis, angle) => {
+            const index = this._skinBoneNameToIndex.get(boneName);
+            const local = Number.isInteger(index) ? locals[index] : null;
+            if (!local) return;
+            const amount = angle * recoil;
+            if (axis === 'x') glMatrix.mat4.rotateX(local, local, amount);
+            else if (axis === 'y') glMatrix.mat4.rotateY(local, local, amount);
+            else glMatrix.mat4.rotateZ(local, local, amount);
+        };
+
+        applyLocal('SKEL_Spine2', 'x', -0.018);
+        applyLocal('SKEL_R_Clavicle', 'z', -0.014);
+        applyLocal('SKEL_R_UpperArm', 'x', -0.040);
+        applyLocal('SKEL_R_Forearm', 'x', 0.030);
+        applyLocal('SKEL_L_Clavicle', 'z', 0.010);
+        applyLocal('SKEL_L_UpperArm', 'x', -0.024);
+        applyLocal('SKEL_L_Forearm', 'x', 0.018);
+
+        const depthByIndex = new Map();
+        const depth = (index) => {
+            if (depthByIndex.has(index)) return depthByIndex.get(index);
+            const parent = this._skinBoneParents[index];
+            const value = parent >= 0 && parent < count ? depth(parent) + 1 : 0;
+            depthByIndex.set(index, value);
+            return value;
+        };
+        const order = Array.from({ length: count }, (_, index) => index).sort((a, b) => depth(a) - depth(b));
+        for (const index of order) {
+            const local = locals[index];
+            if (!local) continue;
+            const parent = this._skinBoneParents[index];
+            const parentWorld = parent >= 0 && parent < count ? worlds[parent] : null;
+            const world = glMatrix.mat4.create();
+            if (parentWorld) glMatrix.mat4.multiply(world, parentWorld, local);
+            else glMatrix.mat4.copy(world, local);
+            worlds[index] = world;
+            const bindInverse = this._skinBoneBindInverseTransforms[index];
+            if (!bindInverse) continue;
+            const skin = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(skin, world, bindInverse);
+            rows[index] = this._rows3x4FromRowMatrix(skin);
+        }
+        return true;
+    }
+
+    _selectWeaponArmsOverlays({ combat, enabled, gait }) {
+        const clips = this._skinAnimationSet?.clips || null;
+        if (!combat?.armed || !clips) return [];
+        const layer = (name) => clips[name]?.weaponLayer ? clips[name] : null;
+        const movement = !enabled ? 'idle' : (gait === 'walk' ? 'walk' : 'run');
+        // The sampled `aim_med_static` palette is exported in a different root
+        // reference space from `idle_2_aim_fwd_med`: using it after the ADS
+        // transition moves the hands by roughly a metre. `aim_med_loop` has the
+        // same terminal hand palette as the transition and is static across its
+        // arm tracks, so it is the stable ADS hold pose at every movement speed.
+        const aimHoldLayer = movement === 'idle'
+            ? (layer('aim_walk') || layer('aim_run'))
+            : (layer(`aim_${movement}`) || layer('aim_walk') || layer('aim_run'));
+        let clip = null;
+        let mode = 'idle';
+        if (combat.phase === 'drawing') {
+            clip = layer('draw');
+            mode = 'oneShot';
+        } else if (combat.phase === 'holstering') {
+            clip = layer('holster');
+            mode = 'oneShot';
+        } else if (combat.reloading) {
+            clip = layer(`reload_${movement}`) || layer('reload_idle');
+            mode = 'oneShot';
+        } else if (combat.aimTransition === 'enter') {
+            clip = layer(`aim_enter_${movement}`) || layer('aim_enter_idle');
+            mode = 'aimEnter';
+        } else if (combat.firing) {
+            clip = layer(`fire_${movement}`) || layer('fire_idle');
+            mode = 'fire';
+        } else if (combat.aiming) {
+            clip = aimHoldLayer;
+            mode = movement === 'idle' ? 'idle' : 'cycle';
+        } else {
+            clip = layer(`armed_${movement}`) || layer('armed_idle');
+            mode = movement === 'idle' ? 'idle' : 'cycle';
+        }
+        if (!clip) return [];
+        if (mode === 'aimEnter') {
+            const holdClip = aimHoldLayer;
+            const progress = Math.max(0.0, Math.min(1.0, Number(combat.aimProgress) || 0.0));
+            // Blend the last part of the transition into its matching loop pose
+            // so the hand attachment has no one-frame step at ADS completion.
+            const blendToHold = Math.max(0.0, Math.min(1.0, (progress - 0.72) / 0.28));
+            return [{
+                clip,
+                mode,
+                crossfadeTo: holdClip ? {
+                    clip: holdClip,
+                    mode: movement === 'idle' ? 'idle' : 'cycle',
+                    blend: blendToHold,
+                } : null,
+            }];
+        }
+        return [{ clip, mode }];
+    }
+
+    _updateSkinningPose(characterLocomotion) {
+        if (!Array.isArray(this._skinBaseRows3x4) || !this._skinBaseRows3x4.length) return;
+        const move01 = Math.max(0.0, Math.min(1.0, Number(characterLocomotion?.move01) || 0.0));
+        const phase = Number.isFinite(Number(characterLocomotion?.phase)) ? Number(characterLocomotion.phase) : 0.0;
+        const stride = Math.max(0.35, Math.min(1.35, Number(characterLocomotion?.stride) || 1.0));
+        const enabled = !!characterLocomotion?.enabled && move01 > 0.005;
+        const gait = String(characterLocomotion?.gait || '').trim().toLowerCase();
+        const combat = characterLocomotion?.combat || null;
+        const gesture = characterLocomotion?.gesture || null;
+        const gestureKey = gesture?.active ? `gesture:${String(gesture.clip || '')}` : 'gesture:none';
+        const combatKey = combat?.melee
+            ? `melee:${String(combat.phase || '')}:${String(combat.attackType || '')}:${String(combat.clip || '')}:${Math.round((Number(combat.clipProgress) || 0.0) * 1000)}:${combat.guarding ? 1 : 0}:${combat.hurt ? 1 : 0}`
+            : (combat?.armed
+            ? `${Math.round((Number(combat.blend) || 0.0) * 1000)}:${combat.aiming ? 1 : 0}:${combat.firing ? 1 : 0}:${combat.reloading ? 1 : 0}:${String(combat.phase || '')}:${String(combat.aimTransition || '')}:${Math.round((Number(combat.aimProgress) || 0.0) * 1000)}`
+            : 'none');
+        this.characterLocomotion = { enabled, move01, phase, stride, gait, combat, gesture };
+
+        const weaponArmsOverlays = this._selectWeaponArmsOverlays({ combat, enabled, gait }) || [];
+        const meleeFullBodyClip = this.enableSampledYcdSkinning && combat?.melee
+            ? this._selectSkinningAnimationClip(this.characterLocomotion, { ignoreCombat: false })
+            : null;
+        const ycdClip = meleeFullBodyClip || (this.enableSampledYcdSkinning
+            ? this._selectSkinningAnimationClip(this.characterLocomotion, { ignoreCombat: false })
+            : null);
+        if (ycdClip) {
+            const cycle01 = ((phase / (Math.PI * 2.0)) % 1.0 + 1.0) % 1.0;
+            const idleTime = (typeof performance !== 'undefined' && performance.now)
+                ? performance.now() * 0.001
+                : 0.0;
+            const clipProgress = Math.max(0.0, Math.min(1.0, Number(combat?.clipProgress) || 0.0));
+            const aimProgress = Math.max(0.0, Math.min(1.0, Number(combat?.aimProgress) || 0.0));
+            const fireProgress = Math.max(0.0, Math.min(1.0, Number(combat?.fireProgress) || 0.0));
+            const compositeWeaponPose = !!combat?.armed && ycdClip.composite === true;
+            let sampleTime = enabled ? (cycle01 * ycdClip.duration) : idleTime;
+            if (meleeFullBodyClip) {
+                sampleTime = clipProgress * meleeFullBodyClip.duration;
+            } else if (compositeWeaponPose) {
+                // Composite weapon clips were sampled as GTA's locomotion base
+                // followed by its BothArms_filter layer. One-shot clips must
+                // advance on their own controller timeline, not walk-cycle time.
+                if (combat.phase === 'drawing' || combat.phase === 'holstering' || combat.reloading) {
+                    sampleTime = clipProgress * ycdClip.duration;
+                } else if (combat.aimTransition === 'enter') {
+                    sampleTime = aimProgress * ycdClip.duration;
+                } else if (combat.firing) {
+                    sampleTime = fireProgress * ycdClip.duration;
+                }
+            }
+            const sampled = this._sampleSkinningAnimationRows(ycdClip, sampleTime);
+            const sampleWeaponOverlay = (overlay) => {
+                let overlayTime = 0.0;
+                if (overlay.mode === 'oneShot') overlayTime = clipProgress * overlay.clip.duration;
+                else if (overlay.mode === 'aimEnter') overlayTime = aimProgress * overlay.clip.duration;
+                else if (overlay.mode === 'fire') overlayTime = Math.max(0.0, Math.min(1.0, Number(combat?.fireProgress) || 0.0)) * overlay.clip.duration;
+                else if (overlay.mode === 'cycle') overlayTime = cycle01 * overlay.clip.duration;
+                else if (overlay.mode === 'idle') overlayTime = idleTime;
+                const sample = this._sampleSkinningAnimationRows(overlay.clip, overlayTime);
+                return sample?.rows?.length ? { ...sample, overlay } : null;
+            };
+            const weaponArmsSamples = weaponArmsOverlays
+                .map(sampleWeaponOverlay)
+                .filter((sample) => !!sample?.rows?.length);
+            let rows = sampled?.rows || null;
+            let appliedWeaponOverlay = false;
+            if (rows?.length && weaponArmsSamples.length) {
+                rows = rows.map((row) => Array.isArray(row) ? row.slice(0, 12) : row);
+                const primary = weaponArmsSamples[0];
+                const crossfade = primary?.overlay?.crossfadeTo;
+                if (crossfade?.clip) {
+                    const fromRows = rows.map((row) => Array.isArray(row) ? row.slice(0, 12) : row);
+                    const appliedFrom = this._applyWeaponArmsOverlayRows(fromRows, primary.rows);
+                    const targetSample = sampleWeaponOverlay(crossfade);
+                    if (appliedFrom && targetSample?.rows?.length) {
+                        const targetRows = rows.map((row) => Array.isArray(row) ? row.slice(0, 12) : row);
+                        const appliedTarget = this._applyWeaponArmsOverlayRows(targetRows, targetSample.rows);
+                        if (appliedTarget) {
+                            rows = this._blendWeaponArmRows(fromRows, targetRows, crossfade.blend) || fromRows;
+                            appliedWeaponOverlay = true;
+                        } else {
+                            rows = fromRows;
+                            appliedWeaponOverlay = true;
+                        }
+                    } else if (appliedFrom) {
+                        rows = fromRows;
+                        appliedWeaponOverlay = true;
+                    }
+                } else {
+                    for (const weaponArmsSample of weaponArmsSamples) {
+                        appliedWeaponOverlay = this._applyWeaponArmsOverlayRows(rows, weaponArmsSample.rows) || appliedWeaponOverlay;
+                    }
+                }
+            }
+            if (rows?.length && !appliedWeaponOverlay && !meleeFullBodyClip && !compositeWeaponPose) {
+                this._applyCombatUpperBodyPose(rows, combat);
+            }
+            const proceduralRecoilFallback = !compositeWeaponPose || ycdClip.requiresProceduralRecoil === true;
+            if (rows?.length && proceduralRecoilFallback) this._applyWeaponFireRecoilPose(rows, combat);
+            const armsKey = weaponArmsSamples.map((sample) => sample.key).join('|') || 'off';
+            const key = `${sampled?.key || `ycd:${ycdClip.name}:invalid`}:arms:${armsKey}:combat:${combatKey}:${gestureKey}`;
+            if (rows?.length && key !== this._lastSkinPoseKey) {
+                this._skinTransforms3x4 = rows;
+                this._skinPoseVersion++;
+                this._lastSkinPoseKey = key;
+            }
+            this._weaponAnimationDiagnostics = {
+                active: !!combat?.armed,
+                selectedClip: ycdClip.name,
+                selectedComposite: compositeWeaponPose,
+                phase: String(combat?.phase || ''),
+                aimTransition: String(combat?.aimTransition || ''),
+                aiming: !!combat?.aiming,
+                firing: !!combat?.firing,
+                reloading: !!combat?.reloading,
+                sampleTime: Number(sampleTime.toFixed(5)),
+                clipDuration: Number(ycdClip.duration || 0),
+                weaponOverlayCount: weaponArmsSamples.length,
+                appliedWeaponOverlay,
+                proceduralUpperBodyFallback: !!rows?.length && !appliedWeaponOverlay && !meleeFullBodyClip && !compositeWeaponPose,
+                proceduralRecoilFallback: !!rows?.length && proceduralRecoilFallback && !!combat?.firing,
+            };
+            return;
+        }
+
+        const locomotionKey = enabled
+            ? `walk:${Math.round(phase * 1000)}:${Math.round(move01 * 1000)}:${Math.round(stride * 1000)}`
+            : 'rest';
+        const key = `${locomotionKey}:combat:${combatKey}:${gestureKey}`;
+        if (key === this._lastSkinPoseKey) return;
+
+        const rows = this._skinBaseRows3x4.map((r) => Array.isArray(r) ? r.slice(0, 12) : null);
+        if (enabled) {
+            const legAmp = 0.34 * move01 * stride;
+            const kneeAmp = 0.25 * move01;
+            const ankleAmp = 0.12 * move01;
+
+            const applyChain = (names, transforms) => {
+                let m = this._identityRowMatrix();
+                for (let i = 0; i < names.length; i++) {
+                    const name = names[i];
+                    const pivot = this._skinBonePivots[this._skinBoneNameToIndex.get(name)];
+                    const spec = transforms[i] || transforms[transforms.length - 1] || null;
+                    if (spec && pivot) {
+                        m = this._mulRowMatrix(m, this._rotationAroundPivotRow(spec.axis || 'x', spec.angle || 0.0, pivot));
+                    }
+                    this._applySkinBoneMatrix(rows, name, m);
+                }
+            };
+
+            const leftPhase = phase;
+            const rightPhase = phase + Math.PI;
+            const leftSwing = Math.sin(leftPhase);
+            const rightSwing = Math.sin(rightPhase);
+            const leftKnee = Math.max(0.0, Math.sin(leftPhase + 0.55)) * kneeAmp;
+            const rightKnee = Math.max(0.0, Math.sin(rightPhase + 0.55)) * kneeAmp;
+
+            applyChain(['SKEL_L_Thigh', 'SKEL_L_Calf', 'SKEL_L_Foot', 'SKEL_L_Toe0'], [
+                { axis: 'x', angle: leftSwing * legAmp },
+                { axis: 'x', angle: -leftKnee },
+                { axis: 'x', angle: (leftKnee * 0.55) - (leftSwing * ankleAmp) },
+                { axis: 'x', angle: 0.0 },
+            ]);
+            applyChain(['SKEL_R_Thigh', 'SKEL_R_Calf', 'SKEL_R_Foot', 'SKEL_R_Toe0'], [
+                { axis: 'x', angle: rightSwing * legAmp },
+                { axis: 'x', angle: -rightKnee },
+                { axis: 'x', angle: (rightKnee * 0.55) - (rightSwing * ankleAmp) },
+                { axis: 'x', angle: 0.0 },
+            ]);
+            applyChain(['RB_L_ThighRoll', 'MH_L_Knee', 'MH_L_CalfBack', 'MH_L_ThighBack'], [
+                { axis: 'x', angle: leftSwing * legAmp },
+            ]);
+            applyChain(['RB_R_ThighRoll', 'MH_R_Knee', 'MH_R_CalfBack', 'MH_R_ThighBack'], [
+                { axis: 'x', angle: rightSwing * legAmp },
+            ]);
+        }
+        this._applyCombatUpperBodyPose(rows, combat);
+        this._applyWeaponFireRecoilPose(rows, combat);
+
+        this._skinTransforms3x4 = rows;
+        this._skinPoseVersion++;
+        this._lastSkinPoseKey = key;
+        this._weaponAnimationDiagnostics = {
+            active: !!combat?.armed,
+            selectedClip: null,
+            selectedComposite: false,
+            phase: String(combat?.phase || ''),
+            aimTransition: String(combat?.aimTransition || ''),
+            aiming: !!combat?.aiming,
+            firing: !!combat?.firing,
+            reloading: !!combat?.reloading,
+            sampleTime: null,
+            clipDuration: null,
+            weaponOverlayCount: 0,
+            appliedWeaponOverlay: false,
+            proceduralUpperBodyFallback: !!combat?.armed,
+            proceduralRecoilFallback: !!combat?.firing,
+        };
+    }
+
+    clearScene() {
+        const gl = this.gl;
+        for (const entry of this.instances.values()) {
+            try { if (entry?.instanceBuffer) gl.deleteBuffer(entry.instanceBuffer); } catch { /* ignore */ }
+            try {
+                for (const sm of entry?.submeshes?.values?.() || []) {
+                    if (sm?.vao) gl.deleteVertexArray(sm.vao);
+                }
+            } catch { /* ignore */ }
+        }
+        for (const bucket of this.buckets.values()) {
+            try { if (bucket?.instanceBuffer) gl.deleteBuffer(bucket.instanceBuffer); } catch { /* ignore */ }
+            try { if (bucket?.vao) gl.deleteVertexArray(bucket.vao); } catch { /* ignore */ }
+        }
+        this.instances.clear();
+        this.buckets.clear();
+        this._meshLoadQueue.length = 0;
+        this._meshLoadPending.clear();
+        this._renderStats.drawCalls = 0;
+        this._renderStats.triangles = 0;
+        this._renderStats.instances = 0;
+        this._renderStats.bucketDraws = 0;
+        this._renderStats.submeshDraws = 0;
+        this._renderStats.drawItems = 0;
+    }
+
+    _packBoneTextureRows(rows3x4) {
+        const rows = Array.isArray(rows3x4) ? rows3x4 : [];
+        const boneCount = Math.max(1, rows.length);
+        const data = new Float32Array(boneCount * 12);
+        const ident = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        for (let i = 0; i < boneCount; i++) {
+            const r = (Array.isArray(rows[i]) && rows[i].length >= 12) ? rows[i] : ident;
+            for (let j = 0; j < 12; j++) data[i * 12 + j] = Number.isFinite(Number(r[j])) ? Number(r[j]) : ident[j];
+        }
+        return { data, boneCount };
+    }
+
+    _createBoneTextureFromRows(rows3x4) {
+        const gl = this.gl;
+        const packed = this._packBoneTextureRows(rows3x4);
+        let prevActive = null;
+        try {
+            try {
+                prevActive = gl.getParameter(gl.ACTIVE_TEXTURE);
+                gl.activeTexture(gl.TEXTURE0 + 16);
+            } catch { /* ignore */ }
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1, packed.boneCount * 3, 0, gl.RGBA, gl.FLOAT, packed.data);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            try { if (prevActive !== null) gl.activeTexture(prevActive); } catch { /* ignore */ }
+            return t;
+        } catch {
+            try { gl.bindTexture(gl.TEXTURE_2D, null); } catch { /* ignore */ }
+            try { if (prevActive !== null) gl.activeTexture(prevActive); } catch { /* ignore */ }
+            return null;
+        }
+    }
+
+    _updateBoneTextureFromRows(tex, rows3x4) {
+        if (!tex) return false;
+        const gl = this.gl;
+        const packed = this._packBoneTextureRows(rows3x4);
+        let prevActive = null;
+        try {
+            if (this._fastTextureUnitRestore) {
+                gl.activeTexture(gl.TEXTURE0 + 16);
+            } else {
+                try {
+                    prevActive = gl.getParameter(gl.ACTIVE_TEXTURE);
+                    gl.activeTexture(gl.TEXTURE0 + 16);
+                } catch { /* ignore */ }
+            }
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, packed.boneCount * 3, gl.RGBA, gl.FLOAT, packed.data);
+            try {
+                if (this._fastTextureUnitRestore) gl.activeTexture(gl.TEXTURE0);
+                else if (prevActive !== null) gl.activeTexture(prevActive);
+            } catch { /* ignore */ }
+            return true;
+        } catch {
+            try { gl.bindTexture(gl.TEXTURE_2D, null); } catch { /* ignore */ }
+            try {
+                if (this._fastTextureUnitRestore) gl.activeTexture(gl.TEXTURE0);
+                else if (prevActive !== null) gl.activeTexture(prevActive);
+            } catch { /* ignore */ }
+            return false;
+        }
+    }
+
+    _getBonePaletteTexture(boneIds) {
+        const ids = (Array.isArray(boneIds) ? boneIds : [])
+            .map((v) => Number(v) | 0)
+            .filter((v) => v >= 0);
+        if (!ids.length || !Array.isArray(this._skinTransforms3x4) || !this._skinTransforms3x4.length) {
+            return this._identityBoneTexture;
+        }
+        const key = ids.join(',');
+        const cached = this._skinTextureCache.get(key);
+        const rows = ids.map((id) => this._skinTransforms3x4[id] || null);
+        if (cached?.tex) {
+            if (cached.version === this._skinPoseVersion) return cached.tex;
+            if (cached.count === ids.length && this._updateBoneTextureFromRows(cached.tex, rows)) {
+                cached.version = this._skinPoseVersion;
+                return cached.tex;
+            }
+            try { this.gl.deleteTexture(cached.tex); } catch { /* ignore */ }
+            this._skinTextureCache.delete(key);
+        }
+        const tex = this._createBoneTextureFromRows(rows);
+        if (tex) this._skinTextureCache.set(key, { tex, count: ids.length, version: this._skinPoseVersion });
+        return tex || this._identityBoneTexture;
+    }
+
+    hasSkinningSkeleton() {
+        return Array.isArray(this._skinTransforms3x4) && this._skinTransforms3x4.length > 0;
+    }
+
+    hasSkinningAnimations() {
+        return !!(this._skinAnimationSet?.clips && Object.keys(this._skinAnimationSet.clips).length);
+    }
+
+    /**
+     * Return the current model-local transform for a named skinned bone.
+     * This is the same sampled palette used by the vertex shader, expanded from
+     * skin space back into the ped's bind space so external props can stay pinned
+     * to a joint instead of following an approximate world-space location.
+     */
+    getSkinningBoneTransform(name, out = null) {
+        const index = this._skinBoneNameToIndex?.get?.(String(name || ''));
+        if (!Number.isInteger(index) || index < 0) return null;
+        const skinRows = this._skinTransforms3x4?.[index];
+        const bind = this._skinBoneBindTransforms?.[index];
+        if (!Array.isArray(skinRows) || skinRows.length < 12 || !bind) return null;
+
+        const skin = this._skinBoneTransformScratch;
+        skin[0] = Number(skinRows[0]) || 0.0;
+        skin[4] = Number(skinRows[1]) || 0.0;
+        skin[8] = Number(skinRows[2]) || 0.0;
+        skin[12] = Number(skinRows[3]) || 0.0;
+        skin[1] = Number(skinRows[4]) || 0.0;
+        skin[5] = Number(skinRows[5]) || 0.0;
+        skin[9] = Number(skinRows[6]) || 0.0;
+        skin[13] = Number(skinRows[7]) || 0.0;
+        skin[2] = Number(skinRows[8]) || 0.0;
+        skin[6] = Number(skinRows[9]) || 0.0;
+        skin[10] = Number(skinRows[10]) || 0.0;
+        skin[14] = Number(skinRows[11]) || 0.0;
+        skin[3] = 0.0;
+        skin[7] = 0.0;
+        skin[11] = 0.0;
+        skin[15] = 1.0;
+
+        const target = out || glMatrix.mat4.create();
+        glMatrix.mat4.multiply(target, skin, bind);
+        return target;
+    }
+
+    getSkinningAnimationStatus() {
+        const clips = this._skinAnimationSet?.clips || {};
+        return {
+            ready: this.hasSkinningAnimations(),
+            clips: Object.keys(clips),
+            boneCount: Number(this._skinAnimationSet?.boneCount) || 0,
+        };
+    }
+
+    getWeaponAnimationDiagnostics() {
+        return {
+            ...(this._weaponAnimationDiagnostics || {}),
+            availableCompositeClips: Object.values(this._skinAnimationSet?.clips || {})
+                .filter((clip) => clip?.composite)
+                .map((clip) => clip.name),
+        };
     }
 
     _create1x1TextureRGBA8(rgba = [255, 255, 255, 255]) {
@@ -1127,12 +2544,26 @@ export class InstancedModelRenderer {
      * - Fall back to the original path when hash-only is missing.
      * - Skip URLs we already know 404 via TextureStreamer negative cache.
      */
-    _chooseTextureUrl(rel) {
-        return this._texResolver?.chooseTextureUrl?.(rel) ?? null;
+    _chooseTextureUrl(rel, options) {
+        return this._texResolver?.chooseTextureUrl?.(rel, options) ?? null;
     }
 
     getRenderStats() {
-        return { ...(this._renderStats || {}) };
+        const out = { ...(this._renderStats || {}) };
+        try {
+            const miss = Array.from((this._texFrame?.missingFromExportedSet || new Map()).entries())
+                .map(([rel, count]) => {
+                    const r = String(rel || '');
+                    const m = r.match(/models_textures(?:_ktx2)?\/(\d+)/i);
+                    return { rel: r, hash: m ? m[1] : '', count: Number(count) | 0 };
+                })
+                .sort((a, b) => (b.count - a.count) || a.rel.localeCompare(b.rel))
+                .slice(0, 8);
+            out.diffuseMissingFromIndexTop = miss;
+        } catch {
+            out.diffuseMissingFromIndexTop = [];
+        }
+        return out;
     }
 
     /**
@@ -1161,11 +2592,727 @@ export class InstancedModelRenderer {
         }
     }
 
+    pickAssetAtScreen({ x, y, viewportWidth, viewportHeight, viewProjectionMatrix, maxPixelDistance = 28, nearbyLimit = 8 } = {}) {
+        const sx = Number(x);
+        const sy = Number(y);
+        const vw = Number(viewportWidth);
+        const vh = Number(viewportHeight);
+        if (!Number.isFinite(sx) || !Number.isFinite(sy) || !(vw > 0) || !(vh > 0)) return null;
+        if (!viewProjectionMatrix || viewProjectionMatrix.length < 16) return null;
+
+        const maxPx = Number.isFinite(Number(maxPixelDistance)) ? Math.max(2, Math.min(96, Number(maxPixelDistance))) : 28;
+        const ray = this._makePickRay(sx, sy, vw, vh, viewProjectionMatrix);
+        const hits = [];
+        const items = Array.isArray(this._lastPickDrawItems) ? this._lastPickDrawItems : [];
+        for (const item of items) {
+            if (!item || !item.mesh) continue;
+            const data = item.instanceData;
+            const stride = Math.max(16, Math.floor(Number(item.instanceStrideFloats) || 16));
+            const count = Math.min(
+                Math.max(0, Math.floor(Number(item.instanceCount) || 0)),
+                data && data.length ? Math.floor(data.length / stride) : 0,
+            );
+            if (!data || count <= 0) continue;
+            for (let idx = 0; idx < count; idx++) {
+                const off = idx * stride;
+                const rayHit = ray ? this._rayIntersectInstanceBounds(item, data, off, ray) : null;
+                if (!rayHit) continue;
+                const meshHit = this._rayIntersectInstanceMesh(item, data, off, ray);
+                const hit = meshHit || rayHit;
+                const proj = this._projectInstanceScreenBounds(item, data, off, viewProjectionMatrix, vw, vh);
+                if (!proj) continue;
+                hits.push({
+                    item,
+                    instanceIndex: idx,
+                    instanceOffset: off,
+                    distPx: 0,
+                    score: hit.tViewer,
+                    projection: proj,
+                    rayHit: hit,
+                    pickMethod: meshHit ? 'rayMesh' : 'rayAabb',
+                });
+            }
+        }
+
+        // Fallback for malformed/missing bounds only. Do not let huge projected
+        // ground/curb rectangles steal clicks from smaller assets.
+        if (hits.length === 0) {
+            const viewportArea = Math.max(1, vw * vh);
+            for (const item of items) {
+                if (!item || !item.mesh) continue;
+                const data = item.instanceData;
+                const stride = Math.max(16, Math.floor(Number(item.instanceStrideFloats) || 16));
+                const count = Math.min(
+                    Math.max(0, Math.floor(Number(item.instanceCount) || 0)),
+                    data && data.length ? Math.floor(data.length / stride) : 0,
+                );
+                if (!data || count <= 0) continue;
+                for (let idx = 0; idx < count; idx++) {
+                    const off = idx * stride;
+                    const proj = this._projectInstanceScreenBounds(item, data, off, viewProjectionMatrix, vw, vh);
+                    if (!proj) continue;
+                    const distPx = this._distanceToRect(sx, sy, proj.rect);
+                    if (distPx > maxPx) continue;
+                    const rw = Math.max(0, Math.min(vw, proj.rect.maxX) - Math.max(0, proj.rect.minX));
+                    const rh = Math.max(0, Math.min(vh, proj.rect.maxY) - Math.max(0, proj.rect.minY));
+                    const coverage = (rw * rh) / viewportArea;
+                    if (coverage > 0.45 && distPx <= 1.0) continue;
+                    const score = distPx + Math.max(0, proj.depth01 || 0) * 0.001 + coverage * 12.0;
+                    hits.push({
+                        item,
+                        instanceIndex: idx,
+                        instanceOffset: off,
+                        distPx,
+                        score,
+                        projection: proj,
+                        rayHit: null,
+                        pickMethod: 'screenRectFallback',
+                        screenCoverage: coverage,
+                    });
+                }
+            }
+        }
+
+        hits.sort((a, b) => {
+            const methodRank = (method) => {
+                if (method === 'rayMesh') return 0;
+                if (method === 'rayAabb') return 1;
+                return 2;
+            };
+            const am = methodRank(a.pickMethod);
+            const bm = methodRank(b.pickMethod);
+            if (am !== bm) return am - bm;
+            if (am <= 1 && bm <= 1) {
+                const at = Number(a.rayHit?.tViewer);
+                const bt = Number(b.rayHit?.tViewer);
+                if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt;
+            }
+            if (a.distPx !== b.distPx) return a.distPx - b.distPx;
+            const ac = Number(a.screenCoverage);
+            const bc = Number(b.screenCoverage);
+            if (Number.isFinite(ac) && Number.isFinite(bc) && ac !== bc) return ac - bc;
+            const ad = Number(a.projection?.depth01);
+            const bd = Number(b.projection?.depth01);
+            if (Number.isFinite(ad) && Number.isFinite(bd) && ad !== bd) return ad - bd;
+            return (a.item?.seq ?? 0) - (b.item?.seq ?? 0);
+        });
+
+        const lim = Number.isFinite(Number(nearbyLimit)) ? Math.max(1, Math.min(24, Math.floor(Number(nearbyLimit)))) : 8;
+        const selectedHit = hits[0] || null;
+        const report = {
+            schema: 'webglgta-demo-asset-pick-v1',
+            timeIso: (() => { try { return new Date().toISOString(); } catch { return null; } })(),
+            click: {
+                x: sx,
+                y: sy,
+                viewportWidth: vw,
+                viewportHeight: vh,
+                maxPixelDistance: maxPx,
+                ray: ray ? {
+                    originViewer: this._jsonSafe(ray.origin),
+                    dirViewer: this._jsonSafe(ray.dir),
+                } : null,
+            },
+            selected: selectedHit ? this._buildPickRecord(selectedHit, { full: true }) : null,
+            nearby: hits.slice(0, lim).map((h) => this._buildPickRecord(h, { full: false })),
+            rendererStats: (() => { try { return this.getRenderStats(); } catch { return null; } })(),
+            textureFrame: (() => { try { return this.getTextureFrameReport(25); } catch { return null; } })(),
+        };
+        this._lastPickReport = report;
+        return report;
+    }
+
+    getLastPickReport() {
+        return this._lastPickReport || null;
+    }
+
+    _makePickRay(x, y, viewportWidth, viewportHeight, viewProjectionMatrix) {
+        const invVp = this._pickTmpInvVp;
+        if (!glMatrix.mat4.invert(invVp, viewProjectionMatrix)) return null;
+        const ndcX = (Number(x) / Number(viewportWidth)) * 2.0 - 1.0;
+        const ndcY = 1.0 - (Number(y) / Number(viewportHeight)) * 2.0;
+        const near = this._pickTmpNear;
+        const far = this._pickTmpFar;
+        near[0] = ndcX; near[1] = ndcY; near[2] = -1.0; near[3] = 1.0;
+        far[0] = ndcX; far[1] = ndcY; far[2] = 1.0; far[3] = 1.0;
+        glMatrix.vec4.transformMat4(near, near, invVp);
+        glMatrix.vec4.transformMat4(far, far, invVp);
+        if (Math.abs(near[3]) < 1e-8 || Math.abs(far[3]) < 1e-8) return null;
+        near[0] /= near[3]; near[1] /= near[3]; near[2] /= near[3]; near[3] = 1.0;
+        far[0] /= far[3]; far[1] /= far[3]; far[2] /= far[3]; far[3] = 1.0;
+        const dx = far[0] - near[0];
+        const dy = far[1] - near[1];
+        const dz = far[2] - near[2];
+        const len = Math.hypot(dx, dy, dz);
+        if (!Number.isFinite(len) || len < 1e-8) return null;
+        return {
+            origin: [near[0], near[1], near[2]],
+            dir: [dx / len, dy / len, dz / len],
+            ndc: [ndcX, ndcY],
+        };
+    }
+
+    _instanceMatrixFromData(data, off, out) {
+        if (!data || !out) return null;
+        for (let i = 0; i < 16; i++) out[i] = Number(data[off + i]) || 0.0;
+        return out;
+    }
+
+    _rayIntersectInstanceBounds(item, data, off, ray) {
+        const meshBounds = item?.mesh?.bounds || null;
+        const min0 = Array.isArray(meshBounds?.min) ? meshBounds.min : null;
+        const max0 = Array.isArray(meshBounds?.max) ? meshBounds.max : null;
+        if (!min0 || !max0 || min0.length < 3 || max0.length < 3) return null;
+
+        const inst = this._instanceMatrixFromData(data, off, this._pickTmpInst);
+        if (!inst) return null;
+        const localToViewer = this._pickTmpLocalToViewer;
+        glMatrix.mat4.multiply(localToViewer, this.modelMatrix, inst);
+        const invLocalToViewer = this._pickTmpInvLocalToViewer;
+        if (!glMatrix.mat4.invert(invLocalToViewer, localToViewer)) return null;
+
+        const ro4 = this._pickTmpRayOrigin4;
+        ro4[0] = ray.origin[0]; ro4[1] = ray.origin[1]; ro4[2] = ray.origin[2]; ro4[3] = 1.0;
+        const rd4 = this._pickTmpRayDir4;
+        rd4[0] = ray.dir[0]; rd4[1] = ray.dir[1]; rd4[2] = ray.dir[2]; rd4[3] = 0.0;
+        const localOrigin = this._pickTmpLocalOrigin;
+        const localDir = this._pickTmpLocalDir;
+        glMatrix.vec4.transformMat4(localOrigin, ro4, invLocalToViewer);
+        glMatrix.vec4.transformMat4(localDir, rd4, invLocalToViewer);
+        const tLocal = this._rayIntersectLocalAabb(localOrigin, localDir, min0, max0);
+        if (tLocal === null) return null;
+
+        const localHit = this._pickTmpLocalHit;
+        localHit[0] = localOrigin[0] + localDir[0] * tLocal;
+        localHit[1] = localOrigin[1] + localDir[1] * tLocal;
+        localHit[2] = localOrigin[2] + localDir[2] * tLocal;
+        localHit[3] = 1.0;
+        glMatrix.vec4.transformMat4(this._pickTmpWorld, localHit, localToViewer);
+        const vx = this._pickTmpWorld[0];
+        const vy = this._pickTmpWorld[1];
+        const vz = this._pickTmpWorld[2];
+        const tViewer =
+            (vx - ray.origin[0]) * ray.dir[0] +
+            (vy - ray.origin[1]) * ray.dir[1] +
+            (vz - ray.origin[2]) * ray.dir[2];
+        if (!Number.isFinite(tViewer) || tViewer < 0) return null;
+
+        return {
+            tLocal,
+            tViewer,
+            localHit: [localHit[0], localHit[1], localHit[2]],
+            dataHit: this._transformInstanceLocalToData(data, off, localHit),
+            viewerHit: [vx, vy, vz],
+            bounds: {
+                min: [Number(min0[0]) || 0, Number(min0[1]) || 0, Number(min0[2]) || 0],
+                max: [Number(max0[0]) || 0, Number(max0[1]) || 0, Number(max0[2]) || 0],
+            },
+        };
+    }
+
+    _rayIntersectInstanceMesh(item, data, off, ray) {
+        const mesh = item?.mesh || null;
+        const positions = mesh?.pickPositions || null;
+        const indices = mesh?.pickIndices || null;
+        if (!positions || !indices || positions.length < 9 || indices.length < 3) return null;
+
+        const inst = this._instanceMatrixFromData(data, off, this._pickTmpInst);
+        if (!inst) return null;
+        const localToViewer = this._pickTmpLocalToViewer;
+        glMatrix.mat4.multiply(localToViewer, this.modelMatrix, inst);
+        const invLocalToViewer = this._pickTmpInvLocalToViewer;
+        if (!glMatrix.mat4.invert(invLocalToViewer, localToViewer)) return null;
+
+        const ro4 = this._pickTmpRayOrigin4;
+        ro4[0] = ray.origin[0]; ro4[1] = ray.origin[1]; ro4[2] = ray.origin[2]; ro4[3] = 1.0;
+        const rd4 = this._pickTmpRayDir4;
+        rd4[0] = ray.dir[0]; rd4[1] = ray.dir[1]; rd4[2] = ray.dir[2]; rd4[3] = 0.0;
+        const localOrigin = this._pickTmpLocalOrigin;
+        const localDir = this._pickTmpLocalDir;
+        glMatrix.vec4.transformMat4(localOrigin, ro4, invLocalToViewer);
+        glMatrix.vec4.transformMat4(localDir, rd4, invLocalToViewer);
+
+        let bestT = Number.POSITIVE_INFINITY;
+        let bestTri = -1;
+        let bestU = 0;
+        let bestV = 0;
+        const triCount = Math.min(Math.floor(indices.length / 3), 100000);
+        const eps = 1e-8;
+        const ox = Number(localOrigin[0]);
+        const oy = Number(localOrigin[1]);
+        const oz = Number(localOrigin[2]);
+        const dx = Number(localDir[0]);
+        const dy = Number(localDir[1]);
+        const dz = Number(localDir[2]);
+        if (![ox, oy, oz, dx, dy, dz].every(Number.isFinite)) return null;
+
+        for (let tri = 0; tri < triCount; tri++) {
+            const ii = tri * 3;
+            const i0 = Math.floor(Number(indices[ii + 0]) || 0) * 3;
+            const i1 = Math.floor(Number(indices[ii + 1]) || 0) * 3;
+            const i2 = Math.floor(Number(indices[ii + 2]) || 0) * 3;
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 + 2 >= positions.length || i1 + 2 >= positions.length || i2 + 2 >= positions.length) continue;
+
+            const v0x = positions[i0 + 0], v0y = positions[i0 + 1], v0z = positions[i0 + 2];
+            const e1x = positions[i1 + 0] - v0x;
+            const e1y = positions[i1 + 1] - v0y;
+            const e1z = positions[i1 + 2] - v0z;
+            const e2x = positions[i2 + 0] - v0x;
+            const e2y = positions[i2 + 1] - v0y;
+            const e2z = positions[i2 + 2] - v0z;
+
+            const px = dy * e2z - dz * e2y;
+            const py = dz * e2x - dx * e2z;
+            const pz = dx * e2y - dy * e2x;
+            const det = e1x * px + e1y * py + e1z * pz;
+            if (Math.abs(det) < eps) continue;
+            const invDet = 1.0 / det;
+
+            const tx = ox - v0x;
+            const ty = oy - v0y;
+            const tz = oz - v0z;
+            const u = (tx * px + ty * py + tz * pz) * invDet;
+            if (u < -1e-5 || u > 1.00001) continue;
+
+            const qx = ty * e1z - tz * e1y;
+            const qy = tz * e1x - tx * e1z;
+            const qz = tx * e1y - ty * e1x;
+            const v = (dx * qx + dy * qy + dz * qz) * invDet;
+            if (v < -1e-5 || (u + v) > 1.00001) continue;
+
+            const t = (e2x * qx + e2y * qy + e2z * qz) * invDet;
+            if (t < 0 || t >= bestT) continue;
+            bestT = t;
+            bestTri = tri;
+            bestU = u;
+            bestV = v;
+        }
+
+        if (!Number.isFinite(bestT) || bestTri < 0) return null;
+        const localHit = this._pickTmpLocalHit;
+        localHit[0] = ox + dx * bestT;
+        localHit[1] = oy + dy * bestT;
+        localHit[2] = oz + dz * bestT;
+        localHit[3] = 1.0;
+        glMatrix.vec4.transformMat4(this._pickTmpWorld, localHit, localToViewer);
+        const vx = this._pickTmpWorld[0];
+        const vy = this._pickTmpWorld[1];
+        const vz = this._pickTmpWorld[2];
+        const tViewer =
+            (vx - ray.origin[0]) * ray.dir[0] +
+            (vy - ray.origin[1]) * ray.dir[1] +
+            (vz - ray.origin[2]) * ray.dir[2];
+        if (!Number.isFinite(tViewer) || tViewer < 0) return null;
+
+        return {
+            tLocal: bestT,
+            tViewer,
+            localHit: [localHit[0], localHit[1], localHit[2]],
+            dataHit: this._transformInstanceLocalToData(data, off, localHit),
+            viewerHit: [vx, vy, vz],
+            triangleIndex: bestTri,
+            barycentric: [1.0 - bestU - bestV, bestU, bestV],
+        };
+    }
+
+    _rayIntersectLocalAabb(origin4, dir4, min0, max0) {
+        let tMin = Number.NEGATIVE_INFINITY;
+        let tMax = Number.POSITIVE_INFINITY;
+        for (let axis = 0; axis < 3; axis++) {
+            const o = Number(origin4[axis]);
+            const d = Number(dir4[axis]);
+            const rawMin = Number(min0[axis]);
+            const rawMax = Number(max0[axis]);
+            if (!Number.isFinite(o) || !Number.isFinite(d) || !Number.isFinite(rawMin) || !Number.isFinite(rawMax)) return null;
+            const mn = Math.min(rawMin, rawMax) - 0.02;
+            const mx = Math.max(rawMin, rawMax) + 0.02;
+            if (Math.abs(d) < 1e-9) {
+                if (o < mn || o > mx) return null;
+                continue;
+            }
+            let t1 = (mn - o) / d;
+            let t2 = (mx - o) / d;
+            if (t1 > t2) {
+                const tmp = t1;
+                t1 = t2;
+                t2 = tmp;
+            }
+            if (t1 > tMin) tMin = t1;
+            if (t2 < tMax) tMax = t2;
+            if (tMin > tMax) return null;
+        }
+        if (tMax < 0) return null;
+        const t = tMin >= 0 ? tMin : tMax;
+        return Number.isFinite(t) ? t : null;
+    }
+
+    _projectInstanceScreenBounds(item, data, off, viewProjectionMatrix, viewportWidth, viewportHeight) {
+        const meshBounds = item?.mesh?.bounds || null;
+        const min = Array.isArray(meshBounds?.min) ? meshBounds.min : null;
+        const max = Array.isArray(meshBounds?.max) ? meshBounds.max : null;
+        const center = Array.isArray(meshBounds?.center) ? meshBounds.center : [0, 0, 0];
+        const radius = Number(item?.mesh?.radius ?? item?.gpuCullRadius ?? 1.0);
+        const corners = [];
+        if (min && max && min.length >= 3 && max.length >= 3) {
+            for (let ix = 0; ix < 2; ix++) {
+                for (let iy = 0; iy < 2; iy++) {
+                    for (let iz = 0; iz < 2; iz++) {
+                        corners.push([
+                            ix ? Number(max[0]) : Number(min[0]),
+                            iy ? Number(max[1]) : Number(min[1]),
+                            iz ? Number(max[2]) : Number(min[2]),
+                        ]);
+                    }
+                }
+            }
+        } else {
+            const c = center || [0, 0, 0];
+            const r = Number.isFinite(radius) ? Math.max(0.5, radius) : 1.0;
+            corners.push(
+                [c[0] - r, c[1], c[2]],
+                [c[0] + r, c[1], c[2]],
+                [c[0], c[1] - r, c[2]],
+                [c[0], c[1] + r, c[2]],
+                [c[0], c[1], c[2] - r],
+                [c[0], c[1], c[2] + r],
+            );
+        }
+
+        let minX = Number.POSITIVE_INFINITY;
+        let minY = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let maxY = Number.NEGATIVE_INFINITY;
+        let minDepth = Number.POSITIVE_INFINITY;
+        let projected = 0;
+        for (const p of corners) {
+            const s = this._projectInstanceLocalPoint(data, off, p, viewProjectionMatrix, viewportWidth, viewportHeight);
+            if (!s) continue;
+            projected++;
+            minX = Math.min(minX, s.x);
+            minY = Math.min(minY, s.y);
+            maxX = Math.max(maxX, s.x);
+            maxY = Math.max(maxY, s.y);
+            minDepth = Math.min(minDepth, s.depth01);
+        }
+
+        const centerScreen = this._projectInstanceLocalPoint(data, off, center, viewProjectionMatrix, viewportWidth, viewportHeight);
+        if (!centerScreen && projected <= 0) return null;
+        if (projected <= 0 && centerScreen) {
+            const r = Math.max(8, Math.min(48, Number(radius) || 8));
+            minX = centerScreen.x - r;
+            maxX = centerScreen.x + r;
+            minY = centerScreen.y - r;
+            maxY = centerScreen.y + r;
+            minDepth = centerScreen.depth01;
+        }
+        if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
+
+        const pad = 4.0;
+        return {
+            rect: {
+                minX: Math.max(-viewportWidth, minX - pad),
+                minY: Math.max(-viewportHeight, minY - pad),
+                maxX: Math.min(viewportWidth * 2, maxX + pad),
+                maxY: Math.min(viewportHeight * 2, maxY + pad),
+            },
+            centerScreen: centerScreen ? { x: centerScreen.x, y: centerScreen.y, depth01: centerScreen.depth01 } : null,
+            centerData: this._transformInstanceLocalToData(data, off, center),
+            centerViewer: centerScreen?.viewer || null,
+            depth01: Number.isFinite(minDepth) ? minDepth : (centerScreen?.depth01 ?? 1.0),
+        };
+    }
+    _transformInstanceLocalToData(data, off, local) {
+        const x = Number(local?.[0]) || 0.0;
+        const y = Number(local?.[1]) || 0.0;
+        const z = Number(local?.[2]) || 0.0;
+        return [
+            (Number(data[off + 0]) || 0) * x + (Number(data[off + 4]) || 0) * y + (Number(data[off + 8]) || 0) * z + (Number(data[off + 12]) || 0),
+            (Number(data[off + 1]) || 0) * x + (Number(data[off + 5]) || 0) * y + (Number(data[off + 9]) || 0) * z + (Number(data[off + 13]) || 0),
+            (Number(data[off + 2]) || 0) * x + (Number(data[off + 6]) || 0) * y + (Number(data[off + 10]) || 0) * z + (Number(data[off + 14]) || 0),
+        ];
+    }
+
+    _projectInstanceLocalPoint(data, off, local, viewProjectionMatrix, viewportWidth, viewportHeight) {
+        const dataPos = this._transformInstanceLocalToData(data, off, local);
+        const dataV = this._pickTmpData;
+        dataV[0] = dataPos[0];
+        dataV[1] = dataPos[1];
+        dataV[2] = dataPos[2];
+        dataV[3] = 1.0;
+        glMatrix.vec4.transformMat4(this._pickTmpWorld, dataV, this.modelMatrix);
+        glMatrix.vec4.transformMat4(this._pickTmpClip, this._pickTmpWorld, viewProjectionMatrix);
+        const w = Number(this._pickTmpClip[3]);
+        if (!Number.isFinite(w) || Math.abs(w) < 1e-6) return null;
+        const ndcX = this._pickTmpClip[0] / w;
+        const ndcY = this._pickTmpClip[1] / w;
+        const ndcZ = this._pickTmpClip[2] / w;
+        if (!Number.isFinite(ndcX) || !Number.isFinite(ndcY) || !Number.isFinite(ndcZ)) return null;
+        if (ndcZ < -1.25 || ndcZ > 1.25) return null;
+        return {
+            x: (ndcX * 0.5 + 0.5) * viewportWidth,
+            y: (1.0 - (ndcY * 0.5 + 0.5)) * viewportHeight,
+            depth01: ndcZ * 0.5 + 0.5,
+            data: dataPos,
+            viewer: [this._pickTmpWorld[0], this._pickTmpWorld[1], this._pickTmpWorld[2]],
+        };
+    }
+
+    _distanceToRect(x, y, rect) {
+        if (!rect) return Number.POSITIVE_INFINITY;
+        const dx = x < rect.minX ? (rect.minX - x) : (x > rect.maxX ? (x - rect.maxX) : 0);
+        const dy = y < rect.minY ? (rect.minY - y) : (y > rect.maxY ? (y - rect.maxY) : 0);
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    _buildPickRecord(hit, { full = false } = {}) {
+        const item = hit?.item || {};
+        const data = item.instanceData;
+        const off = Math.max(0, Math.floor(Number(hit?.instanceOffset) || 0));
+        const stride = Math.max(16, Math.floor(Number(item.instanceStrideFloats) || 16));
+        const dataPosition = data ? [
+            this._roundDebugNumber(data[off + 12]),
+            this._roundDebugNumber(data[off + 13]),
+            this._roundDebugNumber(data[off + 14]),
+        ] : null;
+        const maxScale = data ? this._roundDebugNumber(this._instanceMaxScaleFromData(data, off)) : null;
+        const textureDistance = Number.isFinite(Number(item.dist)) ? Number(item.dist) : 0;
+        const textures = {
+            diffuse: this._textureDebugInfo(item.diffuseRel, item.diffuseKind || 'diffuse', textureDistance),
+            diffuse2: this._textureDebugInfo(item.diffuse2Rel, 'diffuse2', textureDistance),
+            normal: this._textureDebugInfo(item.normalRel, 'normal', textureDistance),
+            spec: this._textureDebugInfo(item.specRel, (item.shaderFamilyInt === 6) ? 'diffuse' : 'spec', textureDistance),
+            detail: this._textureDebugInfo(item.detailRel, 'detail', textureDistance),
+            tintPalette: this._textureDebugInfo(item.tintPaletteRel, 'tintPalette', textureDistance),
+            alphaMask: this._textureDebugInfo(item.alphaMaskRel, 'alphaMask', textureDistance),
+            env: this._textureDebugInfo(item.envRel, (item.shaderFamilyInt === 6) ? 'diffuse' : 'env', textureDistance),
+            dirt: this._textureDebugInfo(item.dirtRel, 'dirt', textureDistance),
+            damage: this._textureDebugInfo(item.damageRel, 'damage', textureDistance),
+            damageMask: this._textureDebugInfo(item.damageMaskRel, 'damageMask', textureDistance),
+            puddleMask: this._textureDebugInfo(item.puddleMaskRel, 'puddleMask', textureDistance),
+            emissive: this._textureDebugInfo(item.emissiveRel, 'emissive', textureDistance),
+            ao: this._textureDebugInfo(item.aoRel, 'ao', textureDistance),
+            height: this._textureDebugInfo(item.heightRel, 'height', textureDistance),
+        };
+        const manifestEntry = item.hash ? (this.modelManager?.manifest?.meshes?.[String(item.hash)] || null) : null;
+        const projection = hit?.projection || null;
+        const rayHit = hit?.rayHit || null;
+        const base = {
+            pick: {
+                method: hit?.pickMethod || null,
+                distancePx: this._roundDebugNumber(hit?.distPx),
+                score: this._roundDebugNumber(hit?.score),
+                screenCoverage: this._roundDebugNumber(hit?.screenCoverage),
+                screenRect: this._jsonSafe(projection?.rect),
+                centerScreen: this._jsonSafe(projection?.centerScreen),
+                depth01: this._roundDebugNumber(projection?.depth01),
+                rayTViewer: this._roundDebugNumber(rayHit?.tViewer),
+                rayTLocal: this._roundDebugNumber(rayHit?.tLocal),
+                rayLocalHit: this._jsonSafe(rayHit?.localHit),
+                rayDataHit: this._jsonSafe(rayHit?.dataHit),
+                rayViewerHit: this._jsonSafe(rayHit?.viewerHit),
+                triangleIndex: Number.isFinite(Number(rayHit?.triangleIndex)) ? Math.floor(Number(rayHit.triangleIndex)) : null,
+                barycentric: this._jsonSafe(rayHit?.barycentric),
+            },
+            identity: {
+                kind: item.kind || null,
+                hash: item.hash || null,
+                lod: item.lod || null,
+                file: item.file || item.meshKey || null,
+                bucketId: item.bucketId || null,
+                materialSig: item.materialSig || null,
+                seq: Number.isFinite(Number(item.seq)) ? Number(item.seq) : null,
+            },
+            instance: {
+                index: Number.isFinite(Number(hit?.instanceIndex)) ? Math.floor(Number(hit.instanceIndex)) : null,
+                count: Number.isFinite(Number(item.instanceCount)) ? Math.floor(Number(item.instanceCount)) : null,
+                strideFloats: stride,
+                dataPosition,
+                centerData: this._jsonSafe(projection?.centerData),
+                centerViewer: this._jsonSafe(projection?.centerViewer),
+                maxScale,
+                tintIndex: stride >= 17 && data ? this._roundDebugNumber(data[off + 16]) : null,
+                guid: stride >= 21 && data ? (Number(data[off + 17]) >>> 0) : null,
+                mloParentGuid: stride >= 21 && data ? (Number(data[off + 18]) >>> 0) : null,
+                mloEntitySetHash: stride >= 21 && data ? (Number(data[off + 19]) >>> 0) : null,
+                mloFlags: stride >= 21 && data ? (Number(data[off + 20]) >>> 0) : null,
+                ymapHash: stride >= 22 && data ? (Number(data[off + 21]) >>> 0) : null,
+            },
+            mesh: {
+                key: item.meshKey || item.file || null,
+                vertexCount: Number.isFinite(Number(item.mesh?.vertexCount)) ? Math.floor(Number(item.mesh.vertexCount)) : null,
+                indexCount: Number.isFinite(Number(item.mesh?.indexCount)) ? Math.floor(Number(item.mesh.indexCount)) : null,
+                radius: this._roundDebugNumber(item.mesh?.radius),
+                bounds: this._jsonSafe(item.mesh?.bounds),
+                hasUv0: !!item.mesh?.uvBuffer,
+                hasUv1: !!item.meshHasUv1,
+                hasColor0: !!item.meshHasColor0,
+                hasTangents: !!item.meshHasTangents,
+                skinned: !!item.skinned,
+            },
+            material: {
+                shaderName: item.shaderName || null,
+                shaderFamily: item.shaderFamily || null,
+                renderBucket: Number.isFinite(Number(item.renderBucket)) ? Number(item.renderBucket) : null,
+                alphaModeInt: Number.isFinite(Number(item.alphaModeInt)) ? Number(item.alphaModeInt) : null,
+                doubleSided: !!item.doubleSided,
+                doubleSidedLighting: !!item.doubleSidedLighting,
+                alphaToCoverage: !!item.alphaToCoverage,
+                baseColor: this._jsonSafe(item.baseColor),
+                vertexColorMode: Number.isFinite(Number(item.vertexColorMode)) ? Number(item.vertexColorMode) : 0,
+                tintMode: Number.isFinite(Number(item.tintMode)) ? Number(item.tintMode) : null,
+                uv0ScaleOffset: this._jsonSafe(item.uvso),
+                uv1ScaleOffset: this._jsonSafe(item.uvso1),
+                uv2ScaleOffset: this._jsonSafe(item.uvso2),
+            },
+            textures,
+            culling: {
+                dist: this._roundDebugNumber(item.dist),
+                sortDist: this._roundDebugNumber(item.sortDist),
+                instBounds: this._jsonSafe(item.instBounds),
+                gpuCullRadius: this._roundDebugNumber(item.gpuCullRadius),
+            },
+        };
+        if (full) {
+            base.archetype = {
+                lodDistances: this._jsonSafe(manifestEntry?.lodDistances),
+                bounds: this._jsonSafe(manifestEntry?.bounds),
+                radius: this._roundDebugNumber(manifestEntry?.radius),
+                material: this._jsonSafe(manifestEntry?.material),
+            };
+            base.material.raw = {
+                entry: this._jsonSafe(item.entryMaterial),
+                submesh: this._jsonSafe(item.submeshMaterial),
+                effective: this._jsonSafe(item.effectiveMaterial),
+            };
+            base.renderItem = {
+                diffuseUvSet: Number.isFinite(Number(item.diffuseUvSet)) ? Number(item.diffuseUvSet) : null,
+                normalUvSet: Number.isFinite(Number(item.normalUvSet)) ? Number(item.normalUvSet) : null,
+                specUvSet: Number.isFinite(Number(item.specUvSet)) ? Number(item.specUvSet) : null,
+                detailUvSet: Number.isFinite(Number(item.detailUvSet)) ? Number(item.detailUvSet) : null,
+                aoUvSet: Number.isFinite(Number(item.aoUvSet)) ? Number(item.aoUvSet) : null,
+                vertexColorMode: Number.isFinite(Number(item.vertexColorMode)) ? Number(item.vertexColorMode) : 0,
+                alphaCutoff: this._roundDebugNumber(item.alphaCutoff),
+                alphaScale: this._roundDebugNumber(item.alphaScale),
+                doubleSidedLighting: !!item.doubleSidedLighting,
+                bumpiness: this._roundDebugNumber(item.bumpiness),
+                specIntensity: this._roundDebugNumber(item.specIntensity),
+                specPower: this._roundDebugNumber(item.specPower),
+                specFalloffMult: this._roundDebugNumber(item.specFalloffMult),
+                wetness: this._roundDebugNumber(item.wetness),
+                decalTint: this._jsonSafe(item.decalTint),
+                dirtColor: this._jsonSafe(item.dirtColor),
+                ambientDecalMask: this._jsonSafe(item.ambientDecalMask),
+                dirtDecalMask: this._jsonSafe(item.dirtDecalMask),
+                specMaskWeights: this._jsonSafe(item.specMaskWeights),
+                detailSettings: this._jsonSafe(item.detailSettings),
+            };
+        }
+        return base;
+    }
+
+    _textureDebugInfo(rel, kind = 'diffuse', distance = 0) {
+        const rawRel = (typeof rel === 'string' && rel) ? rel : null;
+        if (!rawRel) return { rel: null, kind, state: 'none' };
+        const url = this._chooseTextureUrl(rawRel);
+        const out = {
+            rel: rawRel,
+            kind,
+            resolvedUrl: url || null,
+            state: url ? 'notResident' : 'indexMissingOrPending',
+            missingFromIndex: !url,
+            missing404: false,
+            rejected: false,
+            desiredTier: null,
+            residentTier: null,
+            loadingTier: null,
+            tiers: [],
+        };
+        const ts = this.textureStreamer;
+        if (!url || !ts) return out;
+        try {
+            out.missing404 = !!ts.isMissing?.(url);
+            if (out.missing404) out.state = 'missing404';
+            out.rejected = !!ts.isRejected?.(url);
+            if (out.rejected) out.state = 'rejected';
+            const desired = (typeof ts._clampTierToAllowed === 'function' && typeof ts._tierForDistance === 'function')
+                ? ts._clampTierToAllowed(ts._tierForDistance(distance, kind))
+                : String(ts.quality || 'high');
+            out.desiredTier = desired;
+            const order = desired === 'high' ? ['high', 'medium', 'low'] : (desired === 'medium' ? ['medium', 'low'] : ['low']);
+            const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            for (const tier of order) {
+                const key = (typeof ts._cacheKey === 'function') ? ts._cacheKey(url, tier, kind) : `${tier}|${url}`;
+                const e = ts.cache?.get?.(key);
+                const row = {
+                    tier,
+                    cacheKey: key,
+                    state: e?.tex ? 'resident' : (e?.loading ? 'loading' : 'absent'),
+                    bytes: Number.isFinite(Number(e?.bytes)) ? Math.floor(Number(e.bytes)) : 0,
+                    uploadedAsSrgb: !!e?.uploadedAsSrgb,
+                    needsUvFlipY: !!e?.needsUvFlipY,
+                    lastUseAgeMs: Number.isFinite(Number(e?.lastUse)) ? Math.max(0, Math.floor(now - Number(e.lastUse))) : null,
+                };
+                if (row.state === 'resident' && !out.residentTier) out.residentTier = tier;
+                if (row.state === 'loading' && !out.loadingTier) out.loadingTier = tier;
+                out.tiers.push(row);
+            }
+            if (out.residentTier) out.state = 'resident';
+            else if (out.loadingTier && !out.missing404) out.state = 'loading';
+        } catch {
+            out.state = out.state || 'unknown';
+        }
+        return out;
+    }
+
+    _instanceMaxScaleFromData(data, off) {
+        const sx = Math.hypot(Number(data[off + 0]) || 0, Number(data[off + 1]) || 0, Number(data[off + 2]) || 0);
+        const sy = Math.hypot(Number(data[off + 4]) || 0, Number(data[off + 5]) || 0, Number(data[off + 6]) || 0);
+        const sz = Math.hypot(Number(data[off + 8]) || 0, Number(data[off + 9]) || 0, Number(data[off + 10]) || 0);
+        const s = Math.max(sx, sy, sz);
+        return Number.isFinite(s) && s > 0 ? s : 1.0;
+    }
+
+    _roundDebugNumber(v) {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        return Math.round(n * 100000) / 100000;
+    }
+
+    _jsonSafe(value, depth = 0, seen = null) {
+        if (value === null || value === undefined) return null;
+        const t = typeof value;
+        if (t === 'string' || t === 'boolean') return value;
+        if (t === 'number') return Number.isFinite(value) ? this._roundDebugNumber(value) : null;
+        if (t !== 'object') return String(value);
+        const localSeen = seen || new WeakSet();
+        if (localSeen.has(value)) return '[Circular]';
+        if (depth >= 7) return '[MaxDepth]';
+        if (ArrayBuffer.isView(value)) {
+            return Array.from(value.slice ? value.slice(0, 64) : Array.prototype.slice.call(value, 0, 64))
+                .map((x) => this._jsonSafe(x, depth + 1, localSeen));
+        }
+        if (Array.isArray(value)) {
+            return value.slice(0, 64).map((x) => this._jsonSafe(x, depth + 1, localSeen));
+        }
+        localSeen.add(value);
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            if (k === 'tex' || k === 'vao' || k === 'mesh' || k === 'instanceBuffer') continue;
+            if (typeof v === 'function') continue;
+            out[k] = this._jsonSafe(v, depth + 1, localSeen);
+        }
+        localSeen.delete(value);
+        return out;
+    }
+
     _computeInstanceBoundsFromMatrices(matricesFloat32) {
         try {
             const a = matricesFloat32;
             if (!a || a.length < 16) return null;
-            const stride = ((a.length % 21) === 0) ? 21 : (((a.length % 17) === 0) ? 17 : 16);
+            const stride =
+                ((a.length % 22) === 0) ? 22 :
+                (((a.length % 21) === 0) ? 21 :
+                (((a.length % 17) === 0) ? 17 : 16));
             const minT = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
             const maxT = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY];
             let maxScale = 1.0;
@@ -1257,6 +3404,9 @@ export class InstancedModelRenderer {
         // Shadow depth-only shader (uses the same vertex layout / instancing attributes).
         const shadowVs = `#version 300 es
 layout(location=0) in vec3 aPosition;
+layout(location=2) in vec2 aTexcoord;
+layout(location=9) in vec2 aTexcoord1;
+layout(location=10) in vec2 aTexcoord2;
 // mat4 instance transform at locations 4..7 (same as main VS)
 layout(location=4) in vec4 aI0;
 layout(location=5) in vec4 aI1;
@@ -1264,14 +3414,45 @@ layout(location=6) in vec4 aI2;
 layout(location=7) in vec4 aI3;
 uniform mat4 uModelMatrix;
 uniform mat4 uLightViewProj;
+uniform vec4 uShadowUv0ScaleOffset;
+uniform vec4 uShadowUv1ScaleOffset;
+uniform vec4 uShadowUv2ScaleOffset;
+uniform vec3 uShadowGlobalAnimUV0;
+uniform vec3 uShadowGlobalAnimUV1;
+uniform int uShadowDiffuseUvSet;
+out vec2 vShadowDiffuseUv;
+vec2 selectUv3(int uvSet, vec2 uv0, vec2 uv1, vec2 uv2) {
+    if (uvSet == 2) return uv2;
+    if (uvSet == 1) return uv1;
+    return uv0;
+}
 void main() {
     mat4 inst = mat4(aI0, aI1, aI2, aI3);
     vec4 worldPos = uModelMatrix * (inst * vec4(aPosition, 1.0));
+    vec3 uvw = vec3(aTexcoord, 1.0);
+    vec2 uv0 = vec2(dot(uShadowGlobalAnimUV0, uvw), dot(uShadowGlobalAnimUV1, uvw));
+    uv0 = uv0 * uShadowUv0ScaleOffset.xy + uShadowUv0ScaleOffset.zw;
+    vec2 uv1 = aTexcoord1 * uShadowUv1ScaleOffset.xy + uShadowUv1ScaleOffset.zw;
+    vec2 uv2 = aTexcoord2 * uShadowUv2ScaleOffset.xy + uShadowUv2ScaleOffset.zw;
+    vShadowDiffuseUv = selectUv3(uShadowDiffuseUvSet, uv0, uv1, uv2);
     gl_Position = uLightViewProj * worldPos;
 }`;
         const shadowFs = `#version 300 es
 precision mediump float;
-void main() { }`;
+in vec2 vShadowDiffuseUv;
+uniform bool uShadowAlphaTest;
+uniform sampler2D uShadowDiffuse;
+uniform float uShadowAlphaCutoff;
+uniform bool uShadowFlipDiffuseY;
+vec2 maybeFlipY(vec2 uv, bool flipY) {
+    return flipY ? vec2(uv.x, 1.0 - uv.y) : uv;
+}
+void main() {
+    if (uShadowAlphaTest) {
+        float a = texture(uShadowDiffuse, maybeFlipY(vShadowDiffuseUv, uShadowFlipDiffuseY)).a;
+        if (a < uShadowAlphaCutoff) discard;
+    }
+}`;
         const okShadow = await this._shadowProgram.createProgram(shadowVs, shadowFs);
         if (!okShadow || !this._shadowProgram?.program) {
             console.warn('InstancedModelRenderer: shadow program failed to link (shadows disabled).');
@@ -1280,13 +3461,24 @@ void main() { }`;
         this.uniforms = {
             uViewProjectionMatrix: this.gl.getUniformLocation(this.program.program, 'uViewProjectionMatrix'),
             uModelMatrix: this.gl.getUniformLocation(this.program.program, 'uModelMatrix'),
+            uGpuFrustumCulling: this.gl.getUniformLocation(this.program.program, 'uGpuFrustumCulling'),
+            uGpuFrustumPlanes: this.gl.getUniformLocation(this.program.program, 'uGpuFrustumPlanes[0]'),
+            uGpuCullRadius: this.gl.getUniformLocation(this.program.program, 'uGpuCullRadius'),
             uLightViewProj: this.gl.getUniformLocation(this.program.program, 'uLightViewProj'),
             uUv0ScaleOffset: this.gl.getUniformLocation(this.program.program, 'uUv0ScaleOffset'),
             uUv1ScaleOffset: this.gl.getUniformLocation(this.program.program, 'uUv1ScaleOffset'),
             uUv2ScaleOffset: this.gl.getUniformLocation(this.program.program, 'uUv2ScaleOffset'),
             uGlobalAnimUV0: this.gl.getUniformLocation(this.program.program, 'uGlobalAnimUV0'),
             uGlobalAnimUV1: this.gl.getUniformLocation(this.program.program, 'uGlobalAnimUV1'),
+            uCharacterLocomotion: this.gl.getUniformLocation(this.program.program, 'uCharacterLocomotion'),
+            uFragmentTransformEnabled: this.gl.getUniformLocation(this.program.program, 'uFragmentTransformEnabled'),
+            uFragmentPivot: this.gl.getUniformLocation(this.program.program, 'uFragmentPivot'),
+            uFragmentRotation: this.gl.getUniformLocation(this.program.program, 'uFragmentRotation'),
+            uSkinningEnabled: this.gl.getUniformLocation(this.program.program, 'uSkinningEnabled'),
+            uBoneTexture: this.gl.getUniformLocation(this.program.program, 'uBoneTexture'),
             uColor: this.gl.getUniformLocation(this.program.program, 'uColor'),
+            uVertexColorMode: this.gl.getUniformLocation(this.program.program, 'uVertexColorMode'),
+            uDoubleSidedLighting: this.gl.getUniformLocation(this.program.program, 'uDoubleSidedLighting'),
             uLightDir: this.gl.getUniformLocation(this.program.program, 'uLightDir'),
             uLightColor: this.gl.getUniformLocation(this.program.program, 'uLightColor'),
             uAmbient: this.gl.getUniformLocation(this.program.program, 'uAmbient'),
@@ -1332,8 +3524,10 @@ void main() { }`;
 
             uEnableTintPalette: this.gl.getUniformLocation(this.program.program, 'uEnableTintPalette'),
             uTintPalette: this.gl.getUniformLocation(this.program.program, 'uTintPalette'),
-            uTintPaletteSelector: this.gl.getUniformLocation(this.program.program, 'uTintPaletteSelector'),
             uTintMode: this.gl.getUniformLocation(this.program.program, 'uTintMode'),
+            uPedHairTint: this.gl.getUniformLocation(this.program.program, 'uPedHairTint'),
+            uPedHairPrimary: this.gl.getUniformLocation(this.program.program, 'uPedHairPrimary'),
+            uPedHairHighlight: this.gl.getUniformLocation(this.program.program, 'uPedHairHighlight'),
 
             uDecodeDiffuseSrgb: this.gl.getUniformLocation(this.program.program, 'uDecodeDiffuseSrgb'),
             uDecodeDiffuse2Srgb: this.gl.getUniformLocation(this.program.program, 'uDecodeDiffuse2Srgb'),
@@ -1421,6 +3615,8 @@ void main() { }`;
             uFogColor: this.gl.getUniformLocation(this.program.program, 'uFogColor'),
             uFogStart: this.gl.getUniformLocation(this.program.program, 'uFogStart'),
             uFogEnd: this.gl.getUniformLocation(this.program.program, 'uFogEnd'),
+            uWireframe: this.gl.getUniformLocation(this.program.program, 'uWireframe'),
+            uWireframeColor: this.gl.getUniformLocation(this.program.program, 'uWireframeColor'),
         };
 
         // Shadow program uniforms.
@@ -1429,6 +3625,16 @@ void main() { }`;
                 this._shadowUniforms = {
                     uModelMatrix: this.gl.getUniformLocation(this._shadowProgram.program, 'uModelMatrix'),
                     uLightViewProj: this.gl.getUniformLocation(this._shadowProgram.program, 'uLightViewProj'),
+                    uShadowUv0ScaleOffset: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowUv0ScaleOffset'),
+                    uShadowUv1ScaleOffset: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowUv1ScaleOffset'),
+                    uShadowUv2ScaleOffset: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowUv2ScaleOffset'),
+                    uShadowGlobalAnimUV0: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowGlobalAnimUV0'),
+                    uShadowGlobalAnimUV1: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowGlobalAnimUV1'),
+                    uShadowDiffuseUvSet: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowDiffuseUvSet'),
+                    uShadowAlphaTest: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowAlphaTest'),
+                    uShadowDiffuse: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowDiffuse'),
+                    uShadowAlphaCutoff: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowAlphaCutoff'),
+                    uShadowFlipDiffuseY: this.gl.getUniformLocation(this._shadowProgram.program, 'uShadowFlipDiffuseY'),
                 };
             }
         } catch {
@@ -1443,6 +3649,11 @@ void main() { }`;
         this._texWhite = this._create1x1TextureRGBA8([255, 255, 255, 255]);
         this._texBlack = this._create1x1TextureRGBA8([0, 0, 0, 255]);
         this._texNormalFlat = this._create1x1TextureRGBA8([128, 128, 255, 255]);
+        this._identityBoneTexture = this._createBoneTextureFromRows([[
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ]]);
 
         // Dummy depth texture for shadow sampler binding when shadows are disabled.
         this._shadow.dummyDepthTex = this._create1x1DepthTexture();
@@ -1559,6 +3770,130 @@ void main() { }`;
         return vp;
     }
 
+    renderOccluderDepth(viewProjectionMatrix, { maxDistance = 180, maxDrawItems = 96, minRadius = 3.0 } = {}) {
+        // The old occlusion prepass only contained terrain and a legacy building OBJ.
+        // Streamed GTA buildings therefore never blocked the drawables behind them.
+        // Reuse the depth-only shadow shader for opaque world mesh instances.
+        const gl = this.gl;
+        const stats = this._occlusionStats;
+        stats.depthCandidates = 0;
+        stats.depthDraws = 0;
+        stats.depthInstances = 0;
+        stats.depthDistanceRejected = 0;
+        stats.depthSizeRejected = 0;
+        if (!this.ready || !this._shadowProgram?.program || !this._shadowUniforms) return false;
+        if (!viewProjectionMatrix || viewProjectionMatrix.length < 16) return false;
+
+        const maxD = Number.isFinite(Number(maxDistance)) ? Math.max(1.0, Number(maxDistance)) : 180.0;
+        const maxItems = Number.isFinite(Number(maxDrawItems)) ? Math.max(1, Math.floor(Number(maxDrawItems))) : 96;
+        const minR = Number.isFinite(Number(minRadius)) ? Math.max(0.0, Number(minRadius)) : 3.0;
+        const candidates = [];
+        const isOpaqueOccluder = (material) => {
+            const mat = material && typeof material === 'object' ? material : {};
+            const family = String(mat.shaderFamily || '').toLowerCase();
+            const name = String(mat.shaderName || '').toLowerCase();
+            const alpha = String(mat.alphaMode || 'opaque').toLowerCase();
+            // Do not let leaves, glass, decals, or water falsely become solid walls.
+            if (family === 'decal' || family === 'glass' || family === 'water') return false;
+            if (name.includes('decal') || name.includes('glass') || name.includes('water') || name.includes('additive')) return false;
+            return alpha !== 'blend' && alpha !== 'cutout';
+        };
+        const addCandidate = (item, material, distance) => {
+            if (!item?.mesh || !(Number(item.instanceCount) > 0)) return;
+            if (this.modelManager?.isMeshDisposed?.(item.mesh)) return;
+            if (!isOpaqueOccluder(material)) return;
+            const radius = Number(item.mesh.radius) || 0.0;
+            if (radius < minR) {
+                stats.depthSizeRejected++;
+                return;
+            }
+            const d = Number(distance);
+            if (Number.isFinite(d) && d > maxD) {
+                stats.depthDistanceRejected++;
+                return;
+            }
+            const safeDistance = Number.isFinite(d) ? Math.max(0.0, d) : 0.0;
+            candidates.push({ ...item, distance: safeDistance, screenScore: radius / Math.max(1.0, safeDistance) });
+        };
+
+        for (const bucket of this.buckets.values()) {
+            if (!bucket || bucket.file === '__placeholder__') continue;
+            addCandidate({
+                mesh: bucket.mesh,
+                vao: bucket.vao,
+                instanceBuffer: bucket.instanceBuffer,
+                instanceCount: bucket.instanceCount,
+                instanceStrideFloats: bucket.instanceStrideFloats,
+                doubleSided: !!bucket.material?.doubleSided,
+            }, bucket.material, bucket.minDist);
+        }
+        for (const entry of this.instances.values()) {
+            if (!entry || !(Number(entry.instanceCount) > 0)) continue;
+            const h = this.modelManager?.normalizeId?.(entry.hash) ?? String(entry.hash || '');
+            const entryMat = this.modelManager?.manifest?.meshes?.[h]?.material ?? null;
+            for (const submesh of entry.submeshes?.values?.() || []) {
+                if (!submesh || submesh.file === '__placeholder__') continue;
+                const material = { ...(entryMat || {}), ...(submesh.material || {}) };
+                addCandidate({
+                    mesh: submesh.mesh,
+                    vao: submesh.vao,
+                    instanceBuffer: entry.instanceBuffer,
+                    instanceCount: entry.instanceCount,
+                    instanceStrideFloats: entry.instanceStrideFloats,
+                    doubleSided: !!material.doubleSided,
+                }, material, entry.minDist);
+            }
+        }
+
+        // Start with the meshes that cover the largest portion of the screen. This
+        // favors building facades over small props and keeps the prepass bounded.
+        candidates.sort((a, b) => b.screenScore - a.screenScore || a.distance - b.distance);
+        stats.depthCandidates = candidates.length;
+        if (!candidates.length) return false;
+
+        let previousProgram = null;
+        let previousVao = null;
+        try { previousProgram = gl.getParameter(gl.CURRENT_PROGRAM); } catch { /* ignore */ }
+        try { previousVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING); } catch { /* ignore */ }
+        try {
+            gl.useProgram(this._shadowProgram.program);
+            gl.uniformMatrix4fv(this._shadowUniforms.uModelMatrix, false, this.modelMatrix);
+            gl.uniformMatrix4fv(this._shadowUniforms.uLightViewProj, false, viewProjectionMatrix);
+
+            for (let i = 0; i < candidates.length && i < maxItems; i++) {
+                const item = candidates[i];
+                const mesh = item.mesh;
+                if (!mesh?.vao || !(Number(mesh.indexCount) > 0)) continue;
+                if (item.doubleSided) gl.disable(gl.CULL_FACE);
+                else {
+                    gl.enable(gl.CULL_FACE);
+                    gl.cullFace(gl.BACK);
+                }
+                if (item.vao) {
+                    gl.bindVertexArray(item.vao);
+                } else {
+                    gl.bindVertexArray(mesh.vao);
+                    gl.bindBuffer(gl.ARRAY_BUFFER, item.instanceBuffer);
+                    const strideFloats = Math.max(16, Number(item.instanceStrideFloats) || 16);
+                    const strideBytes = strideFloats * 4;
+                    for (let column = 0; column < 4; column++) {
+                        const location = 4 + column;
+                        gl.enableVertexAttribArray(location);
+                        gl.vertexAttribPointer(location, 4, gl.FLOAT, false, strideBytes, column * 16);
+                        gl.vertexAttribDivisor(location, 1);
+                    }
+                }
+                gl.drawElementsInstanced(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_INT, 0, item.instanceCount);
+                stats.depthDraws++;
+                stats.depthInstances += Number(item.instanceCount) || 0;
+            }
+            return stats.depthDraws > 0;
+        } finally {
+            try { gl.bindVertexArray(previousVao); } catch { /* ignore */ }
+            try { gl.useProgram(previousProgram); } catch { /* ignore */ }
+        }
+    }
+
     _renderShadowMap(drawItems, lightViewProjMat4) {
         const gl = this.gl;
         if (!this._shadowProgram?.program || !this._shadowUniforms) return false;
@@ -1596,12 +3931,64 @@ void main() { }`;
             gl.useProgram(this._shadowProgram.program);
             gl.uniformMatrix4fv(this._shadowUniforms.uModelMatrix, false, this.modelMatrix);
             gl.uniformMatrix4fv(this._shadowUniforms.uLightViewProj, false, lightViewProjMat4);
+            try { gl.uniform1i(this._shadowUniforms.uShadowDiffuse, 0); } catch { /* ignore */ }
+
+            const setShadowVec4 = (loc, v, fallback = [1.0, 1.0, 0.0, 0.0]) => {
+                const a = Array.isArray(v) && v.length >= 4 ? v : fallback;
+                gl.uniform4fv(loc, [
+                    Number.isFinite(Number(a[0])) ? Number(a[0]) : fallback[0],
+                    Number.isFinite(Number(a[1])) ? Number(a[1]) : fallback[1],
+                    Number.isFinite(Number(a[2])) ? Number(a[2]) : fallback[2],
+                    Number.isFinite(Number(a[3])) ? Number(a[3]) : fallback[3],
+                ]);
+            };
+            const setShadowVec3 = (loc, v, fallback = [1.0, 0.0, 0.0]) => {
+                const a = Array.isArray(v) && v.length >= 3 ? v : fallback;
+                gl.uniform3fv(loc, [
+                    Number.isFinite(Number(a[0])) ? Number(a[0]) : fallback[0],
+                    Number.isFinite(Number(a[1])) ? Number(a[1]) : fallback[1],
+                    Number.isFinite(Number(a[2])) ? Number(a[2]) : fallback[2],
+                ]);
+            };
 
             // Draw shadow casters: opaque + cutout only (no glass/decals/water blending).
             for (const it of drawItems) {
                 if (!it || !it.mesh) continue;
                 const rb = Number(it.renderBucket);
                 if (!(rb === 0 || rb === 1)) continue; // OPAQUE or CUTOUT only
+
+                const needsAlphaTest = rb === 1 || Number(it.alphaModeInt) === 1;
+                if (needsAlphaTest) {
+                    const rel = String(it.diffuseRel || '');
+                    const url = rel ? this._chooseTextureUrl(rel, { allowIndexMiss: false }) : null;
+                    const kind = String(it.diffuseKind || 'diffuse');
+                    const info = (url && this.textureStreamer)
+                        ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind })
+                        : null;
+                    if (!info || info.isPlaceholder || !info.tex) {
+                        // A solid depth silhouette is worse than no foliage shadow: it projects the
+                        // whole leaf card/canopy as a dull blob over the visible cutout tree.
+                        continue;
+                    }
+                    gl.activeTexture(gl.TEXTURE0);
+                    gl.bindTexture(gl.TEXTURE_2D, info.tex);
+                    gl.uniform1i(this._shadowUniforms.uShadowAlphaTest, 1);
+                    gl.uniform1f(
+                        this._shadowUniforms.uShadowAlphaCutoff,
+                        Number.isFinite(Number(it.alphaCutoff)) ? Number(it.alphaCutoff) : 0.33
+                    );
+                    gl.uniform1i(this._shadowUniforms.uShadowFlipDiffuseY, info.needsUvFlipY ? 1 : 0);
+                } else {
+                    gl.uniform1i(this._shadowUniforms.uShadowAlphaTest, 0);
+                    gl.uniform1i(this._shadowUniforms.uShadowFlipDiffuseY, 0);
+                }
+
+                setShadowVec4(this._shadowUniforms.uShadowUv0ScaleOffset, it.uvso);
+                setShadowVec4(this._shadowUniforms.uShadowUv1ScaleOffset, it.uvso1);
+                setShadowVec4(this._shadowUniforms.uShadowUv2ScaleOffset, it.uvso2);
+                setShadowVec3(this._shadowUniforms.uShadowGlobalAnimUV0, it.globalAnimUV0, [1.0, 0.0, 0.0]);
+                setShadowVec3(this._shadowUniforms.uShadowGlobalAnimUV1, it.globalAnimUV1, [0.0, 1.0, 0.0]);
+                gl.uniform1i(this._shadowUniforms.uShadowDiffuseUvSet, Number.isFinite(Number(it.diffuseUvSet)) ? (Number(it.diffuseUvSet) | 0) : 0);
 
                 // Cull setting
                 const ds = !!it.doubleSided;
@@ -1673,7 +4060,36 @@ void main() { }`;
         }
     }
 
-    async setInstancesForArchetype(hash, lod, matricesFloat32, minDist = null) {
+    _updateInstanceData(entry, matricesFloat32) {
+        if (entry.instanceData instanceof Float32Array && entry.instanceData.length === matricesFloat32.length) {
+            let changed = false;
+            for (let i = 0; i < matricesFloat32.length; i++) {
+                const value = matricesFloat32[i];
+                if (entry.instanceData[i] === value) continue;
+                entry.instanceData[i] = value;
+                changed = true;
+            }
+            return changed;
+        }
+        entry.instanceData = new Float32Array(matricesFloat32);
+        return true;
+    }
+
+    _uploadInstanceBuffer(entry, matricesFloat32) {
+        const gl = this.gl;
+        const nextBytes = matricesFloat32.byteLength || (matricesFloat32.length * 4);
+        gl.bindBuffer(gl.ARRAY_BUFFER, entry.instanceBuffer);
+        if (Number(entry.instanceBufferBytes) === Number(nextBytes)) {
+            try {
+                gl.bufferSubData(gl.ARRAY_BUFFER, 0, matricesFloat32);
+                return;
+            } catch { /* reallocate below */ }
+        }
+        gl.bufferData(gl.ARRAY_BUFFER, matricesFloat32, gl.DYNAMIC_DRAW);
+        entry.instanceBufferBytes = nextBytes;
+    }
+
+    async setInstancesForArchetype(hash, lod, matricesFloat32, minDist = null, opts = {}) {
         const h = String(hash);
         const l = String(lod || 'high').toLowerCase();
         if (!this.ready) return;
@@ -1701,11 +4117,15 @@ void main() { }`;
                 lod: l,
                 minDist: null,
                 instanceBuffer: gl.createBuffer(),
+                instanceBufferBytes: 0,
                 instanceCount: 0,
                 submeshes: new Map(), // file -> {file, material, mesh, vao}
+                loadPriority: 0,
             };
             this.instances.set(key, entry);
         }
+        const loadPriority = Number(opts?.loadPriority);
+        entry.loadPriority = Number.isFinite(loadPriority) ? loadPriority : (Number(entry.loadPriority) || 0);
 
         {
             const d = Number(minDist);
@@ -1743,11 +4163,13 @@ void main() { }`;
         }
         entry.instanceStrideFloats = stride;
         entry.instanceCount = Math.floor(matricesFloat32.length / stride);
-        gl.bindBuffer(gl.ARRAY_BUFFER, entry.instanceBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, matricesFloat32, gl.DYNAMIC_DRAW);
+        const instanceDataChanged = this._updateInstanceData(entry, matricesFloat32);
+        if (instanceDataChanged) this._uploadInstanceBuffer(entry, matricesFloat32);
 
         // Cache conservative instance translation bounds + max scale (data space) for occlusion.
-        entry._instBounds = this._computeInstanceBoundsFromMatrices(matricesFloat32);
+        if (instanceDataChanged || !entry._instBounds) {
+            entry._instBounds = this._computeInstanceBoundsFromMatrices(matricesFloat32);
+        }
 
         // Update submesh list from manifest (v4) or fallback (v3).
         const subs = this.modelManager?.getLodSubmeshes?.(h, l) || [];
@@ -1755,7 +4177,10 @@ void main() { }`;
 
         // If an archetype isn't in the manifest, `subs` is empty.
         // In that case we can optionally render a placeholder cube to make "missing exports" obvious.
-        if ((!subs || subs.length === 0) && (this.modelManager?.enablePlaceholderMeshes ?? false)) {
+        const allowPlaceholderMesh = opts?.allowPlaceholderMesh !== false;
+        if ((!subs || subs.length === 0)
+            && allowPlaceholderMesh
+            && (this.modelManager?.enablePlaceholderMeshes ?? false)) {
             const phKey = '__placeholder__';
             wanted.add(phKey);
             // Ensure ONLY the placeholder submesh remains.
@@ -1779,11 +4204,30 @@ void main() { }`;
                 if (!file) continue;
                 wanted.add(file);
                 if (!entry.submeshes.has(file)) {
-                    entry.submeshes.set(file, { file, material: sm?.material ?? null, mesh: null, vao: null });
+                    entry.submeshes.set(file, {
+                        file,
+                        material: sm?.material ?? null,
+                        pedComponent: sm?.pedComponent ?? null,
+                        mesh: null,
+                        vao: null,
+                        skinned: !!sm?.skinned,
+                        boneIds: Array.isArray(sm?.boneIds) ? sm.boneIds.slice(0) : [],
+                        hasBlendWeights: !!sm?.hasBlendWeights,
+                        hasBlendIndices: !!sm?.hasBlendIndices,
+                        fragmentBoneTag: Number.isFinite(Number(sm?.fragmentBoneTag)) ? Number(sm.fragmentBoneTag) : null,
+                    });
                 } else {
                     // keep material up to date if manifest changed
                     const e = entry.submeshes.get(file);
-                    if (e) e.material = sm?.material ?? e.material;
+                    if (e) {
+                        e.material = sm?.material ?? e.material;
+                        e.pedComponent = sm?.pedComponent ?? e.pedComponent ?? null;
+                        e.skinned = !!sm?.skinned;
+                        e.boneIds = Array.isArray(sm?.boneIds) ? sm.boneIds.slice(0) : [];
+                        e.hasBlendWeights = !!sm?.hasBlendWeights;
+                        e.hasBlendIndices = !!sm?.hasBlendIndices;
+                        e.fragmentBoneTag = Number.isFinite(Number(sm?.fragmentBoneTag)) ? Number(sm.fragmentBoneTag) : null;
+                    }
                 }
             }
 
@@ -1797,7 +4241,7 @@ void main() { }`;
             }
 
             // Ensure submesh meshes will be loaded (throttled).
-            for (const file of wanted) this._enqueueMeshLoad(key, file);
+            for (const file of wanted) this._enqueueMeshLoad(key, file, { priority: entry.loadPriority || 0 });
         }
     }
 
@@ -1848,23 +4292,12 @@ void main() { }`;
         }
         entry.instanceStrideFloats = stride;
         entry.instanceCount = Math.floor(matricesFloat32.length / stride);
-        gl.bindBuffer(gl.ARRAY_BUFFER, entry.instanceBuffer);
+        const instanceDataChanged = this._updateInstanceData(entry, matricesFloat32);
+        if (instanceDataChanged) this._uploadInstanceBuffer(entry, matricesFloat32);
 
-        // If buffer sizes match, prefer bufferSubData to avoid realloc; otherwise fallback to bufferData.
-        try {
-            const curBytes = gl.getBufferParameter(gl.ARRAY_BUFFER, gl.BUFFER_SIZE) || 0;
-            const nextBytes = matricesFloat32.byteLength || (matricesFloat32.length * 4);
-            if (Number(curBytes) === Number(nextBytes)) {
-                gl.bufferSubData(gl.ARRAY_BUFFER, 0, matricesFloat32);
-            } else {
-                gl.bufferData(gl.ARRAY_BUFFER, matricesFloat32, gl.DYNAMIC_DRAW);
-            }
-        } catch {
-            // Safe fallback if getBufferParameter isn't supported/throws.
-            gl.bufferData(gl.ARRAY_BUFFER, matricesFloat32, gl.DYNAMIC_DRAW);
+        if (instanceDataChanged || !entry._instBounds) {
+            entry._instBounds = this._computeInstanceBoundsFromMatrices(matricesFloat32);
         }
-
-        entry._instBounds = this._computeInstanceBoundsFromMatrices(matricesFloat32);
         return true;
     }
 
@@ -1896,6 +4329,7 @@ void main() { }`;
                 material: material ?? null,
                 minDist: null,
                 instanceBuffer: gl.createBuffer(),
+                instanceBufferBytes: 0,
                 instanceCount: 0,
                 mesh: null,
                 vao: null,
@@ -1924,17 +4358,19 @@ void main() { }`;
         }
         entry.instanceStrideFloats = stride;
         entry.instanceCount = Math.floor(matricesFloat32.length / stride);
-        gl.bindBuffer(gl.ARRAY_BUFFER, entry.instanceBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, matricesFloat32, gl.DYNAMIC_DRAW);
+        const instanceDataChanged = this._updateInstanceData(entry, matricesFloat32);
+        if (instanceDataChanged) this._uploadInstanceBuffer(entry, matricesFloat32);
 
         // Cache conservative instance translation bounds + max scale (data space) for occlusion.
-        entry._instBounds = this._computeInstanceBoundsFromMatrices(matricesFloat32);
+        if (instanceDataChanged || !entry._instBounds) {
+            entry._instBounds = this._computeInstanceBoundsFromMatrices(matricesFloat32);
+        }
 
         // Ensure mesh will be loaded (throttled).
         this._enqueueMeshLoad(id, f);
     }
 
-    _enqueueMeshLoad(entryKey, file) {
+    _enqueueMeshLoad(entryKey, file, opts = {}) {
         const ek = String(entryKey || '');
         const f = String(file || '');
         if (!ek || !f) return;
@@ -1964,7 +4400,14 @@ void main() { }`;
             if (b && Number.isFinite(Number(b.minDist))) dist = Math.min(dist, Number(b.minDist));
         } catch { /* ignore */ }
         const seq = (this._meshLoadSeq++ >>> 0);
-        this._meshLoadQueue.push({ entryKey: ek, file: f, dist, seq });
+        const priority = Number(opts?.priority);
+        this._meshLoadQueue.push({
+            entryKey: ek,
+            file: f,
+            dist,
+            seq,
+            priority: Number.isFinite(priority) ? priority : 0,
+        });
     }
 
     _pumpMeshLoads() {
@@ -1980,7 +4423,16 @@ void main() { }`;
                 const bd = Number(best?.dist);
                 const dOk = Number.isFinite(jd);
                 const bOk = Number.isFinite(bd);
-                if ((dOk && !bOk) || (dOk && bOk && jd < bd) || (jd === bd && (Number(j.seq) < Number(best?.seq)))) {
+                const jp = Number(j?.priority) || 0;
+                const bp = Number(best?.priority) || 0;
+                if (
+                    jp > bp ||
+                    (jp === bp && (
+                        (dOk && !bOk) ||
+                        (dOk && bOk && jd < bd) ||
+                        (jd === bd && (Number(j.seq) < Number(best?.seq)))
+                    ))
+                ) {
                     bestIdx = i;
                     best = j;
                 }
@@ -2007,7 +4459,14 @@ void main() { }`;
             this._meshLoadsInFlight++;
             (async () => {
                 try {
-                    const mesh = await this.modelManager.loadMeshFile(file);
+                    const requiresBlendAttributes = !!(
+                        this.meshLoadOptions?.requireBlendAttributes && sm?.skinned
+                    );
+                    const mesh = await this.modelManager.loadMeshFile(file, {
+                        usePersistentCache: this.meshLoadOptions?.usePersistentCache !== false,
+                        cacheBust: this.meshLoadOptions?.cacheBust || '',
+                        requireBlendAttributes: requiresBlendAttributes,
+                    });
                     if (!mesh) return;
 
                     // Assign mesh + build VAO for whichever kind of entry is present.
@@ -2106,6 +4565,28 @@ void main() { }`;
                                 try {
                                     gl.disableVertexAttribArray(11);
                                     gl.vertexAttrib4f(11, 0.0, 0.0, 0.0, 1.0);
+                                } catch { /* ignore */ }
+                            }
+
+                            if (mesh.blendWeightsBuffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.blendWeightsBuffer);
+                                gl.enableVertexAttribArray(13);
+                                gl.vertexAttribPointer(13, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+                            } else {
+                                try {
+                                    gl.disableVertexAttribArray(13);
+                                    gl.vertexAttrib4f(13, 1.0, 0.0, 0.0, 0.0);
+                                } catch { /* ignore */ }
+                            }
+
+                            if (mesh.blendIndicesBuffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.blendIndicesBuffer);
+                                gl.enableVertexAttribArray(14);
+                                gl.vertexAttribPointer(14, 4, gl.UNSIGNED_BYTE, false, 0, 0);
+                            } else {
+                                try {
+                                    gl.disableVertexAttribArray(14);
+                                    gl.vertexAttrib4f(14, 0.0, 0.0, 0.0, 0.0);
                                 } catch { /* ignore */ }
                             }
 
@@ -2225,6 +4706,28 @@ void main() { }`;
                                 } catch { /* ignore */ }
                             }
 
+                            if (mesh.blendWeightsBuffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.blendWeightsBuffer);
+                                gl.enableVertexAttribArray(13);
+                                gl.vertexAttribPointer(13, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+                            } else {
+                                try {
+                                    gl.disableVertexAttribArray(13);
+                                    gl.vertexAttrib4f(13, 1.0, 0.0, 0.0, 0.0);
+                                } catch { /* ignore */ }
+                            }
+
+                            if (mesh.blendIndicesBuffer) {
+                                gl.bindBuffer(gl.ARRAY_BUFFER, mesh.blendIndicesBuffer);
+                                gl.enableVertexAttribArray(14);
+                                gl.vertexAttribPointer(14, 4, gl.UNSIGNED_BYTE, false, 0, 0);
+                            } else {
+                                try {
+                                    gl.disableVertexAttribArray(14);
+                                    gl.vertexAttrib4f(14, 0.0, 0.0, 0.0, 0.0);
+                                } catch { /* ignore */ }
+                            }
+
                             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.idxBuffer);
 
                             gl.bindBuffer(gl.ARRAY_BUFFER, b.instanceBuffer);
@@ -2283,11 +4786,64 @@ void main() { }`;
      * Best-effort: scan currently-instanced submeshes and prefetch diffuse textures.
      * This is capped to avoid doing huge work on boot.
      */
-    prefetchDiffuseTextures(limit = 256) {
+    prefetchDiffuseTextures(limit = 256, { allowIndexMiss = false, includeSecondary = false } = {}) {
         if (!this.textureStreamer) return 0;
         const cap = Number.isFinite(limit) ? Math.max(0, Math.min(4096, Math.floor(limit))) : 256;
+        if (cap <= 0) return 0;
         let n = 0;
-        const toUrl = (rel) => this._chooseTextureUrl(rel);
+        const toUrl = (rel) => this._chooseTextureUrl(rel, { allowIndexMiss });
+        const seen = new Set();
+        const diffuseKindForMat = (mat) => {
+            const s = String(mat?.shaderName || '').toLowerCase();
+            const fam = String(mat?.shaderFamily || '').toLowerCase();
+            const am = String(mat?.alphaMode || '').toLowerCase();
+            if (fam === 'basic' && (am === 'cutout' || s.includes('cutout')) && (
+                s.includes('trees_') || s.includes('branches') || s.includes('leaf') || s.includes('leaves') || s.includes('foliage')
+            )) return 'foliageDiffuse';
+            return 'diffuse';
+        };
+        const touchTexture = (rel, distance, kind = 'diffuse') => {
+            const url = toUrl(rel);
+            // Index-gated misses are not fetchable. Do not let them consume the
+            // warmup budget and delay textures that actually exist.
+            if (!url) return false;
+            const key = `${String(kind || 'diffuse').toLowerCase()}|${String(url)}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            this.textureStreamer.touch(url, {
+                distance,
+                kind,
+                priority: distance <= this.textureStreamer.highDist ? 'high' : 'low',
+            });
+            n++;
+            return n >= cap;
+        };
+        const touchMaterialTextures = (mat, distance) => {
+            if (!mat) return false;
+            if (mat.diffuse && touchTexture(mat.diffuse, distance, diffuseKindForMat(mat))) return true;
+            if (!includeSecondary) return false;
+            const slots = [
+                ['diffuse2', 'diffuse2'],
+                ['tintPalette', 'tintPalette'],
+                ['alphaMask', 'alphaMask'],
+                ['normal', 'normal'],
+                ['detail', 'detail'],
+                ['spec', 'spec'],
+                ['emissive', 'emissive'],
+                ['ao', 'ao'],
+                ['height', 'height'],
+                ['env', 'env'],
+                ['dirt', 'dirt'],
+                ['damage', 'damage'],
+                ['damageMask', 'damageMask'],
+                ['puddleMask', 'puddleMask'],
+            ];
+            for (const [slot, kind] of slots) {
+                const rel = mat?.[slot];
+                if (rel && touchTexture(rel, distance, kind)) return true;
+            }
+            return false;
+        };
 
         // IMPORTANT:
         // - When cross-archetype instancing is enabled, most geometry is rendered via `buckets`.
@@ -2295,30 +4851,30 @@ void main() { }`;
         // Prefetch must scan BOTH, otherwise you can see lots of meshes but 0 texture requests.
 
         // 1) Buckets (cross-archetype instancing path)
-        for (const b of this.buckets.values()) {
+        const buckets = Array.from(this.buckets.values())
+            .filter((b) => !!b)
+            .sort((a, b) => Number(a.minDist ?? Infinity) - Number(b.minDist ?? Infinity));
+        for (const b of buckets) {
             if (!b) continue;
             const mat = b.material || null;
-            const diffuseRel = mat?.diffuse;
-            if (!diffuseRel) continue;
-            const url = toUrl(diffuseRel);
-            if (url) this.textureStreamer.touch(url, { distance: 0, kind: 'diffuse', priority: 'low' });
-            n++;
-            if (n >= cap) return n;
+            const distance = Number.isFinite(Number(b.minDist)) ? Number(b.minDist) : 1e30;
+            if (touchMaterialTextures(mat, distance)) return n;
         }
 
         // 2) Instances (per-archetype path)
-        for (const entry of this.instances.values()) {
+        // Per-archetype instances are the default path. Map insertion order is
+        // unrelated to distance, so prefetching it directly made nearby materials
+        // wait behind arbitrary distant archetypes.
+        const instances = Array.from(this.instances.values())
+            .filter((entry) => !!entry && entry.instanceCount > 0)
+            .sort((a, b) => Number(a.minDist ?? Infinity) - Number(b.minDist ?? Infinity));
+        for (const entry of instances) {
             if (!entry || entry.instanceCount <= 0) continue;
             for (const sm of entry.submeshes?.values?.() || []) {
                 if (!sm) continue;
                 const mat = sm.material || null;
-                const diffuseRel = mat?.diffuse;
-                if (diffuseRel) {
-                    const url = toUrl(diffuseRel);
-                    if (url) this.textureStreamer.touch(url, { distance: 0, kind: 'diffuse', priority: 'low' });
-                    n++;
-                    if (n >= cap) return n;
-                }
+                const distance = Number.isFinite(Number(entry.minDist)) ? Number(entry.minDist) : 1e30;
+                if (touchMaterialTextures(mat, distance)) return n;
             }
         }
         return n;
@@ -2327,58 +4883,83 @@ void main() { }`;
     render(viewProjectionMatrix, enabled = true, cameraPos = [0, 0, 0], fog = { enabled: false, color: [0.6, 0.7, 0.8], start: 1500, end: 9000 }) {
         if (!enabled || !this.ready) return;
         const gl = this.gl;
+        const wireframe = !!fog?.wireframe;
+        const fastStateRestore = !!fog?.fastStateRestore;
+        this._fastTextureUnitRestore = fastStateRestore;
+        const alphaToCoverageEnabled = fog?.alphaToCoverageEnabled !== false;
         // IMPORTANT (stability):
         // A single bad drawable (or a GL error that forces an early exit) must NOT leak state into the rest of
         // the frame. State leaks (colorMask/depthMask/blend/etc) are a classic cause of "the whole screen greys out"
         // or "stale frames" once models start drawing.
         let _restoreState = null;
         try {
-            const prev = {
-                program: null,
-                vao: null,
-                fbo: null,
-                viewport: null,
-                colorMask: null,
-                depthMask: null,
-                depthTest: null,
-                depthFunc: null,
-                blend: null,
-                blendSrcRGB: null,
-                blendDstRGB: null,
-                blendSrcA: null,
-                blendDstA: null,
-                blendEqRGB: null,
-                blendEqA: null,
-                blendColor: null,
-                cull: null,
-                scissor: null,
-                stencil: null,
-                a2c: null,
-                polyOffset: null,
-            };
-            try { prev.program = gl.getParameter(gl.CURRENT_PROGRAM); } catch { prev.program = null; }
-            try { prev.vao = gl.getParameter(gl.VERTEX_ARRAY_BINDING); } catch { prev.vao = null; }
-            try { prev.fbo = gl.getParameter(gl.FRAMEBUFFER_BINDING); } catch { prev.fbo = null; }
-            try { prev.viewport = gl.getParameter(gl.VIEWPORT); } catch { prev.viewport = null; }
-            try { prev.colorMask = gl.getParameter(gl.COLOR_WRITEMASK); } catch { prev.colorMask = null; }
-            try { prev.depthMask = gl.getParameter(gl.DEPTH_WRITEMASK); } catch { prev.depthMask = null; }
-            try { prev.depthTest = gl.isEnabled(gl.DEPTH_TEST); } catch { prev.depthTest = null; }
-            try { prev.depthFunc = gl.getParameter(gl.DEPTH_FUNC); } catch { prev.depthFunc = null; }
-            try { prev.blend = gl.isEnabled(gl.BLEND); } catch { prev.blend = null; }
-            try { prev.blendSrcRGB = gl.getParameter(gl.BLEND_SRC_RGB); } catch { prev.blendSrcRGB = null; }
-            try { prev.blendDstRGB = gl.getParameter(gl.BLEND_DST_RGB); } catch { prev.blendDstRGB = null; }
-            try { prev.blendSrcA = gl.getParameter(gl.BLEND_SRC_ALPHA); } catch { prev.blendSrcA = null; }
-            try { prev.blendDstA = gl.getParameter(gl.BLEND_DST_ALPHA); } catch { prev.blendDstA = null; }
-            try { prev.blendEqRGB = gl.getParameter(gl.BLEND_EQUATION_RGB); } catch { prev.blendEqRGB = null; }
-            try { prev.blendEqA = gl.getParameter(gl.BLEND_EQUATION_ALPHA); } catch { prev.blendEqA = null; }
-            try { prev.blendColor = gl.getParameter(gl.BLEND_COLOR); } catch { prev.blendColor = null; }
-            try { prev.cull = gl.isEnabled(gl.CULL_FACE); } catch { prev.cull = null; }
-            try { prev.scissor = gl.isEnabled(gl.SCISSOR_TEST); } catch { prev.scissor = null; }
-            try { prev.stencil = gl.isEnabled(gl.STENCIL_TEST); } catch { prev.stencil = null; }
-            try { prev.a2c = gl.isEnabled(gl.SAMPLE_ALPHA_TO_COVERAGE); } catch { prev.a2c = null; }
-            try { prev.polyOffset = gl.isEnabled(gl.POLYGON_OFFSET_FILL); } catch { prev.polyOffset = null; }
+            if (fastStateRestore) {
+                const restoreFbo = ('restoreFramebuffer' in Object(fog || {})) ? fog.restoreFramebuffer : null;
+                const restoreW = Math.max(1, Math.floor(Number(fog?.restoreViewportWidth ?? fog?.viewportWidth ?? gl.canvas?.width) || 1));
+                const restoreH = Math.max(1, Math.floor(Number(fog?.restoreViewportHeight ?? fog?.viewportHeight ?? gl.canvas?.height) || 1));
+                _restoreState = () => {
+                    try { gl.bindVertexArray(null); } catch { /* ignore */ }
+                    try { gl.bindFramebuffer(gl.FRAMEBUFFER, restoreFbo || null); } catch { /* ignore */ }
+                    try { gl.viewport(0, 0, restoreW, restoreH); } catch { /* ignore */ }
+                    try { gl.colorMask(true, true, true, true); } catch { /* ignore */ }
+                    try { gl.depthMask(true); } catch { /* ignore */ }
+                    try { gl.enable(gl.DEPTH_TEST); } catch { /* ignore */ }
+                    try { gl.depthFunc(gl.LEQUAL); } catch { /* ignore */ }
+                    try { gl.disable(gl.CULL_FACE); } catch { /* ignore */ }
+                    try { gl.disable(gl.SCISSOR_TEST); } catch { /* ignore */ }
+                    try { gl.disable(gl.STENCIL_TEST); } catch { /* ignore */ }
+                    try { gl.disable(gl.BLEND); } catch { /* ignore */ }
+                    try { gl.disable(gl.SAMPLE_ALPHA_TO_COVERAGE); } catch { /* ignore */ }
+                    try { gl.disable(gl.POLYGON_OFFSET_FILL); } catch { /* ignore */ }
+                    try { gl.useProgram(null); } catch { /* ignore */ }
+                };
+            } else {
+                const prev = {
+                    program: null,
+                    vao: null,
+                    fbo: null,
+                    viewport: null,
+                    colorMask: null,
+                    depthMask: null,
+                    depthTest: null,
+                    depthFunc: null,
+                    blend: null,
+                    blendSrcRGB: null,
+                    blendDstRGB: null,
+                    blendSrcA: null,
+                    blendDstA: null,
+                    blendEqRGB: null,
+                    blendEqA: null,
+                    blendColor: null,
+                    cull: null,
+                    scissor: null,
+                    stencil: null,
+                    a2c: null,
+                    polyOffset: null,
+                };
+                try { prev.program = gl.getParameter(gl.CURRENT_PROGRAM); } catch { prev.program = null; }
+                try { prev.vao = gl.getParameter(gl.VERTEX_ARRAY_BINDING); } catch { prev.vao = null; }
+                try { prev.fbo = gl.getParameter(gl.FRAMEBUFFER_BINDING); } catch { prev.fbo = null; }
+                try { prev.viewport = gl.getParameter(gl.VIEWPORT); } catch { prev.viewport = null; }
+                try { prev.colorMask = gl.getParameter(gl.COLOR_WRITEMASK); } catch { prev.colorMask = null; }
+                try { prev.depthMask = gl.getParameter(gl.DEPTH_WRITEMASK); } catch { prev.depthMask = null; }
+                try { prev.depthTest = gl.isEnabled(gl.DEPTH_TEST); } catch { prev.depthTest = null; }
+                try { prev.depthFunc = gl.getParameter(gl.DEPTH_FUNC); } catch { prev.depthFunc = null; }
+                try { prev.blend = gl.isEnabled(gl.BLEND); } catch { prev.blend = null; }
+                try { prev.blendSrcRGB = gl.getParameter(gl.BLEND_SRC_RGB); } catch { prev.blendSrcRGB = null; }
+                try { prev.blendDstRGB = gl.getParameter(gl.BLEND_DST_RGB); } catch { prev.blendDstRGB = null; }
+                try { prev.blendSrcA = gl.getParameter(gl.BLEND_SRC_ALPHA); } catch { prev.blendSrcA = null; }
+                try { prev.blendDstA = gl.getParameter(gl.BLEND_DST_ALPHA); } catch { prev.blendDstA = null; }
+                try { prev.blendEqRGB = gl.getParameter(gl.BLEND_EQUATION_RGB); } catch { prev.blendEqRGB = null; }
+                try { prev.blendEqA = gl.getParameter(gl.BLEND_EQUATION_ALPHA); } catch { prev.blendEqA = null; }
+                try { prev.blendColor = gl.getParameter(gl.BLEND_COLOR); } catch { prev.blendColor = null; }
+                try { prev.cull = gl.isEnabled(gl.CULL_FACE); } catch { prev.cull = null; }
+                try { prev.scissor = gl.isEnabled(gl.SCISSOR_TEST); } catch { prev.scissor = null; }
+                try { prev.stencil = gl.isEnabled(gl.STENCIL_TEST); } catch { prev.stencil = null; }
+                try { prev.a2c = gl.isEnabled(gl.SAMPLE_ALPHA_TO_COVERAGE); } catch { prev.a2c = null; }
+                try { prev.polyOffset = gl.isEnabled(gl.POLYGON_OFFSET_FILL); } catch { prev.polyOffset = null; }
 
-            _restoreState = () => {
+                _restoreState = () => {
                 // Try to restore the caller's state; if unavailable, fall back to a safe baseline.
                 try { gl.bindVertexArray(null); } catch { /* ignore */ }
                 try {
@@ -2440,13 +5021,20 @@ void main() { }`;
                 } catch { /* ignore */ }
                 try { gl.useProgram(prev.program); } catch { /* ignore */ }
                 try { if (prev.vao) gl.bindVertexArray(prev.vao); } catch { /* ignore */ }
-            };
+                };
+            }
         } catch {
             _restoreState = null;
         }
 
         try {
             gl.useProgram(this.program.program);
+            try {
+                gl.enable(gl.DEPTH_TEST);
+                gl.depthFunc(gl.LEQUAL);
+                gl.disable(gl.SCISSOR_TEST);
+                gl.disable(gl.STENCIL_TEST);
+            } catch { /* ignore */ }
 
             // Keep mesh loads flowing but bounded.
             this._pumpMeshLoads();
@@ -2457,7 +5045,7 @@ void main() { }`;
             this._occlusionStats.tested = 0;
             this._occlusionStats.culled = 0;
 
-        const shouldDrawByOcclusion = (instBounds, radiusSafe) => {
+        const shouldDrawByOcclusion = (instBounds, radiusSafe, occlusionKey = null) => {
             if (!occlusion || typeof occlusion.isVisibleSphere !== 'function') return true;
             if (!instBounds) return true;
             if (!(viewportWidth > 2 && viewportHeight > 2)) return true;
@@ -2489,6 +5077,7 @@ void main() { }`;
                 viewProjectionMatrix,
                 viewportWidth,
                 viewportHeight,
+                key: occlusionKey,
             });
             if (!vis) this._occlusionStats.culled++;
             return !!vis;
@@ -2496,9 +5085,33 @@ void main() { }`;
 
             gl.uniformMatrix4fv(this.uniforms.uViewProjectionMatrix, false, viewProjectionMatrix);
             gl.uniformMatrix4fv(this.uniforms.uModelMatrix, false, this.modelMatrix);
+            const gpuFrustumCulling = !!(fog && fog.gpuFrustumCulling && viewProjectionMatrix);
+            if (gpuFrustumCulling) {
+                try {
+                    glMatrix.mat4.multiply(this._gpuCullVpData, viewProjectionMatrix, this.modelMatrix);
+                    const planes = extractFrustumPlanes(this._gpuCullVpData, this._gpuCullPlanes);
+                    const flat = this._gpuCullPlanesFlat;
+                    for (let i = 0; i < 6; i++) {
+                        const p = planes[i];
+                        flat[i * 4 + 0] = Number(p?.[0]) || 0;
+                        flat[i * 4 + 1] = Number(p?.[1]) || 0;
+                        flat[i * 4 + 2] = Number(p?.[2]) || 0;
+                        flat[i * 4 + 3] = Number(p?.[3]) || 0;
+                    }
+                    gl.uniform1i(this.uniforms.uGpuFrustumCulling, 1);
+                    gl.uniform4fv(this.uniforms.uGpuFrustumPlanes, flat);
+                } catch {
+                    gl.uniform1i(this.uniforms.uGpuFrustumCulling, 0);
+                }
+            } else {
+                gl.uniform1i(this.uniforms.uGpuFrustumCulling, 0);
+            }
+            gl.uniform1f(this.uniforms.uGpuCullRadius, 0.0);
         // CodeWalker BasicPS uses the sampled diffuse (and tint paths) directly; it does NOT apply a global
         // constant "base color" multiply. Using a non-white default here washes the whole scene.
         gl.uniform3fv(this.uniforms.uColor, [1.0, 1.0, 1.0]);
+        try { gl.uniform1i(this.uniforms.uVertexColorMode, 0); } catch { /* ignore */ }
+        try { gl.uniform1i(this.uniforms.uDoubleSidedLighting, 0); } catch { /* ignore */ }
         // Lighting inputs: allow App to pass HDR-ish sunlight settings via fog.lightDir/lightColor/ambientIntensity.
         // Defaults remain stable for older callers.
         const ld = (fog && Array.isArray(fog.lightDir) && fog.lightDir.length >= 3)
@@ -2557,6 +5170,24 @@ void main() { }`;
         // Default CodeWalker GlobalUVAnim (identity).
         gl.uniform3fv(this.uniforms.uGlobalAnimUV0, [1.0, 0.0, 0.0]);
         gl.uniform3fv(this.uniforms.uGlobalAnimUV1, [0.0, 1.0, 0.0]);
+        const characterLocomotion = fog?.characterLocomotion || null;
+        const characterMove01 = Math.max(0.0, Math.min(1.0, Number(characterLocomotion?.move01) || 0.0));
+        const characterPhase = Number.isFinite(Number(characterLocomotion?.phase)) ? Number(characterLocomotion.phase) : 0.0;
+        const characterStride = Math.max(0.35, Math.min(1.35, Number(characterLocomotion?.stride) || 1.0));
+        const characterEnabled = !!characterLocomotion?.enabled && characterMove01 > 0.005;
+        this._updateSkinningPose({
+            enabled: characterEnabled,
+            move01: characterMove01,
+            phase: characterPhase,
+            stride: characterStride,
+            gait: String(characterLocomotion?.gait || ''),
+            combat: characterLocomotion?.combat || null,
+            gesture: characterLocomotion?.gesture || null,
+        });
+        try {
+            gl.uniform4fv(this.uniforms.uCharacterLocomotion, [characterEnabled ? 1.0 : 0.0, characterMove01, characterPhase, characterStride]);
+        } catch { /* ignore */ }
+        try { gl.uniform1i(this.uniforms.uSkinningEnabled, 0); } catch { /* ignore */ }
 
         // Defaults for optional maps.
         gl.uniform1i(this.uniforms.uHasNormal, 0);
@@ -2621,7 +5252,6 @@ void main() { }`;
         // Tint/dirt/damage/puddles defaults
         gl.uniform1i(this.uniforms.uEnableTintPalette, 0);
         try { gl.uniform1i(this.uniforms.uTintMode, 0); } catch { /* ignore */ }
-        try { gl.uniform2fv(this.uniforms.uTintPaletteSelector, [0.0, 0.5]); } catch { /* ignore */ }
         gl.uniform3fv(this.uniforms.uDecalTint, [1.0, 1.0, 1.0]);
         gl.uniform1i(this.uniforms.uHasDirt, 0);
         gl.uniform1f(this.uniforms.uDirtLevel, 0.0);
@@ -2647,6 +5277,8 @@ void main() { }`;
         gl.uniform3fv(this.uniforms.uFogColor, fog?.color || [0.6, 0.7, 0.8]);
         gl.uniform1f(this.uniforms.uFogStart, Number(fog?.start ?? 1500));
         gl.uniform1f(this.uniforms.uFogEnd, Number(fog?.end ?? 9000));
+        gl.uniform1i(this.uniforms.uWireframe, wireframe ? 1 : 0);
+        gl.uniform3fv(this.uniforms.uWireframeColor, fog?.wireframeColor || [0.82, 0.92, 1.0]);
         // Time (seconds) for animated shader paths (water ripples, etc).
         try { gl.uniform1f(this.uniforms.uTime, (performance?.now?.() ?? Date.now()) * 0.001); } catch { /* ignore */ }
 
@@ -2724,6 +5356,32 @@ void main() { }`;
                 console.warn(`InstancedModelRenderer: unsupported shaderFamily "${f}" (rendering as basic).`);
             } catch { /* ignore */ }
         };
+        const skipsColorPassShader = (shaderName) => {
+            const s = String(shaderName || '').toLowerCase();
+            return s.includes('cpv_only')
+                || s.includes('decal_shadow_only')
+                || s.includes('trees_shadow_proxy');
+        };
+        const vertexColorModeFor = (shaderName, mat) => {
+            const explicit = Number(mat?.vertexColorMode ?? mat?.vertexColourMode);
+            if (Number.isFinite(explicit)) {
+                const n = Math.floor(explicit);
+                return (n === 1 || n === 2) ? n : 0;
+            }
+            const s = String(shaderName || mat?.shaderName || '').toLowerCase();
+            if (
+                s.includes('cpv_only') ||
+                s.includes('colour_only') ||
+                s.includes('color_only') ||
+                s.includes('vertexcolour') ||
+                s.includes('vertexcolor') ||
+                s.includes('vertex_colour') ||
+                s.includes('vertex_color')
+            ) {
+                return 1;
+            }
+            return 0;
+        };
 
         const makeUvso = (uvso) => {
             if (uvso && Array.isArray(uvso) && uvso.length >= 4) {
@@ -2776,6 +5434,14 @@ void main() { }`;
                 emissiveUvSet: eff.emissiveUvSet ?? eff.emissiveUv ?? null,
             });
         };
+        const effectiveMaterialFor = (entryMat, subMat) => {
+            try {
+                if (this.modelManager?.getEffectiveMaterialAndSignature) {
+                    return this.modelManager.getEffectiveMaterialAndSignature(entryMat ?? null, subMat ?? null).material || {};
+                }
+            } catch { /* ignore */ }
+            return { ...(entryMat || {}), ...(subMat || {}) };
+        };
 
         // Prefer KTX2 variants when present; fall back to PNG paths.
         // Viewer can always load PNG; KTX2 support is best-effort.
@@ -2786,6 +5452,32 @@ void main() { }`;
             const v2 = preferKtx2 ? (m[k2] ?? null) : null;
             const v1 = m[keyBase] ?? null;
             return (typeof v2 === 'string' && v2) ? v2 : ((typeof v1 === 'string' && v1) ? v1 : null);
+        };
+        const isPedSkinMask = (mat) => !!(mat && typeof mat === 'object' && mat.pedSkinMask === true);
+        const makeBaseColor = (mat) => {
+            const v = mat?.baseColor;
+            if (Array.isArray(v) && v.length >= 3) {
+                const r = Number(v[0]), g = Number(v[1]), b = Number(v[2]);
+                if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) return [r, g, b];
+            }
+            return [1.0, 1.0, 1.0];
+        };
+        const pickDiffuseTex = (mat) => isPedSkinMask(mat) ? null : pickTex(mat, 'diffuse');
+        const diffuseKindFor = (shaderName, alphaModeInt, shaderFamily = '') => {
+            const s = String(shaderName || '').toLowerCase();
+            const fam = String(shaderFamily || '').toLowerCase();
+            if ((Number(alphaModeInt) | 0) !== 1 || fam !== 'basic') return 'diffuse';
+            if (s.includes('trees_') || s.includes('cutout') || s.includes('branches')) return 'foliageDiffuse';
+            return 'diffuse';
+        };
+        const doubleSidedLightingFor = (shaderName, alphaModeInt, shaderFamily, doubleSided, diffuseKind = 'diffuse') => {
+            if (!doubleSided) return false;
+            if (String(shaderFamily || '').toLowerCase() !== 'basic') return false;
+            if ((Number(alphaModeInt) | 0) !== 1) return false;
+            const kind = String(diffuseKind || '').toLowerCase();
+            if (kind === 'foliagediffuse') return true;
+            const s = String(shaderName || '').toLowerCase();
+            return s.includes('trees_') || s.includes('branches') || s.includes('cutout');
         };
 
         const computeRadiusSafe = (mesh) => {
@@ -2809,9 +5501,10 @@ void main() { }`;
             this.modelManager?.touchMesh?.(b.mesh);
 
             const radiusSafe = computeRadiusSafe(b.mesh);
-            if (!shouldDrawByOcclusion(b._instBounds, radiusSafe)) continue;
+            if (!shouldDrawByOcclusion(b._instBounds, radiusSafe, `bucket:${b.bucketId || b.file || seq}`)) continue;
 
             const mat = b.material || null;
+            if (mat?.skipColorPass || skipsColorPassShader(mat?.shaderName)) continue;
             const shaderFamily = String(mat?.shaderFamily || '').toLowerCase();
             const alphaModeStr = String(mat?.alphaMode || 'opaque').toLowerCase();
             let alphaModeInt = (alphaModeStr === 'cutout') ? 1 : ((alphaModeStr === 'blend') ? 2 : 0);
@@ -2819,14 +5512,25 @@ void main() { }`;
             if (shaderFamily === 'decal' || shaderFamily === 'glass') alphaModeInt = 2;
             const shaderName = String(mat?.shaderName || '');
             const shaderFamilyInt = shaderFamilyToInt(shaderFamily);
+            const diffuseKind = diffuseKindFor(shaderName, alphaModeInt, shaderFamily);
+            const doubleSided = !!mat?.doubleSided;
             if (shaderFamilyInt === 0) warnUnknownFamilyOnce(shaderFamily);
             drawItems.push({
                 kind: 'bucket',
+                bucketId: String(b.bucketId || ''),
+                hash: null,
+                lod: String(b.lod || ''),
+                file: String(b.file || ''),
                 seq: seq++,
                 materialSig: materialSigFor(null, mat),
                 meshKey: String(b.file || ''),
                 meshHasTangents: !!(b.mesh?.tanBuffer),
+                meshHasColor0: !!(b.mesh?.col0Buffer),
                 meshHasUv1: !!(b.mesh?.uv1Buffer),
+                skinned: false,
+                hasBlendWeights: false,
+                hasBlendIndices: false,
+                boneIds: [],
                 dist,
                 instanceStrideFloats: Number(b.instanceStrideFloats ?? 16),
                 sortDist: computeSortDist(b._instBounds),
@@ -2835,12 +5539,17 @@ void main() { }`;
                 shaderFamilyInt,
                 renderBucket: classifyBucket(shaderName, alphaModeInt, shaderFamily),
                 instBounds: b._instBounds || null,
+                gpuCullRadius: radiusSafe,
                 uvso: makeUvso(mat?.uv0ScaleOffset),
                 uvso1: makeUvso(mat?.uv1ScaleOffset),
                 uvso2: makeUvso(mat?.uv2ScaleOffset),
                 globalAnimUV0: (Array.isArray(mat?.globalAnimUV0) && mat.globalAnimUV0.length >= 3) ? mat.globalAnimUV0 : [1.0, 0.0, 0.0],
                 globalAnimUV1: (Array.isArray(mat?.globalAnimUV1) && mat.globalAnimUV1.length >= 3) ? mat.globalAnimUV1 : [0.0, 1.0, 0.0],
-                diffuseRel: pickTex(mat, 'diffuse'),
+                baseColor: makeBaseColor(mat),
+                pedHairTint: mat?.pedHairTint === true,
+                vertexColorMode: vertexColorModeFor(shaderName, mat),
+                diffuseRel: pickDiffuseTex(mat),
+                diffuseKind,
                 diffuseUvSet: parseUvSet(mat?.diffuseUvSet ?? mat?.diffuseUv ?? null, 0),
                 diffuse2Rel: pickTex(mat, 'diffuse2'),
                 diffuse2Uv: mat?.diffuse2Uv ?? null,
@@ -2880,7 +5589,8 @@ void main() { }`;
                 alphaCutoff: Number(mat?.alphaCutoff ?? 0.33),
                 alphaScale: Number(mat?.alphaScale ?? 1.0),
                 alphaToCoverage: !!mat?.alphaToCoverage,
-                doubleSided: !!mat?.doubleSided,
+                doubleSided,
+                doubleSidedLighting: doubleSidedLightingFor(shaderName, alphaModeInt, shaderFamily, doubleSided, diffuseKind),
                 specMaskWeights: Array.isArray(mat?.specMaskWeights) ? mat.specMaskWeights : null,
                 detailSettings: Array.isArray(mat?.detailSettings) ? mat.detailSettings : null,
                 bumpiness: Number((mat?.bumpiness) ?? 1.0),
@@ -2926,9 +5636,13 @@ void main() { }`;
                 decalTint: Array.isArray(mat?.decalTint) ? mat.decalTint : null,
                 puddleParams: Array.isArray(mat?.puddleParams) ? mat.puddleParams : null,
                 puddleScaleRange: Array.isArray(mat?.puddleScaleRange) ? mat.puddleScaleRange : null,
+                entryMaterial: null,
+                submeshMaterial: null,
+                effectiveMaterial: mat,
                 vao: b.vao || null,
                 mesh: b.mesh,
                 instanceBuffer: b.instanceBuffer,
+                instanceData: b.instanceData || null,
                 instanceCount: b.instanceCount,
                 entryInstanceBuffer: null,
             });
@@ -2938,6 +5652,7 @@ void main() { }`;
         for (const [_hash, entry] of this.instances.entries()) {
             if (!entry || entry.instanceCount <= 0) continue;
             const dist = Number.isFinite(Number(entry.minDist)) ? Number(entry.minDist) : 0;
+            const entrySortDist = computeSortDist(entry._instBounds);
 
             let fallbackMat = null;
             try {
@@ -2954,7 +5669,7 @@ void main() { }`;
                 const r0 = computeRadiusSafe(m0);
                 if (r0 > maxRadiusSafe) maxRadiusSafe = r0;
             }
-            if (maxRadiusSafe > 0 && !shouldDrawByOcclusion(entry._instBounds, maxRadiusSafe)) continue;
+            if (maxRadiusSafe > 0 && !shouldDrawByOcclusion(entry._instBounds, maxRadiusSafe, `arch:${entry.hash}:${entry.lod}`)) continue;
 
             for (const sm of entry.submeshes?.values?.() || []) {
                 if (!sm || !sm.mesh) continue;
@@ -2962,13 +5677,25 @@ void main() { }`;
                     try { if (sm.vao) gl.deleteVertexArray(sm.vao); } catch { /* ignore */ }
                     sm.vao = null;
                     sm.mesh = null;
-                    this._enqueueMeshLoad(`${entry.hash}:${entry.lod}`, sm.file);
+                    this._enqueueMeshLoad(`${entry.hash}:${entry.lod}`, sm.file, { priority: entry.loadPriority || 0 });
                     continue;
                 }
                 this.modelManager?.touchMesh?.(sm.mesh);
 
+                const radiusSafe = computeRadiusSafe(sm.mesh);
                 const subMat = sm.material || null;
-                const eff = { ...(fallbackMat || {}), ...(subMat || {}) };
+                let materialCache = sm._renderMaterialCache;
+                if (!materialCache || materialCache.entry !== fallbackMat || materialCache.sub !== subMat) {
+                    materialCache = {
+                        entry: fallbackMat,
+                        sub: subMat,
+                        effective: effectiveMaterialFor(fallbackMat, subMat),
+                        signature: materialSigFor(fallbackMat, subMat),
+                    };
+                    sm._renderMaterialCache = materialCache;
+                }
+                const eff = materialCache.effective;
+                if (eff.skipColorPass || skipsColorPassShader(eff?.shaderName)) continue;
                 const shaderFamily = String(eff?.shaderFamily || '').toLowerCase();
                 const alphaModeStr = String(eff?.alphaMode || 'opaque').toLowerCase();
                 let alphaModeInt = (alphaModeStr === 'cutout') ? 1 : ((alphaModeStr === 'blend') ? 2 : 0);
@@ -2976,28 +5703,46 @@ void main() { }`;
                 const shaderName = String(eff?.shaderName || '');
 
                 const shaderFamilyInt = shaderFamilyToInt(shaderFamily);
+                const diffuseKind = diffuseKindFor(shaderName, alphaModeInt, shaderFamily);
+                const fragmentBoneTag = Number.isFinite(Number(sm.fragmentBoneTag)) ? Number(sm.fragmentBoneTag) : null;
+                const doubleSided = !!eff?.doubleSided || fragmentBoneTag !== null;
                 if (shaderFamilyInt === 0) warnUnknownFamilyOnce(shaderFamily);
                 drawItems.push({
                     kind: 'submesh',
+                    hash: String(entry.hash || ''),
+                    lod: String(entry.lod || ''),
+                    file: String(sm.file || ''),
+                    bucketId: null,
                     seq: seq++,
-                    materialSig: materialSigFor(fallbackMat, subMat),
+                    materialSig: materialCache.signature,
                     meshKey: String(sm.file || ''),
                     meshHasTangents: !!(sm.mesh?.tanBuffer),
+                    meshHasColor0: !!(sm.mesh?.col0Buffer),
                     meshHasUv1: !!(sm.mesh?.uv1Buffer),
+                    skinned: !!sm.skinned,
+                    hasBlendWeights: !!sm.hasBlendWeights,
+                    hasBlendIndices: !!sm.hasBlendIndices,
+                    boneIds: Array.isArray(sm.boneIds) ? sm.boneIds : [],
+                    fragmentBoneTag,
                     dist,
                     instanceStrideFloats: Number(entry.instanceStrideFloats ?? 16),
-                    sortDist: computeSortDist(entry._instBounds),
+                    sortDist: entrySortDist,
                     shaderName,
                     shaderFamily,
                     shaderFamilyInt,
                     renderBucket: classifyBucket(shaderName, alphaModeInt, shaderFamily),
                     instBounds: entry._instBounds || null,
+                    gpuCullRadius: radiusSafe,
                     uvso: makeUvso(eff?.uv0ScaleOffset),
                     uvso1: makeUvso(eff?.uv1ScaleOffset),
                     uvso2: makeUvso(eff?.uv2ScaleOffset),
                     globalAnimUV0: (Array.isArray(eff?.globalAnimUV0) && eff.globalAnimUV0.length >= 3) ? eff.globalAnimUV0 : [1.0, 0.0, 0.0],
                     globalAnimUV1: (Array.isArray(eff?.globalAnimUV1) && eff.globalAnimUV1.length >= 3) ? eff.globalAnimUV1 : [0.0, 1.0, 0.0],
-                    diffuseRel: pickTex(eff, 'diffuse'),
+                    baseColor: makeBaseColor(eff),
+                    pedHairTint: eff?.pedHairTint === true,
+                    vertexColorMode: vertexColorModeFor(shaderName, eff),
+                    diffuseRel: pickDiffuseTex(eff),
+                    diffuseKind,
                     diffuseUvSet: parseUvSet(eff?.diffuseUvSet ?? eff?.diffuseUv ?? null, 0),
                     diffuse2Rel: pickTex(eff, 'diffuse2'),
                     diffuse2Uv: eff?.diffuse2Uv ?? null,
@@ -3036,7 +5781,8 @@ void main() { }`;
                     alphaCutoff: Number(eff?.alphaCutoff ?? 0.33),
                     alphaScale: Number(eff?.alphaScale ?? 1.0),
                     alphaToCoverage: !!eff?.alphaToCoverage,
-                    doubleSided: !!eff?.doubleSided,
+                    doubleSided,
+                    doubleSidedLighting: doubleSidedLightingFor(shaderName, alphaModeInt, shaderFamily, doubleSided, diffuseKind),
                     specMaskWeights: Array.isArray(eff?.specMaskWeights) ? eff.specMaskWeights : null,
                     detailSettings: Array.isArray(eff?.detailSettings) ? eff.detailSettings : null,
                     bumpiness: Number(eff?.bumpiness ?? 1.0),
@@ -3081,16 +5827,29 @@ void main() { }`;
                     decalTint: Array.isArray(eff?.decalTint) ? eff.decalTint : null,
                     puddleParams: Array.isArray(eff?.puddleParams) ? eff.puddleParams : null,
                     puddleScaleRange: Array.isArray(eff?.puddleScaleRange) ? eff.puddleScaleRange : null,
+                    entryMaterial: fallbackMat,
+                    submeshMaterial: subMat,
+                    effectiveMaterial: eff,
                     vao: sm.vao || null,
                     mesh: sm.mesh,
                     instanceBuffer: entry.instanceBuffer,
+                    instanceData: entry.instanceData || null,
                     instanceCount: entry.instanceCount,
                 });
             }
         }
 
-        // Stable-ish sort: material signature first, then tangents presence, then mesh key, then sequence.
+        // Draw opaque geometry front-to-back so early depth rejection skips work behind
+        // nearby building faces. Transparent passes remain back-to-front.
         drawItems.sort((a, b) => {
+            if (a.renderBucket !== b.renderBucket) return a.renderBucket - b.renderBucket;
+            const aDist = Number.isFinite(a.sortDist) ? a.sortDist : Number.POSITIVE_INFINITY;
+            const bDist = Number.isFinite(b.sortDist) ? b.sortDist : Number.POSITIVE_INFINITY;
+            if (a.renderBucket === BUCKET.OPAQUE || a.renderBucket === BUCKET.CUTOUT) {
+                if (aDist !== bDist) return aDist - bDist;
+            } else if (a.renderBucket === BUCKET.ALPHA || a.renderBucket === BUCKET.ADDITIVE) {
+                if (aDist !== bDist) return bDist - aDist;
+            }
             if (a.materialSig !== b.materialSig) return (a.materialSig < b.materialSig) ? -1 : 1;
             const ta = a.meshHasTangents ? 1 : 0;
             const tb = b.meshHasTangents ? 1 : 0;
@@ -3098,6 +5857,7 @@ void main() { }`;
             if (a.meshKey !== b.meshKey) return (a.meshKey < b.meshKey) ? -1 : 1;
             return a.seq - b.seq;
         });
+        this._lastPickDrawItems = drawItems;
 
         // Render stats for Perf HUD (lightweight counters).
         this._renderStats.drawCalls = 0;
@@ -3109,6 +5869,7 @@ void main() { }`;
         this._renderStats.diffuseWanted = 0;
         this._renderStats.diffusePlaceholder = 0;
         this._renderStats.diffuseReal = 0;
+        this._renderStats.diffuseMissingFromIndex = 0;
         this._renderStats.drawItemsMissingUv = 0;
 
         // Reset per-frame texture diagnostics.
@@ -3161,6 +5922,7 @@ void main() { }`;
             flipHeightY: null,
             normalEncoding: null,
             normalReconstructZ: null,
+            fragmentTransform: null,
             specMaskWeights: null,
             doubleSided: null,
             normalScale: null,
@@ -3202,6 +5964,9 @@ void main() { }`;
             waterEnableFogtex: null,
             waterFlowParams: null,
             waterFogParams: null,
+            gpuCullRadius: null,
+            baseColor: null,
+            vertexColorMode: null,
             // IMPORTANT: initialize to `undefined` (not `null`) so the first bind always happens.
             // If we initialize to null and the first material's texture is also null (placeholder/loading),
             // bindTexCached() would early-return and leave a stale texture bound (e.g. PostFX scene RT),
@@ -3221,9 +5986,11 @@ void main() { }`;
             texDamageMask: undefined,
             texPuddleMask: undefined,
             texTintPalette: undefined,
+            texBone: undefined,
             texShadow: undefined,
             activeUnit: -1,
             polyOffset: null,
+            skinEnabled: null,
         };
 
         const setUvsoCached = (uvso4) => {
@@ -3264,7 +6031,9 @@ void main() { }`;
             state.uvAnim1 = [v1[0], v1[1], v1[2]];
         };
 
-        const toAssetUrl = (rel) => this._chooseTextureUrl(rel);
+        const toAssetUrl = (rel) => this._chooseTextureUrl(rel, {
+            allowIndexMiss: !!fog?.allowTextureIndexMiss,
+        });
 
         const set1iCached = (loc, next, key) => {
             if (state[key] === next) return;
@@ -3390,8 +6159,8 @@ void main() { }`;
                     gl.depthMask(true);
                     state.depthMask = true;
                 }
-                // Cutout A2C improves foliage edges when MSAA is enabled.
-                setAlphaToCoverage(m === 1 && !!alphaToCoverage);
+                // Cutout A2C can shimmer on dense foliage while the camera moves.
+                setAlphaToCoverage(alphaToCoverageEnabled && m === 1 && !!alphaToCoverage);
             }
         };
 
@@ -3421,6 +6190,7 @@ void main() { }`;
         gl.uniform1i(this.uniforms.uDamage, 12);
         gl.uniform1i(this.uniforms.uDamageMask, 13);
         gl.uniform1i(this.uniforms.uPuddleMask, 14);
+        try { gl.uniform1i(this.uniforms.uBoneTexture, 16); } catch { /* ignore */ }
         // Shadow map (depth) is always on unit 15 to keep the rest stable.
         try { gl.uniform1i(this.uniforms.uShadowMap, 15); } catch { /* ignore */ }
         gl.uniform1i(this.uniforms.uDecodeDiffuseSrgb, 0);
@@ -3434,9 +6204,6 @@ void main() { }`;
         } catch { /* ignore */ }
         gl.uniform1i(this.uniforms.uNormalEncoding, 0);
         gl.uniform1i(this.uniforms.uNormalReconstructZ, 1);
-
-        // Default tint palette selector (works for 256x1 and 256xN palettes).
-        try { gl.uniform2fv(this.uniforms.uTintPaletteSelector, [0.0, 0.5]); } catch { /* ignore */ }
 
         // Build shadow map NOW that we have the per-frame draw list (uses the same VAOs).
         if (shadowOk) {
@@ -3461,6 +6228,7 @@ void main() { }`;
                 const showWater = (fog && fog.showWater !== undefined) ? !!fog.showWater : true;
                 if (!showWater && (it.shaderFamilyInt === 7)) continue;
             } catch { /* ignore */ }
+            const useSecondaryMaps = !wireframe;
 
             this._renderStats.drawCalls++;
             const inst = Number(it.instanceCount) || 0;
@@ -3474,6 +6242,7 @@ void main() { }`;
             setUvso1Cached(it.uvso1);
             setUvso2Cached(it.uvso2);
             setUvAnimCached(it.globalAnimUV0, it.globalAnimUV1);
+            set1fCached(this.uniforms.uGpuCullRadius, it.gpuCullRadius, 'gpuCullRadius', 0.0);
 
             // Color pipeline: decide per-texture whether we need shader-side sRGB decode.
             // (sRGB support may exist, but a given texture might still be uploaded as RGBA.)
@@ -3487,29 +6256,60 @@ void main() { }`;
 
             // Cull + alpha mode render state.
             setCullCached(!!it.doubleSided);
+            set1iCached(this.uniforms.uDoubleSidedLighting, it.doubleSidedLighting ? 1 : 0, 'doubleSidedLighting');
 
-            // Per-draw tint palette (best-effort).
-            // CodeWalker has multiple tinting paths:
-            // - trees_*_tnt: tint is looked up from vertex colour (no per-instance data)
-            // - weapon_*_palette: tint is derived from diffuse alpha (no per-instance data)
-            // - vehicle/ped/etc: tint index is per-instance (stride>=17)
+            const wheelTag = Number(it.fragmentBoneTag);
+            const wheelPivot = VEHICLE_WHEEL_PIVOTS[wheelTag] || null;
+            const wheelState = fog?.vehicleWheels || null;
+            if (wheelPivot && wheelState) {
+                const spin = Number(wheelState.spinRad) || 0.0;
+                const steer = (wheelTag === 27922 || wheelTag === 26418)
+                    ? (Number(wheelState.steeringRad) || 0.0)
+                    : 0.0;
+                const cx = Math.cos(spin); const sx = Math.sin(spin);
+                const cz = Math.cos(steer); const sz = Math.sin(steer);
+                const rotation = this._fragmentRotationScratch;
+                rotation[0] = cz; rotation[1] = sz; rotation[2] = 0.0;
+                rotation[3] = -sz * cx; rotation[4] = cz * cx; rotation[5] = sx;
+                rotation[6] = sz * sx; rotation[7] = -cz * sx; rotation[8] = cx;
+                const transformKey = `${wheelTag}:${spin.toFixed(5)}:${steer.toFixed(5)}`;
+                if (state.fragmentTransform !== transformKey) {
+                    gl.uniform1i(this.uniforms.uFragmentTransformEnabled, 1);
+                    gl.uniform3fv(this.uniforms.uFragmentPivot, wheelPivot);
+                    gl.uniformMatrix3fv(this.uniforms.uFragmentRotation, false, rotation);
+                    state.fragmentTransform = transformKey;
+                }
+            } else if (state.fragmentTransform !== 'off') {
+                gl.uniform1i(this.uniforms.uFragmentTransformEnabled, 0);
+                state.fragmentTransform = 'off';
+            }
+
+            // Per-draw tint palette. Palette X is selected by the material's shader family;
+            // the texture row always comes from the per-entity GTA TintPaletteIndex.
             const strideFloats = Number(it.instanceStrideFloats ?? 16);
             const wantsTintIndex = (strideFloats >= 17);
-            // Prefer a material-provided palette; fall back to the built-in debug palette.
-            let tintTex = this.tintPaletteTex;
-            if (it.tintPaletteRel && this.textureStreamer) {
+            // Material palettes must be exact. While one is missing/rejected, disable
+            // tint instead of briefly recoloring the prop with the built-in debug palette.
+            let tintTex = null;
+            let tintReady = false;
+            if (!wireframe && it.tintPaletteRel && this.textureStreamer) {
                 const url = toAssetUrl(it.tintPaletteRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'tintPalette' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'tintPalette' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
-                if (!info.isPlaceholder && info.tex) tintTex = info.tex;
+                if (!info.isPlaceholder && info.tex) {
+                    tintTex = info.tex;
+                    tintReady = true;
+                }
                 // Decode palette in shader only if it couldn't be uploaded as sRGB.
                 decodeTintPaletteSrgb = !!(info && info.tex && !info.uploadedAsSrgb);
+            } else if (!it.tintPaletteRel && this.tintPaletteTex) {
+                tintTex = this.tintPaletteTex;
+                tintReady = true;
             }
-            bindTexCached(8, tintTex, 'texTintPalette');
+            bindTexCached(8, tintTex || this.tintPaletteTex, 'texTintPalette');
             const tintMode = (it.tintMode | 0);
-            const canEnableTint = !!tintTex && (tintMode !== 1 || wantsTintIndex);
+            const canEnableTint = !!tintReady && (tintMode !== 1 || wantsTintIndex);
             set1iCached(this.uniforms.uEnableTintPalette, canEnableTint ? 1 : 0, 'enableTintPalette');
-            set2fCached(this.uniforms.uTintPaletteSelector, it.tintPaletteSelector, 'tintPaletteSel', [0.0, 0.5]);
             set1iCached(this.uniforms.uTintMode, canEnableTint ? tintMode : 0, 'tintMode');
             set1iCached(this.uniforms.uDecodeTintPaletteSrgb, (canEnableTint && decodeTintPaletteSrgb) ? 1 : 0, 'decodeTintPaletteSrgb', 0);
 
@@ -3641,7 +6441,7 @@ void main() { }`;
             // are often repurposed as additional *color* layers (Colourmap3/4). Those should be treated as sRGB
             // color textures (hardware decode), not as linear data textures.
             let decodeEnvSrgb = false;
-            if (it.envRel && this.textureStreamer) {
+            if (useSecondaryMaps && it.envRel && this.textureStreamer) {
                 const url = toAssetUrl(it.envRel);
                 const envKind = (it.shaderFamilyInt === 6) ? 'diffuse' : 'env';
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: envKind });
@@ -3662,6 +6462,11 @@ void main() { }`;
             set1fCached(this.uniforms.uWetness, it.wetness, 'wetness', 0.0);
             set1fCached(this.uniforms.uWetDarken, it.wetDarken, 'wetDarken', 0.0);
             set1fCached(this.uniforms.uWetSpecBoost, it.wetSpecBoost, 'wetSpecBoost', 1.0);
+            set3fCached(this.uniforms.uColor, it.baseColor, 'baseColor', [1.0, 1.0, 1.0]);
+            set1iCached(this.uniforms.uPedHairTint, it.pedHairTint ? 1 : 0, 'pedHairTint', 0);
+            set3fCached(this.uniforms.uPedHairPrimary, this.pedHairPrimary, 'pedHairPrimary', [0.035, 0.012, 0.004]);
+            set3fCached(this.uniforms.uPedHairHighlight, this.pedHairHighlight, 'pedHairHighlight', [0.035, 0.012, 0.004]);
+            set1iCached(this.uniforms.uVertexColorMode, Number.isFinite(Number(it.vertexColorMode)) ? (Number(it.vertexColorMode) | 0) : 0, 'vertexColorMode');
             // Parallax scale/bias: stored as vec4 in exporter/name-map, use xy.
             {
                 const psb = Array.isArray(it.parallaxScaleBias) && it.parallaxScaleBias.length >= 2 ? it.parallaxScaleBias : null;
@@ -3677,8 +6482,10 @@ void main() { }`;
             if (!mesh.uvBuffer) this._renderStats.drawItemsMissingUv++;
 
             // Diffuse
-            if (it.diffuseRel && this.textureStreamer) {
+            if (!wireframe && it.diffuseRel && this.textureStreamer) {
                 const url = toAssetUrl(it.diffuseRel);
+                const diffuseKind = String(it.diffuseKind || 'diffuse');
+                const missingFromIndex = !url;
                 if (!url) {
                     // Resolver returned null => index says this hash is not in the exported set.
                     try {
@@ -3686,9 +6493,10 @@ void main() { }`;
                         const m = this._texFrame?.missingFromExportedSet;
                         if (m) m.set(rel, (m.get(rel) || 0) + 1);
                     } catch { /* ignore */ }
+                    this._renderStats.diffuseMissingFromIndex++;
                 }
-                if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'diffuse' });
-                const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'diffuse' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
+                if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: diffuseKind });
+                const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: diffuseKind }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
                 const tex = info.tex;
                 const hasDiffuse = (!info.isPlaceholder) && !!tex;
                 decodeDiffuseSrgb = hasDiffuse && (!info.uploadedAsSrgb);
@@ -3696,8 +6504,8 @@ void main() { }`;
                 bindTexCached(0, tex, 'tex0');
                 set1iCached(this.uniforms.uHasDiffuse, hasDiffuse ? 1 : 0, 'hasDiffuse');
                 this._renderStats.diffuseWanted++;
-                if (!hasDiffuse) this._renderStats.diffusePlaceholder++;
-                else this._renderStats.diffuseReal++;
+                if (hasDiffuse) this._renderStats.diffuseReal++;
+                else if (!missingFromIndex) this._renderStats.diffusePlaceholder++;
                 if (url && !hasDiffuse) {
                     try {
                         const u = String(url || '');
@@ -3705,6 +6513,10 @@ void main() { }`;
                         if (m2) m2.set(u, (m2.get(u) || 0) + 1);
                     } catch { /* ignore */ }
                 }
+                // Cutout meshes derive their silhouette from diffuse alpha. Drawing
+                // them with an opaque streaming placeholder exposes their source
+                // cards as large blocks (most visibly on ped hair and foliage).
+                if (!hasDiffuse && (Number(it.alphaModeInt) | 0) === 1) continue;
             } else {
                 set1iCached(this.uniforms.uHasDiffuse, 0, 'hasDiffuse');
                 set1iCached(this.uniforms.uFlipDiffuseY, 0, 'flipDiffuseY');
@@ -3714,7 +6526,7 @@ void main() { }`;
             }
 
             // Alpha mask (decal)
-            if (it.alphaMaskRel && this.textureStreamer) {
+            if (!wireframe && it.alphaMaskRel && this.textureStreamer) {
                 const url = toAssetUrl(it.alphaMaskRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'alphaMask' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'alphaMask' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3729,7 +6541,7 @@ void main() { }`;
             }
 
             // Diffuse2
-            if (it.diffuse2Rel && this.textureStreamer) {
+            if (!wireframe && it.diffuse2Rel && this.textureStreamer) {
                 const url = toAssetUrl(it.diffuse2Rel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'diffuse2' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'diffuse2' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3758,7 +6570,7 @@ void main() { }`;
             }
 
             // Dirt (best-effort)
-            if (it.dirtRel && this.textureStreamer) {
+            if (useSecondaryMaps && it.dirtRel && this.textureStreamer) {
                 const url = toAssetUrl(it.dirtRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'dirt' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'dirt' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3775,7 +6587,7 @@ void main() { }`;
             set3fCached(this.uniforms.uDirtColor, it.dirtColor, 'dirtColor', [0.65, 0.62, 0.6]);
 
             // Damage + mask (best-effort)
-            if (it.damageRel && this.textureStreamer) {
+            if (useSecondaryMaps && it.damageRel && this.textureStreamer) {
                 const url = toAssetUrl(it.damageRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'damage' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'damage' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3788,7 +6600,7 @@ void main() { }`;
                 set1iCached(this.uniforms.uFlipDamageY, 0, 'flipDamageY');
                 bindTexCached(12, this._texBlack, 'texDamage');
             }
-            if (it.damageMaskRel && this.textureStreamer) {
+            if (useSecondaryMaps && it.damageMaskRel && this.textureStreamer) {
                 const url = toAssetUrl(it.damageMaskRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'damageMask' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'damageMask' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3803,7 +6615,7 @@ void main() { }`;
             }
 
             // Puddle mask (best-effort)
-            if (it.puddleMaskRel && this.textureStreamer) {
+            if (useSecondaryMaps && it.puddleMaskRel && this.textureStreamer) {
                 const url = toAssetUrl(it.puddleMaskRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'puddleMask' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'puddleMask' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3832,7 +6644,7 @@ void main() { }`;
             set1iCached(this.uniforms.uAOUvSet, (it.aoUvSet | 0), 'aoUvSet');
             set1iCached(this.uniforms.uEmissiveUvSet, (it.emissiveUvSet | 0), 'emissiveUvSet');
 
-            if (hasTangents && it.normalRel && this.textureStreamer) {
+            if (useSecondaryMaps && hasTangents && it.normalRel && this.textureStreamer) {
                 const url = toAssetUrl(it.normalRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'normal' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'normal' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3849,7 +6661,7 @@ void main() { }`;
             }
 
             // Detail (only meaningful if we have tangents + normal path)
-            if (hasTangents && it.detailRel && this.textureStreamer) {
+            if (useSecondaryMaps && hasTangents && it.detailRel && this.textureStreamer) {
                 const url = toAssetUrl(it.detailRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'detail' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'detail' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3881,7 +6693,7 @@ void main() { }`;
                 }
             }
 
-            if (hasTangents && it.specRel && this.textureStreamer) {
+            if (useSecondaryMaps && hasTangents && it.specRel && this.textureStreamer) {
                 const url = toAssetUrl(it.specRel);
                 const specKind = (it.shaderFamilyInt === 6) ? 'diffuse' : 'spec';
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: specKind });
@@ -3901,7 +6713,7 @@ void main() { }`;
             set3fCached(this.uniforms.uSpecMaskWeights, it.specMaskWeights, 'specMaskWeights', [1.0, 0.0, 0.0]);
 
             // Emissive (doesn't require tangents)
-            if (it.emissiveRel && this.textureStreamer) {
+            if (!wireframe && it.emissiveRel && this.textureStreamer) {
                 const url = toAssetUrl(it.emissiveRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'emissive' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'emissive' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3925,7 +6737,7 @@ void main() { }`;
             setDecodeSrgbCached('decodeEmissiveSrgb', decodeEmissiveSrgb);
 
             // AO / occlusion
-            if (it.aoRel && this.textureStreamer) {
+            if (useSecondaryMaps && it.aoRel && this.textureStreamer) {
                 const url = toAssetUrl(it.aoRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'ao' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'ao' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3942,7 +6754,7 @@ void main() { }`;
             }
 
             // Height / parallax map (optional). Only used when shaderFamily is parallax (4), but can be provided for others.
-            if (it.heightRel && this.textureStreamer) {
+            if (useSecondaryMaps && it.heightRel && this.textureStreamer) {
                 const url = toAssetUrl(it.heightRel);
                 if (url) this.textureStreamer.touch(url, { distance: it.dist, kind: 'height' });
                 const info = url ? this.textureStreamer.getWithInfo(url, { distance: it.dist, kind: 'height' }) : { tex: null, isPlaceholder: true, uploadedAsSrgb: false, needsUvFlipY: false };
@@ -3955,6 +6767,18 @@ void main() { }`;
                 set1iCached(this.uniforms.uFlipHeightY, 0, 'flipHeightY');
                 bindTexCached(9, this._texBlack, 'texHeight');
             }
+
+            const wantsSkinning = !!(
+                it.skinned &&
+                it.hasBlendWeights &&
+                it.hasBlendIndices &&
+                Array.isArray(it.boneIds) &&
+                it.boneIds.length &&
+                this.hasSkinningSkeleton()
+            );
+            const boneTex = wantsSkinning ? this._getBonePaletteTexture(it.boneIds) : this._identityBoneTexture;
+            if (boneTex) bindTexCached(16, boneTex, 'texBone');
+            set1iCached(this.uniforms.uSkinningEnabled, (wantsSkinning && boneTex) ? 1 : 0, 'skinEnabled');
 
             // VAO bind + slow-path instancing attr binding.
             if (it.vao) {
@@ -3998,26 +6822,37 @@ void main() { }`;
                 if (key && this._badDrawKeys.has(key)) continue;
             } catch { /* ignore */ }
 
-            gl.drawElementsInstanced(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_INT, 0, it.instanceCount);
+            const drawWireframe = wireframe && !!mesh.lineIdxBuffer && Number(mesh.lineIndexCount) > 0;
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, drawWireframe ? mesh.lineIdxBuffer : mesh.idxBuffer);
+            gl.drawElementsInstanced(
+                drawWireframe ? gl.LINES : gl.TRIANGLES,
+                drawWireframe ? mesh.lineIndexCount : mesh.indexCount,
+                drawWireframe ? (mesh.lineIndexType || gl.UNSIGNED_INT) : gl.UNSIGNED_INT,
+                0,
+                it.instanceCount
+            );
 
-            // One-shot GL error trap (low overhead). If this fires, we record the culprit and skip it next frames.
-            try {
-                const err = gl.getError();
-                if (err && err !== gl.NO_ERROR) {
-                    const key = String(it?.file ?? it?.bucketId ?? it?.hash ?? '');
-                    if (key) this._badDrawKeys.add(key);
-                    this._lastGlError = {
-                        err,
-                        key,
-                        file: String(it?.file ?? ''),
-                        shaderName: String(it?.shaderName ?? ''),
-                        whenMs: (performance?.now?.() ?? Date.now()),
-                    };
-                    console.error('InstancedModelRenderer: GL error during drawable draw (will skip this key next frames):', this._lastGlError);
-                    // Abort remaining draws this frame to avoid cascaded state issues.
-                    break;
-                }
-            } catch { /* ignore */ }
+            // One-shot GL error trap. Disabled by default because gl.getError() can
+            // serialize WebGL after every draw and dominate frame time.
+            if (this.debugDrawGlErrors) {
+                try {
+                    const err = gl.getError();
+                    if (err && err !== gl.NO_ERROR) {
+                        const key = String(it?.file ?? it?.bucketId ?? it?.hash ?? '');
+                        if (key) this._badDrawKeys.add(key);
+                        this._lastGlError = {
+                            err,
+                            key,
+                            file: String(it?.file ?? ''),
+                            shaderName: String(it?.shaderName ?? ''),
+                            whenMs: (performance?.now?.() ?? Date.now()),
+                        };
+                        console.error('InstancedModelRenderer: GL error during drawable draw (will skip this key next frames):', this._lastGlError);
+                        // Abort remaining draws this frame to avoid cascaded state issues.
+                        break;
+                    }
+                } catch { /* ignore */ }
+            }
         }
 
             // Leave GL in a predictable state.
@@ -4026,6 +6861,7 @@ void main() { }`;
         } finally {
             // Always restore state, even if a bad drawable triggers an early exit.
             try { _restoreState?.(); } catch { /* ignore */ }
+            this._fastTextureUnitRestore = false;
         }
     }
 }

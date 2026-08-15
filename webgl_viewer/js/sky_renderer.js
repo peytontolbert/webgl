@@ -114,15 +114,16 @@ export class SkyRenderer {
         moonColor = [0.70, 0.78, 0.90],
         moonIntensity = 0.2,
         starIntensity = 0.0,
+        fastStateRestore = false,
     } = {}) {
         if (!this.ready) return;
         const gl = this.gl;
         gl.useProgram(this.program.program);
 
         // No depth for sky.
-        const depthWasEnabled = gl.isEnabled(gl.DEPTH_TEST);
+        const depthWasEnabled = fastStateRestore ? true : gl.isEnabled(gl.DEPTH_TEST);
         if (depthWasEnabled) gl.disable(gl.DEPTH_TEST);
-        const prevDepthMask = gl.getParameter(gl.DEPTH_WRITEMASK);
+        const prevDepthMask = fastStateRestore ? true : gl.getParameter(gl.DEPTH_WRITEMASK);
         gl.depthMask(false);
 
         gl.uniform3fv(this.uniforms.uSkyTop, topColor);

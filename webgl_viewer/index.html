@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,">
     <title>GTA5 Terrain Viewer</title>
     <style>
         body {
@@ -17,19 +18,57 @@
         }
         #controls {
             position: fixed;
-            top: 20px;
-            left: 20px;
-            background: rgba(0, 0, 0, 0.7);
-            padding: 10px;
-            border-radius: 5px;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(19, 22, 25, 0.97);
+            padding: 0 16px 18px;
             color: white;
             font-family: Arial, sans-serif;
-            z-index: 10;
-            width: 280px;
-            max-height: calc(100vh - 40px);
+            z-index: 101;
+            width: min(380px, calc(100vw - 32px));
             overflow-y: auto;
             overflow-x: hidden;
             -webkit-overflow-scrolling: touch;
+            border-left: 1px solid rgba(255,255,255,0.16);
+            box-shadow: -18px 0 48px rgba(0,0,0,0.38);
+        }
+        #controls[hidden], #settingsBackdrop[hidden] {
+            display: none;
+        }
+        #settingsBackdrop {
+            position: fixed;
+            inset: 0;
+            z-index: 100;
+            background: rgba(0, 0, 0, 0.62);
+        }
+        .settings-header {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin: 0 -16px 14px;
+            padding: 14px 16px;
+            background: #171a1d;
+            border-bottom: 1px solid rgba(255,255,255,0.14);
+        }
+        .settings-header h1 {
+            margin: 0;
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: 0;
+        }
+        #closeSettings {
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 5px;
+            background: #f0f2f4;
+            color: #151719;
+            padding: 7px 12px;
+            cursor: pointer;
+            font-weight: 700;
         }
         .control-group {
             margin: 10px 0;
@@ -128,11 +167,344 @@
             white-space: pre;
             max-width: min(520px, calc(100vw - 40px));
         }
+        #weaponHud {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            z-index: 11;
+            min-width: 128px;
+            padding: 8px 10px;
+            border: 1px solid rgba(255,255,255,0.16);
+            border-radius: 6px;
+            background: rgba(0,0,0,0.72);
+            color: rgba(255,255,255,0.95);
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.35;
+            text-align: right;
+            pointer-events: none;
+        }
+        #vehiclePrompt {
+            position: fixed;
+            left: 50%;
+            bottom: 34px;
+            z-index: 12;
+            transform: translateX(-50%);
+            padding: 8px 12px;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 5px;
+            background: rgba(0,0,0,0.78);
+            color: #fff;
+            font: 700 13px Arial, sans-serif;
+            pointer-events: none;
+        }
+        #weaponHudAmmo {
+            font-size: 18px;
+            font-weight: 700;
+        }
+        #meleeHud {
+            position: fixed;
+            left: 18px;
+            bottom: 18px;
+            z-index: 11;
+            width: 190px;
+            color: #fff;
+            font: 700 11px/1.2 Arial, sans-serif;
+            text-shadow: 0 1px 2px #000;
+            pointer-events: none;
+        }
+        .combat-health-row { margin-top: 7px; }
+        .combat-health-label { display: flex; justify-content: space-between; margin-bottom: 3px; }
+        .combat-health-track { height: 7px; border: 1px solid rgba(255,255,255,0.65); background: rgba(0,0,0,0.68); }
+        .combat-health-fill { height: 100%; width: 100%; background: #67c86f; transition: width 90ms linear; }
+        #meleeTargetRow .combat-health-fill { background: #d85d55; }
+        #glCanvas { transition: filter 500ms ease; }
+        body.player-dead #glCanvas { filter: grayscale(0.9) contrast(0.86) brightness(0.58); }
+        #deathOverlay {
+            position: fixed;
+            inset: 0;
+            z-index: 30;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+            background: rgba(24, 0, 0, 0.12);
+        }
+        #deathOverlay[hidden] { display: none; }
+        #deathOverlayBand {
+            width: 100%;
+            min-height: 132px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.58);
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        #deathTitle {
+            color: #c84d4d;
+            font: 300 64px/1 Arial, Helvetica, sans-serif;
+            letter-spacing: 0;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.85);
+        }
+        #deathCountdown {
+            margin-top: 12px;
+            color: rgba(255, 255, 255, 0.82);
+            font: 700 12px/1 Arial, Helvetica, sans-serif;
+            letter-spacing: 0;
+        }
+        #combatCrosshair {
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            z-index: 11;
+            width: 20px;
+            height: 20px;
+            margin: -10px 0 0 -10px;
+            pointer-events: none;
+        }
+        #combatCrosshair::before,
+        #combatCrosshair::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            background: rgba(255,255,255,0.94);
+            box-shadow: 0 0 2px rgba(0,0,0,0.95);
+        }
+        #combatCrosshair::before { width: 20px; height: 2px; margin: -1px 0 0 -10px; }
+        #combatCrosshair::after { width: 2px; height: 20px; margin: -10px 0 0 -1px; }
+        #weaponInventoryDialog {
+            width: min(360px, calc(100vw - 32px));
+            padding: 0;
+            color: #f5f7f8;
+            background: #171b1f;
+            border: 1px solid #4b535c;
+            border-radius: 6px;
+        }
+        #weaponInventoryDialog::backdrop { background: rgba(0,0,0,0.58); }
+        .inventory-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #363d45; }
+        .inventory-header h2 { margin: 0; font-size: 16px; font-weight: 700; }
+        .inventory-list { padding: 10px; display: grid; gap: 8px; }
+        .inventory-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; min-height: 48px; padding: 9px 10px; border: 1px solid #363d45; border-radius: 5px; }
+        .inventory-item-name { font-size: 14px; font-weight: 700; }
+        .inventory-item-meta { margin-top: 2px; font-size: 12px; color: #b9c1c9; }
+        #assetInspector {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            z-index: 12;
+            display: none;
+            width: min(520px, calc(100vw - 32px));
+            max-height: min(72vh, 720px);
+            overflow: hidden;
+            background: rgba(10, 12, 14, 0.92);
+            border: 1px solid rgba(255,255,255,0.16);
+            border-radius: 8px;
+            box-shadow: 0 14px 44px rgba(0,0,0,0.5);
+            color: rgba(255,255,255,0.95);
+            font-family: Arial, sans-serif;
+        }
+        #assetInspectorHeader {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 9px 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.12);
+        }
+        #assetInspectorTitle {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        #assetInspectorActions {
+            display: flex;
+            gap: 6px;
+            flex: 0 0 auto;
+        }
+        #assetInspector button {
+            border: 1px solid rgba(255,255,255,0.16);
+            background: rgba(255,255,255,0.08);
+            color: #fff;
+            border-radius: 6px;
+            padding: 5px 8px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        #assetInspector button:hover {
+            background: rgba(255,255,255,0.13);
+        }
+        #assetInspectorSummary {
+            padding: 8px 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.10);
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.35;
+            color: rgba(255,255,255,0.86);
+            white-space: pre-wrap;
+        }
+        #assetInspectorBody {
+            margin: 0;
+            padding: 10px;
+            max-height: calc(min(72vh, 720px) - 96px);
+            overflow: auto;
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.32;
+            color: rgba(255,255,255,0.9);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        #characterCreatorDialog {
+            width: min(500px, calc(100vw - 24px));
+            height: calc(100vh - 24px);
+            max-height: 900px;
+            padding: 0;
+            margin: 12px 12px 12px auto;
+            border: 1px solid #3d4248;
+            border-radius: 8px;
+            background: #17191c;
+            color: #f3f4f5;
+            font-family: Arial, sans-serif;
+            box-shadow: 0 18px 56px rgba(0, 0, 0, 0.5);
+        }
+        #characterCreatorDialog::backdrop { background: rgba(0, 0, 0, 0.28); }
+        .character-creator-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-height: 58px;
+            padding: 0 16px;
+            border-bottom: 1px solid #30343a;
+        }
+        .character-creator-header h2 { margin: 0; font-size: 17px; letter-spacing: 0; }
+        .character-creator-icon-button {
+            width: 34px;
+            height: 34px;
+            padding: 0;
+            border: 0;
+            border-radius: 4px;
+            background: transparent;
+            color: #fff;
+            font-size: 22px;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .character-creator-icon-button:hover { background: #2a2e33; }
+        .character-creator-sex {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            padding: 12px 16px;
+            border-bottom: 1px solid #30343a;
+        }
+        .character-creator-sex button, .character-creator-tabs button, .character-creator-footer button {
+            border: 1px solid #454b52;
+            border-radius: 5px;
+            background: #24282d;
+            color: #f5f6f7;
+            min-height: 34px;
+            padding: 7px 11px;
+            cursor: pointer;
+        }
+        .character-creator-sex button[aria-pressed="true"] {
+            border-color: #e6e8ea;
+            background: #e6e8ea;
+            color: #111315;
+        }
+        .character-creator-tabs {
+            display: flex;
+            gap: 4px;
+            padding: 0 16px 12px;
+            border-bottom: 1px solid #30343a;
+            overflow-x: auto;
+        }
+        .character-creator-tabs button { flex: 0 0 auto; border-color: transparent; background: transparent; color: #aeb3b8; }
+        .character-creator-tabs button[aria-selected="true"] { border-color: #555b62; background: #292d32; color: #fff; }
+        .character-creator-body { height: calc(100% - 220px); overflow: auto; padding: 10px 16px 16px; box-sizing: border-box; }
+        .character-creator-panel[hidden] { display: none; }
+        .appearance-grid { display: grid; grid-template-columns: 1fr; gap: 9px; }
+        .appearance-field { display: grid; grid-template-columns: minmax(112px, 1fr) minmax(112px, 1.25fr) 58px; gap: 8px; align-items: center; }
+        .appearance-field input[type="range"] { width: 100%; }
+        .appearance-field input[type="number"], .appearance-field select {
+            min-width: 0;
+            width: 100%;
+            box-sizing: border-box;
+            background: #23282d;
+            color: #fff;
+            border: 1px solid #454b52;
+            border-radius: 4px;
+            padding: 6px;
+        }
+        #characterCreatorComponents > div { min-height: 34px; }
+        #characterCreatorComponents select {
+            min-width: 0;
+            width: 100%;
+            box-sizing: border-box;
+            background: #23282d;
+            color: #fff;
+            border: 1px solid #454b52;
+            border-radius: 4px;
+            padding: 6px;
+        }
+        .character-creator-footer {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 8px;
+            min-height: 58px;
+            align-items: center;
+            padding: 0 16px;
+            border-top: 1px solid #30343a;
+            box-sizing: border-box;
+        }
+        .character-creator-footer #saveCharacterCreator { background: #e6e8ea; color: #111315; border-color: #e6e8ea; }
+        @media (max-width: 720px) {
+            #characterCreatorDialog { width: calc(100vw - 16px); height: calc(100vh - 16px); margin: 8px; }
+            .appearance-field { grid-template-columns: minmax(100px, 1fr) minmax(100px, 1.2fr) 52px; }
+        }
     </style>
 </head>
 <body>
-    <canvas id="glCanvas"></canvas>
+    <canvas id="glCanvas" tabindex="0"></canvas>
     <div id="perfHud"></div>
+    <div id="weaponHud" hidden>
+        <div id="weaponHudState"></div>
+        <div id="weaponHudAmmo"></div>
+    </div>
+    <div id="meleeHud" hidden>
+        <div class="combat-health-row">
+            <div class="combat-health-label"><span>Health</span><span id="meleePlayerHealthText">100</span></div>
+            <div class="combat-health-track"><div id="meleePlayerHealth" class="combat-health-fill"></div></div>
+        </div>
+        <div id="meleeTargetRow" class="combat-health-row" hidden>
+            <div class="combat-health-label"><span>Target</span><span id="meleeTargetHealthText">100</span></div>
+            <div class="combat-health-track"><div id="meleeTargetHealth" class="combat-health-fill"></div></div>
+        </div>
+    </div>
+    <div id="combatCrosshair" hidden aria-hidden="true"></div>
+    <div id="vehiclePrompt" hidden></div>
+    <div id="deathOverlay" hidden aria-live="assertive">
+        <div id="deathOverlayBand">
+            <div id="deathTitle">WASTED</div>
+            <div id="deathCountdown">RESPAWNING IN 5</div>
+        </div>
+    </div>
+    <div id="assetInspector" aria-live="polite">
+        <div id="assetInspectorHeader">
+            <div id="assetInspectorTitle">Asset metadata</div>
+            <div id="assetInspectorActions">
+                <button id="copyAssetMetadata" type="button">Copy metadata</button>
+                <button id="closeAssetInspector" type="button">Close</button>
+            </div>
+        </div>
+        <div id="assetInspectorSummary"></div>
+        <pre id="assetInspectorBody"></pre>
+    </div>
     <div id="loadingOverlay" style="display: flex;">
         <div id="loadingCard">
             <div id="loadingTitle">Loading world…</div>
@@ -144,10 +516,11 @@
             </div>
         </div>
     </div>
-    <div id="controls">
-        <div class="control-group">
-            <label for="wireframe">Wireframe Mode</label>
-            <input type="checkbox" id="wireframe">
+    <div id="settingsBackdrop" hidden></div>
+    <aside id="controls" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+        <div class="settings-header">
+            <h1 id="settingsTitle">Settings</h1>
+            <button id="closeSettings" type="button">Resume</button>
         </div>
         <div class="control-group">
             <label>Camera</label>
@@ -164,10 +537,20 @@
         </div>
         <div class="control-group">
             <label>Ped</label>
-            <button id="spawnCharacter" style="width: 100%; padding: 6px;">Spawn character (GTA camera)</button>
+            <button id="spawnCharacter" style="width: 100%; padding: 6px;">Spawn character (city)</button>
             <button id="spawnPedCity" style="width: 100%; padding: 6px;">Spawn ped (city)</button>
             <label style="margin-top: 8px;">Character model (name or hash)</label>
-            <input id="characterModel" value="player_zero">
+            <input id="characterModel" value="a_m_y_skater_01">
+            <label style="margin-top: 8px;">NexusAI appearance</label>
+            <select id="runtimeAppearanceSelect" style="width: 100%; padding: 5px;">
+                <option value="">Runtime character</option>
+            </select>
+            <button id="openCharacterCreator" type="button" style="width: 100%; padding: 7px; margin-top: 6px;">Design character</button>
+            <div id="runtimeAppearanceComponents" style="margin-top: 6px; max-height: 280px; overflow: auto; font-size: 12px; line-height: 1.35;"></div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px;">
+                <button id="resetRuntimeAppearance" type="button">Reset outfit</button>
+                <button id="copyRuntimeAppearance" type="button">Copy appearance JSON</button>
+            </div>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enableGameplayCamera" checked>
                 Gameplay camera (smooth follow)
@@ -177,20 +560,28 @@
                 Follow ped
             </label>
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="controlPed">
+                <input type="checkbox" id="controlPed" checked>
                 Control ped (WASD)
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="groundPedToTerrain" checked>
-                Ground ped to terrain (if near ground)
+                Use YBN ground collision
             </label>
             <label style="margin-top: 6px;">Ground snap max ΔZ</label>
             <input id="groundPedMaxDelta" type="number" min="0" max="100000" value="25">
             <label style="margin-top: 8px;">PedCoords (vector4)</label>
-            <input id="pedCoords" value="vector4(-562.3726, 154.1684, NaN, 0.0)">
+              <input id="pedCoords" value="vector4(186.9400, -850.8400, 31.1700, 0.0)">
             <label style="margin-top: 6px;">CamCoords (vector4)</label>
-            <input id="camCoords" value="vector4(-562.3726, 254.1684, 176.3396, 0.0)">
+              <input id="camCoords" value="vector4(186.9400, -858.3400, 33.3700, 0.0)">
             <button id="applyPedCam" style="width: 100%; padding: 6px; margin-top: 6px;">Apply ped+cam</button>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px;">
+                <button id="weaponToggle" type="button">Draw Glock-17</button>
+                <button id="weaponReload" type="button">Reload</button>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px;">
+                <button id="weaponInventory" type="button">Inventory</button>
+                <button id="weaponSwitch" type="button">Install Glock switch</button>
+            </div>
             <div id="pedDebug" style="margin-top: 8px; font-size: 12px; opacity: 0.85; line-height: 1.2;"></div>
             <div id="streamDebug" style="margin-top: 6px; font-size: 12px; opacity: 0.85; line-height: 1.2;"></div>
             <div style="margin-top: 10px; font-size: 12px; opacity: 0.9;">
@@ -203,7 +594,36 @@
             </div>
         </div>
         <div class="control-group">
+            <label>Audio</label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="ambientAudio" checked>
+                Environment audio
+            </label>
+            <label style="margin-top: 6px;">Environment volume</label>
+            <input id="ambientVolume" type="range" min="0" max="1" step="0.01" value="0.28">
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="gameplayAudio" checked>
+                Gameplay sounds
+            </label>
+            <label style="margin-top: 6px;">Effects volume</label>
+            <input id="sfxVolume" type="range" min="0" max="1.5" step="0.01" value="0.8">
+            <label style="margin-top: 8px;">Proximity voice mode</label>
+            <select id="voiceMode">
+                <option value="0">Whisper (3m)</option>
+                <option value="1" selected>Normal (7m)</option>
+                <option value="2">Shouting (15m)</option>
+            </select>
+            <label style="margin-top: 6px;">Voice volume</label>
+            <input id="voiceVolume" type="range" min="0" max="1.5" step="0.01" value="1">
+            <button id="voiceMicToggle" type="button" style="width: 100%; padding: 7px; margin-top: 8px;">Enable microphone</button>
+            <div id="audioStatus" role="status" style="margin-top: 6px; font-size: 12px; opacity: 0.82;">MIC OFF | NORMAL 7M</div>
+        </div>
+        <div class="control-group">
             <label>Scene</label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="assetPicker">
+                Asset picker
+            </label>
             <div style="margin-top: 6px; font-size: 12px; opacity: 0.75; line-height: 1.25;">
                 Note: collisions (YBN), interiors (MLO), and lights are not implemented in this WebGL viewer.
             </div>
@@ -254,13 +674,34 @@
             <button id="applyHighDetail" style="width: 100%; padding: 6px; margin-top: 8px;">
                 Apply High Detail (GTA-like)
             </button>
+            <label style="margin-top: 10px; font-weight: 700;">Layer rendering</label>
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="showTerrain" checked>
-                Show terrain (heightmap)
+                <input type="checkbox" id="showPlayer" checked>
+                Show player
             </label>
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="showBuildings" checked>
-                Show buildings/water mesh (OBJ)
+                <input type="checkbox" id="showNpcs" checked>
+                Show NPC pedestrians
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="playerTextured" checked>
+                Player model + textures
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showTerrain">
+                Show spawn-aligned GTA height proxy (debug)
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="terrainTextured">
+                Landscape proxy textures
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showBuildings">
+                Show buildings/water mesh (OBJ fallback)
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="buildingsTextured">
+                Buildings model + textures
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
                 <input type="checkbox" id="showWater" checked>
@@ -276,10 +717,14 @@
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="showModels" checked>
-                Show GTA models (experimental)
+                Show GTA objects (streamed drawables)
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="objectsTextured">
+                Objects model + textures
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
-                <input type="checkbox" id="crossArchetypeInstancing" checked>
+                <input type="checkbox" id="crossArchetypeInstancing">
                 Cross-archetype instancing (group by mesh + material)
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
@@ -292,34 +737,44 @@
             </label>
             <button id="dumpMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Dump missing archetypes (console)</button>
             <button id="downloadMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Download missing archetypes (json)</button>
+            <button id="resolveMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Resolve visible missing archetypes</button>
             <label style="margin-top: 10px;">Streaming radius (chunks)</label>
-            <input id="streamRadius" type="number" min="1" max="24" value="6">
+            <input id="streamRadius" type="number" min="1" max="24" value="1">
             <label style="margin-top: 6px;">Max loaded chunks</label>
-            <input id="maxLoadedChunks" type="number" min="9" max="4000" value="250">
+            <input id="maxLoadedChunks" type="number" min="9" max="4000" value="9">
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="streamFromCamera" checked>
-                Stream around camera (faster first-view)
+                <input type="checkbox" id="streamFromCamera">
+                Use camera focus in free map
             </label>
             <label style="margin-top: 6px;">Max archetypes (instanced meshes) (0 = unlimited)</label>
-            <input id="maxArchetypes" type="number" min="0" value="900">
+            <input id="maxArchetypes" type="number" min="0" value="96">
             <label style="margin-top: 6px;">Model stream distance (data units)</label>
-            <input id="maxModelDistance" type="number" min="0" max="100000" value="1200">
+            <input id="maxModelDistance" type="number" min="0" max="100000" value="320">
+            <label style="margin-top: 6px;">Max visible object instances</label>
+            <input id="maxVisibleInstances" type="number" min="1" max="1000000" value="12000">
+            <label style="margin-top: 6px;">Max instances per archetype</label>
+            <input id="maxInstancesPerArchetype" type="number" min="1" max="100000" value="128">
             <label style="margin-top: 6px;">Mesh loads in flight</label>
-            <input id="maxMeshLoadsInFlight" type="number" min="1" max="64" value="8">
+            <input id="maxMeshLoadsInFlight" type="number" min="1" max="64" value="3">
             <label style="margin-top: 10px;">Streaming preset</label>
             <select id="streamPreset">
-                <option value="game">Game-like</option>
+                <option value="game">Gameplay (low memory)</option>
                 <option value="city">City (heavier)</option>
-                <option value="extreme">Extreme (may hitch/crash)</option>
+                <option value="high">High detail</option>
             </select>
             <button id="applyStreamPreset" style="width: 100%; padding: 6px;">Apply preset</button>
+            <button id="applyMemorySaver" style="width: 100%; padding: 6px; margin-top: 6px;">Memory saver</button>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="frustumCulling" checked>
                 Frustum culling
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enableOcclusionCulling">
-                Occlusion culling (experimental)
+                Occlusion culling (world depth)
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enableWebGpuCulling">
+                WebGPU culling (experimental)
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enableShadows">
@@ -338,7 +793,7 @@
             <div style="margin-top: 10px; font-size: 12px; opacity: 0.9;">
                 <div style="font-weight: 700; margin-bottom: 4px;">Persistence + cache</div>
                 <label style="margin-top: 6px;">
-                    <input type="checkbox" id="restoreOnRefresh" checked>
+                    <input type="checkbox" id="restoreOnRefresh">
                     Restore view on refresh (camera + settings)
                 </label>
                 <label style="margin-top: 6px;">
@@ -356,7 +811,7 @@
             <select id="textureQuality">
                 <option value="high">High</option>
                 <option value="medium">Medium</option>
-                <option value="low">Low</option>
+                <option value="low" selected>Low</option>
             </select>
         </div>
         <div class="control-group">
@@ -364,7 +819,7 @@
             <select id="lodLevel">
                 <option value="0">Full Detail</option>
                 <option value="1">Medium</option>
-                <option value="2">Low</option>
+                <option value="2" selected>Low</option>
             </select>
         </div>
         <div class="control-group">
@@ -379,7 +834,67 @@
             <input id="rpfExtractPath" placeholder="common/data/levels/gta5/..." />
             <button id="rpfExtractBtn" style="width: 100%; padding: 6px; margin-top: 6px;">Extract to download</button>
         </div>
-    </div>
+    </aside>
+    <dialog id="characterCreatorDialog" aria-labelledby="characterCreatorTitle">
+        <div class="character-creator-header">
+            <h2 id="characterCreatorTitle">Illenium Appearance</h2>
+            <button id="closeCharacterCreator" class="character-creator-icon-button" type="button" aria-label="Close character appearance" title="Close">&times;</button>
+        </div>
+        <div class="character-creator-sex" role="group" aria-label="Character sex">
+            <button type="button" data-character-sex="male" aria-pressed="false">Male</button>
+            <button type="button" data-character-sex="female" aria-pressed="false">Female</button>
+        </div>
+        <div class="character-creator-tabs" role="tablist" aria-label="Appearance sections">
+            <button type="button" role="tab" data-character-tab="clothing" aria-selected="true">Clothing</button>
+            <button type="button" role="tab" data-character-tab="heritage" aria-selected="false">Heritage</button>
+            <button type="button" role="tab" data-character-tab="face" aria-selected="false">Face</button>
+            <button type="button" role="tab" data-character-tab="overlays" aria-selected="false">Overlays</button>
+            <button type="button" role="tab" data-character-tab="props" aria-selected="false">Props</button>
+        </div>
+        <div class="character-creator-body">
+            <section class="character-creator-panel" data-character-panel="clothing">
+                <div id="characterCreatorComponents"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="heritage" hidden>
+                <div id="characterCreatorHeritage" class="appearance-grid"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="face" hidden>
+                <div id="characterCreatorFace" class="appearance-grid"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="overlays" hidden>
+                <div id="characterCreatorOverlays" class="appearance-grid"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="props" hidden>
+                <div id="characterCreatorProps" class="appearance-grid"></div>
+            </section>
+        </div>
+        <div class="character-creator-footer">
+            <button id="cancelCharacterCreator" type="button">Cancel</button>
+            <button id="copyCharacterCreator" type="button">Copy JSON</button>
+            <button id="saveCharacterCreator" type="button">Save appearance</button>
+        </div>
+    </dialog>
+    <dialog id="weaponInventoryDialog" aria-labelledby="weaponInventoryTitle">
+        <div class="inventory-header">
+            <h2 id="weaponInventoryTitle">Inventory</h2>
+            <button id="closeWeaponInventory" type="button">Close</button>
+        </div>
+        <div class="inventory-list">
+            <div class="inventory-item">
+                <div>
+                    <div class="inventory-item-name" id="inventoryWeaponName">Glock-17</div>
+                    <div class="inventory-item-meta" id="inventoryWeaponMeta"></div>
+                </div>
+            </div>
+            <div class="inventory-item">
+                <div>
+                    <div class="inventory-item-name">Glock switch</div>
+                    <div class="inventory-item-meta" id="inventorySwitchMeta"></div>
+                </div>
+                <button id="inventoryApplySwitch" type="button">Apply</button>
+            </div>
+        </div>
+    </dialog>
     <!-- gl-matrix is imported via ESM in js/glmatrix.js (Vite dev/build). -->
     <div id="fatalOverlay" style="
         position: fixed;
@@ -416,8 +931,9 @@
         const clamp01 = (v) => Math.max(0, Math.min(1, Number(v)));
         const setLoading = (state) => {
           const s = state || {};
-          const visible = (s.visible === undefined) ? true : !!s.visible;
-          if (loadingOverlayEl) loadingOverlayEl.style.display = visible ? 'flex' : 'none';
+          if (loadingOverlayEl && s.visible !== undefined) {
+            loadingOverlayEl.style.display = s.visible ? 'flex' : 'none';
+          }
           if (loadingTitleEl && s.title !== undefined) loadingTitleEl.textContent = String(s.title || '');
           if (loadingDetailEl && s.detail !== undefined) loadingDetailEl.textContent = String(s.detail || '');
           if (loadingBarInnerEl && s.progress !== undefined) {
@@ -452,4 +968,4 @@
     </script>
     <script type="module" src="js/main.js"></script>
 </body>
-</html> 
+</html>

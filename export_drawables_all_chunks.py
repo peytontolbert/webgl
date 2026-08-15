@@ -17,9 +17,15 @@ import sys
 
 from gta5_modules.script_paths import auto_assets_dir
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
+    ap.add_argument("--game-path", default=(os.getenv("gta_location") or os.getenv("gta5_path") or ""), help="GTA5 install folder (or set gta_location/gta5_path)")
     ap.add_argument("--assets-dir", default="", help="WebGL viewer assets directory (auto if omitted)")
     ap.add_argument("--selected-dlc", default="all", help="Forwarded to export_drawables_for_chunk.py (CodeWalker DLC level).")
     ap.add_argument(
@@ -38,6 +44,7 @@ def main():
     ap.add_argument("--max-archetypes", type=int, default=0, help="Limit archetypes per chunk (0 = no limit)")
     ap.add_argument("--skip-existing", action="store_true", help="Skip archetypes already present in assets/models/manifest.json")
     ap.add_argument("--force", action="store_true", help="Force re-export mesh bins even if present in manifest (useful after exporter changes)")
+    ap.add_argument("--keep-going", action="store_true", help="Continue after a per-chunk exporter failure")
     ap.add_argument(
         "--export-textures",
         action="store_true",
@@ -110,9 +117,15 @@ def main():
                 cmd += ["--base-pack", str(args.base_pack)]
 
             print(f"[{i+1}/{len(chunks)}] exporting chunk {key} (selected_dlc={selected_dlc}) ...")
+            print("  " + subprocess.list2cmdline(cmd))
             cp = subprocess.run(cmd, check=False)
             if int(getattr(cp, "returncode", 0) or 0) != 0:
                 failures.append({"chunk": key, "returncode": int(cp.returncode), "cmd": cmd})
+                msg = f"Chunk {key} exporter failed with exit code {cp.returncode}"
+                if args.keep_going:
+                    print("Warning: " + msg)
+                    continue
+                raise SystemExit(msg)
         return failures
 
     failures = []

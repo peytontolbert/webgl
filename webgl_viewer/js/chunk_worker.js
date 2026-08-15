@@ -2,12 +2,12 @@
 // and build per-archetype packed instance-matrix buffers.
 //
 // Protocol (main -> worker):
-// - { type:'begin_ndjson', reqId:number, camData:[x,y,z], storeKey?:string, storeOnly?:boolean }
+// - { type:'begin_ndjson', reqId:number, camData:[x,y,z], storeKey?:string, storeOnly?:boolean, worldBounds?:object }
 // - { type:'chunk', reqId:number, buffer:ArrayBuffer, offset:number, length:number }
 // - { type:'end', reqId:number }
-// - { type:'parse_ent1', reqId:number, camData:[x,y,z], buffer:ArrayBuffer, storeKey?:string, storeOnly?:boolean }
+// - { type:'parse_ent1', reqId:number, camData:[x,y,z], buffer:ArrayBuffer, storeKey?:string, storeOnly?:boolean, worldBounds?:object }
 // - { type:'cancel', reqId:number }
-// - { type:'rebuild_stored', reqId:number, keys:string[], camData:[x,y,z], camDir:[x,y,z], maxCandidates:number, maxModelDistance:number, behindPenalty:number }
+// - { type:'rebuild_stored', reqId:number, keys:string[], camData:[x,y,z], camDir:[x,y,z], maxCandidates:number, maxModelDistance:number, behindPenalty:number, frustumPlanes?:Float32Array|number[], cullRadiusEntries?:Array<[hash,radius]> }
 // - { type:'drop_stored', reqId:number, keys:string[] }
 //
 // Protocol (worker -> main):
@@ -16,6 +16,80 @@
 // - { type:'result', reqId, ok:false, error:string }
 
 import { joaat } from './joaat.js';
+import { createWasmCuller } from './wasm_culler.js';
+import { canAttemptWebGpuCulling, createWebGpuCuller, getWebGpuCullingAvailability } from './webgpu_culler.js';
+
+let _wasmCuller = null;
+let _wasmCullerFailed = false;
+let _webGpuCuller = null;
+let _webGpuCullerFailed = false;
+let _webGpuCullerPromise = null;
+let _webGpuMatrixScratch = new Float32Array(0);
+let _webGpuRadiusScratch = new Float32Array(0);
+let _webGpuOwnerScratch = new Uint32Array(0);
+
+function _nextScratchCapacity(required) {
+  const value = Math.max(1, Math.ceil(Number(required) || 0));
+  return 2 ** Math.ceil(Math.log2(value));
+}
+
+function _getWebGpuScratch(instanceCount, stride) {
+  const matrixFloats = instanceCount * stride;
+  if (_webGpuMatrixScratch.length < matrixFloats) {
+    _webGpuMatrixScratch = new Float32Array(_nextScratchCapacity(matrixFloats));
+  }
+  if (_webGpuRadiusScratch.length < instanceCount) {
+    _webGpuRadiusScratch = new Float32Array(_nextScratchCapacity(instanceCount));
+  }
+  if (_webGpuOwnerScratch.length < instanceCount) {
+    _webGpuOwnerScratch = new Uint32Array(_nextScratchCapacity(instanceCount));
+  }
+  return {
+    matrices: _webGpuMatrixScratch.subarray(0, matrixFloats),
+    radii: _webGpuRadiusScratch.subarray(0, instanceCount),
+    owners: _webGpuOwnerScratch.subarray(0, instanceCount),
+  };
+}
+
+function _getWasmCuller() {
+  if (_wasmCullerFailed) return null;
+  if (_wasmCuller) return _wasmCuller;
+  try {
+    _wasmCuller = createWasmCuller();
+    if (!_wasmCuller) _wasmCullerFailed = true;
+    return _wasmCuller;
+  } catch {
+    _wasmCullerFailed = true;
+    _wasmCuller = null;
+    return null;
+  }
+}
+
+async function _getWebGpuCuller() {
+  if (_webGpuCullerFailed) return null;
+  if (_webGpuCuller) return _webGpuCuller;
+  if (!canAttemptWebGpuCulling()) {
+    _webGpuCullerFailed = true;
+    return null;
+  }
+  if (!_webGpuCullerPromise) {
+    _webGpuCullerPromise = createWebGpuCuller()
+      .then((culler) => {
+        _webGpuCuller = culler || null;
+        if (!_webGpuCuller) _webGpuCullerFailed = true;
+        return _webGpuCuller;
+      })
+      .catch(() => {
+        _webGpuCullerFailed = true;
+        _webGpuCuller = null;
+        return null;
+      })
+      .finally(() => {
+        _webGpuCullerPromise = null;
+      });
+  }
+  return await _webGpuCullerPromise;
+}
 
 function _normalizeId(id) {
   if (id === null || id === undefined) return null;
@@ -75,6 +149,75 @@ function _safeTintIndex(v, fallback = 0) {
   if (!Number.isFinite(n0)) return fallback;
   const n = Math.floor(n0);
   return Math.max(0, Math.min(255, n));
+}
+
+function _isWithinWorldBounds(bounds, x, y) {
+  if (!bounds || typeof bounds !== 'object') return true;
+  const minX = Number(bounds.minX);
+  const minY = Number(bounds.minY);
+  const maxX = Number(bounds.maxX);
+  const maxY = Number(bounds.maxY);
+  if (![minX, minY, maxX, maxY].every(Number.isFinite) || maxX <= minX || maxY <= minY) return true;
+  return x >= minX && x <= maxX && y >= minY && y <= maxY;
+}
+
+function _instanceTransformSignature(arr, offset, stride) {
+  // YMAP exports can repeat the same drawable record through overlapping map
+  // layers. Quantizing to exporter precision makes the comparison stable while
+  // retaining rotation, scale, translation, and tint differences.
+  const q = (index, scale) => {
+    const n = Number(arr[offset + index]);
+    return Number.isFinite(n) ? Math.round(n * scale) : 0;
+  };
+  return [
+    q(0, 10000), q(1, 10000), q(2, 10000),
+    q(4, 10000), q(5, 10000), q(6, 10000),
+    q(8, 10000), q(9, 10000), q(10, 10000),
+    q(12, 1000), q(13, 1000), q(14, 1000),
+    stride >= 17 ? q(16, 1) : 0,
+  ].join(',');
+}
+
+function _parseFrustumPlanes(raw) {
+  if (!raw) return null;
+  const a = (Array.isArray(raw) || ArrayBuffer.isView(raw)) ? raw : null;
+  if (!a || a.length < 24) return null;
+  const out = new Float32Array(24);
+  for (let i = 0; i < 24; i++) {
+    const n = Number(a[i]);
+    if (!Number.isFinite(n)) return null;
+    out[i] = n;
+  }
+  return out;
+}
+
+function _sphereIntersectsPlanes(planes, x, y, z, radius) {
+  if (!planes || planes.length < 24) return true;
+  const r = Math.max(0.0, Number(radius) || 0.0);
+  for (let i = 0; i < 6; i++) {
+    const o = i * 4;
+    if ((planes[o] * x + planes[o + 1] * y + planes[o + 2] * z + planes[o + 3]) < -r) return false;
+  }
+  return true;
+}
+
+function _instanceMaxScale(arr, offset) {
+  const sx = Math.hypot(Number(arr[offset + 0]) || 0, Number(arr[offset + 1]) || 0, Number(arr[offset + 2]) || 0);
+  const sy = Math.hypot(Number(arr[offset + 4]) || 0, Number(arr[offset + 5]) || 0, Number(arr[offset + 6]) || 0);
+  const sz = Math.hypot(Number(arr[offset + 8]) || 0, Number(arr[offset + 9]) || 0, Number(arr[offset + 10]) || 0);
+  const s = Math.max(sx, sy, sz);
+  return Number.isFinite(s) && s > 0 ? s : 1.0;
+}
+
+function _radiusMapFromEntries(entries) {
+  const out = new Map();
+  if (!Array.isArray(entries)) return out;
+  for (const it of entries) {
+    const hash = String(Array.isArray(it) ? it[0] : it?.hash ?? '');
+    const radius = Number(Array.isArray(it) ? it[1] : it?.radius);
+    if (hash && Number.isFinite(radius) && radius > 0) out.set(hash, radius);
+  }
+  return out;
 }
 
 function _fromRotationTranslationScale(out16, qx, qy, qz, qw, px, py, pz, sx, sy, sz) {
@@ -168,6 +311,12 @@ function _sendProgress(job) {
 }
 
 function _accumEntity(job, archetypeId, pos, rotQuat, scale, tintIndex = 0, guid = 0, mloParentGuid = 0, mloEntitySetHash = 0, mloFlags = 0, ymapHash = 0) {
+  // Position: accept [x,y,z] or {x,y,z}/{X,Y,Z}
+  const px = _safeNum(Array.isArray(pos) ? pos?.[0] : (pos?.x ?? pos?.X), 0.0);
+  const py = _safeNum(Array.isArray(pos) ? pos?.[1] : (pos?.y ?? pos?.Y), 0.0);
+  const pz = _safeNum(Array.isArray(pos) ? pos?.[2] : (pos?.z ?? pos?.Z), 0.0);
+  if (!_isWithinWorldBounds(job.worldBounds, px, py)) return;
+
   const hash = _normalizeId(archetypeId);
   if (!hash) {
     job.badArchetype++;
@@ -184,11 +333,6 @@ function _accumEntity(job, archetypeId, pos, rotQuat, scale, tintIndex = 0, guid
   job.withArchetype++;
 
   job.archetypeCounts.set(hash, (job.archetypeCounts.get(hash) ?? 0) + 1);
-
-  // Position: accept [x,y,z] or {x,y,z}/{X,Y,Z}
-  const px = _safeNum(Array.isArray(pos) ? pos?.[0] : (pos?.x ?? pos?.X), 0.0);
-  const py = _safeNum(Array.isArray(pos) ? pos?.[1] : (pos?.y ?? pos?.Y), 0.0);
-  const pz = _safeNum(Array.isArray(pos) ? pos?.[2] : (pos?.z ?? pos?.Z), 0.0);
 
   const dx = px - job.camX;
   const dy = py - job.camY;
@@ -361,7 +505,7 @@ function _finalizeNdjsonJob(job) {
   _deleteJob(job.reqId);
 }
 
-function _parseEnt1(reqId, camData, buffer, { storeKey = null, storeOnly = false } = {}) {
+function _parseEnt1(reqId, camData, buffer, { storeKey = null, storeOnly = false, worldBounds = null } = {}) {
   const camX = _safeNum(camData?.[0], 0.0);
   const camY = _safeNum(camData?.[1], 0.0);
   const camZ = _safeNum(camData?.[2], 0.0);
@@ -402,6 +546,7 @@ function _parseEnt1(reqId, camData, buffer, { storeKey = null, storeOnly = false
     const px = dv.getFloat32(off + 4, true);
     const py = dv.getFloat32(off + 8, true);
     const pz = dv.getFloat32(off + 12, true);
+    if (!_isWithinWorldBounds(worldBounds, px, py)) continue;
 
     const qx = dv.getFloat32(off + 16, true);
     const qy = dv.getFloat32(off + 20, true);
@@ -469,7 +614,7 @@ function _parseEnt1(reqId, camData, buffer, { storeKey = null, storeOnly = false
   }
 }
 
-self.onmessage = (e) => {
+self.onmessage = async (e) => {
   const msg = e?.data || {};
   const type = String(msg.type || '');
   const reqId = Number(msg.reqId);
@@ -499,10 +644,23 @@ self.onmessage = (e) => {
       const maxCandidates = Math.max(0, Math.floor(Number(msg.maxCandidates ?? 0)));
       const maxD = Number.isFinite(Number(msg.maxModelDistance)) ? Math.max(0, Number(msg.maxModelDistance)) : 1e30;
       const behindPenalty = Number.isFinite(Number(msg.behindPenalty)) ? Math.max(1.0, Number(msg.behindPenalty)) : 1.6;
+      const maxVisibleInstances = Math.max(1, Math.floor(Number(msg.maxVisibleInstances ?? 12000)));
+      const maxInstancesPerArchetype = Math.max(1, Math.floor(Number(msg.maxInstancesPerArchetype ?? 128)));
+      const maxBehindDistance = Math.min(maxD, Math.max(24.0, Number(msg.maxBehindModelDistance ?? (maxD * 0.55))));
+      const nonRenderableHashes = new Set(
+        (Array.isArray(msg.nonRenderableHashes) ? msg.nonRenderableHashes : []).map((h) => String(h))
+      );
+      const frustumPlanes = _parseFrustumPlanes(msg.frustumPlanes);
+      const radiusByHash = _radiusMapFromEntries(msg.cullRadiusEntries);
+      const frustumPadding = Math.max(0.0, _safeNum(msg.frustumPadding, 0.0));
+      let frustumTested = 0;
+      let frustumCulled = 0;
 
       // Aggregate per-hash slices across stored chunks.
-      const stride = 21; // 16 mat + tint + guid + mloParentGuid + mloEntitySetHash + flags
-      /** @type {Map<string, { totalLen:number, bestDist2:number, bestDot:number, slices:Array<{arr:Float32Array, off:number, len:number}> }>} */
+      // Current parser output is v4: 16 mat + tint + guid + MLO metadata + ymap hash.
+      // The historic 21-float stride corrupts positions during rebuild distance selection.
+      const stride = 22;
+      /** @type {Map<string, { totalLen:number, bestDist2:number, bestDot:number, frustumAny:boolean, slices:Array<{arr:Float32Array, off:number, len:number, visibleIndices?:Uint32Array}> }>} */
       const infos = new Map();
 
       for (const k0 of keys) {
@@ -515,38 +673,245 @@ self.onmessage = (e) => {
         for (const it of idx) {
           const hash = String(it?.hash ?? '');
           if (!hash) continue;
+          if (nonRenderableHashes.has(hash)) continue;
           const off = Math.max(0, Math.floor(Number(it?.offsetFloats ?? 0)));
           const len = Math.max(0, Math.floor(Number(it?.lengthFloats ?? 0)));
           if (!len) continue;
 
           let info = infos.get(hash);
           if (!info) {
-            info = { totalLen: 0, bestDist2: 1e30, bestDot: 0.0, slices: [] };
+            info = { totalLen: 0, bestDist2: 1e30, bestDot: 0.0, frustumAny: false, slices: [] };
             infos.set(hash, info);
           }
           info.totalLen += len;
           info.slices.push({ arr, off, len });
+        }
+      }
 
-          // Update bestDist2/bestDot for this hash from this slice.
-          for (let i = off; i + (stride - 1) < (off + len); i += stride) {
-            const px = arr[i + 12];
-            const py = arr[i + 13];
-            const pz = arr[i + 14];
+      let sourceInstances = 0;
+      for (const info of infos.values()) sourceInstances += Math.floor(info.totalLen / stride);
+
+      const isDemoRebuild = keys.some((k) => String(k || '').startsWith('__demo_'));
+      const wasmMinInstances = Math.max(1, Math.floor(Number(msg.wasmCullingMinInstances ?? 50000)));
+      const wasmMinSliceInstances = Math.max(1, Math.floor(Number(msg.wasmCullingMinSliceInstances ?? 512)));
+      const wasmRequested = !!msg.enableWasmCulling && !isDemoRebuild && sourceInstances >= wasmMinInstances;
+      const wasmCuller = wasmRequested ? _getWasmCuller() : null;
+      const wasmStats = { enabled: !!wasmCuller, tested: 0, kept: 0, rejected: 0 };
+      const webGpuMinInstances = Math.max(1, Math.floor(Number(msg.webGpuCullingMinInstances ?? 100000)));
+      const webGpuMinSliceInstances = Math.max(1, Math.floor(Number(msg.webGpuCullingMinSliceInstances ?? 2048)));
+      let webGpuReason = 'disabled';
+      if (msg.enableWebGpuCulling) {
+        webGpuReason = sourceInstances >= webGpuMinInstances
+          ? 'requested'
+          : `below-min-instances:${sourceInstances}<${webGpuMinInstances}`;
+      }
+      const webGpuAvailability = getWebGpuCullingAvailability();
+      const webGpuApiAvailable = webGpuAvailability.available;
+      if (msg.enableWebGpuCulling && sourceInstances >= webGpuMinInstances && !webGpuApiAvailable) {
+        webGpuReason = webGpuAvailability.reason;
+      }
+      const webGpuRequested = !!msg.enableWebGpuCulling && sourceInstances >= webGpuMinInstances && webGpuApiAvailable;
+      const webGpuCuller = webGpuRequested ? await _getWebGpuCuller() : null;
+      if (webGpuCuller) {
+        webGpuReason = 'enabled';
+      } else if (webGpuRequested) {
+        webGpuReason = 'adapter-or-device-unavailable';
+      }
+      const webGpuStats = { enabled: !!webGpuCuller, tested: 0, kept: 0, rejected: 0 };
+      const consumeVisibleIndices = (info, slice, indices) => {
+        if (!(indices instanceof Uint32Array)) return;
+        if (indices.length > 0) info.frustumAny = true;
+        for (let n = 0; n < indices.length; n++) {
+          const i = slice.off + (indices[n] * stride);
+          const px = slice.arr[i + 12];
+          const py = slice.arr[i + 13];
+          const pz = slice.arr[i + 14];
+          const dx = px - cx;
+          const dy = py - cy;
+          const dz = pz - cz;
+          const dist2 = dx * dx + dy * dy + dz * dz;
+          if (dist2 < info.bestDist2) {
+            info.bestDist2 = dist2;
+            info.bestDot = dx * fx + dy * fy + dz * fz;
+          }
+        }
+      };
+      const webGpuHandledSlices = new Set();
+      const runWebGpuBatch = async () => {
+        if (!webGpuCuller) return false;
+        const batchSlices = [];
+        let totalCount = 0;
+        for (const [hash, info] of infos.entries()) {
+          const hasFrustumRadius = !!(frustumPlanes && radiusByHash.has(hash));
+          const baseRadius = hasFrustumRadius ? Math.max(0.5, _safeNum(radiusByHash.get(hash), 0.5)) : 0.0;
+          for (const slice of info.slices) {
+            const count = Math.floor(Number(slice.len ?? 0) / stride);
+            if (count < webGpuMinSliceInstances) continue;
+            batchSlices.push({ info, slice, start: totalCount, count, radius: baseRadius });
+            totalCount += count;
+          }
+        }
+        if (!batchSlices.length || totalCount <= 0) {
+          webGpuReason = 'no-eligible-slices';
+          return false;
+        }
+
+        const scratch = _getWebGpuScratch(totalCount, stride);
+        const matrices = scratch.matrices;
+        const radii = scratch.radii;
+        const ownerByInstance = scratch.owners;
+        for (let owner = 0; owner < batchSlices.length; owner++) {
+          const item = batchSlices[owner];
+          const dstFloat = item.start * stride;
+          const sourceLength = item.count * stride;
+          matrices.set(item.slice.arr.subarray(item.slice.off, item.slice.off + sourceLength), dstFloat);
+          radii.fill(item.radius, item.start, item.start + item.count);
+          ownerByInstance.fill(owner, item.start, item.start + item.count);
+        }
+
+        try {
+          const res = await webGpuCuller.cullIndices({
+            matrices,
+            lengthFloats: matrices.length,
+            stride,
+            planes: frustumPlanes,
+            useFrustum: !!frustumPlanes,
+            radii,
+            padding: frustumPadding,
+            cam: [cx, cy, cz],
+            dir: [fx, fy, fz],
+            maxDistance: maxD,
+            maxBehindDistance,
+            maxOut: totalCount,
+          });
+          if (!res || !(res.indices instanceof Uint32Array)) {
+            webGpuReason = 'invalid-compute-output';
+            return false;
+          }
+          webGpuStats.tested += Math.max(0, Math.floor(Number(res.tested) || 0));
+          webGpuStats.kept += Math.max(0, Math.floor(Number(res.visible) || 0));
+          webGpuStats.rejected += Math.max(0, Math.floor(Number(res.rejected) || 0));
+          const visibleCounts = new Uint32Array(batchSlices.length);
+          for (let i = 0; i < res.indices.length; i++) {
+            const globalIndex = res.indices[i] >>> 0;
+            if (globalIndex >= totalCount) continue;
+            const owner = ownerByInstance[globalIndex] >>> 0;
+            if (owner < batchSlices.length) visibleCounts[owner]++;
+          }
+          const visibleBySlice = Array.from(
+            visibleCounts,
+            (count) => new Uint32Array(count),
+          );
+          const visibleCursors = new Uint32Array(batchSlices.length);
+          for (let i = 0; i < res.indices.length; i++) {
+            const globalIndex = res.indices[i] >>> 0;
+            if (globalIndex >= totalCount) continue;
+            const owner = ownerByInstance[globalIndex] >>> 0;
+            const item = batchSlices[owner];
+            if (!item) continue;
+            visibleBySlice[owner][visibleCursors[owner]++] = globalIndex - item.start;
+          }
+          for (let owner = 0; owner < batchSlices.length; owner++) {
+            const item = batchSlices[owner];
+            const indices = visibleBySlice[owner];
+            item.slice.visibleIndices = indices;
+            webGpuHandledSlices.add(item.slice);
+            consumeVisibleIndices(item.info, item.slice, indices);
+          }
+          webGpuReason = `enabled-batched:${batchSlices.length}`;
+          return true;
+        } catch {
+          _webGpuCullerFailed = true;
+          try { _webGpuCuller?.destroy?.(); } catch { /* ignore */ }
+          _webGpuCuller = null;
+          webGpuReason = 'compute-failed';
+          return false;
+        }
+      };
+      const runWasmSlice = (hash, slice, baseRadius, useFrustumForHash) => {
+        if (!wasmCuller || !slice || !slice.arr) return null;
+        const count = Math.floor(Number(slice.len ?? 0) / stride);
+        if (count < wasmMinSliceInstances) return null;
+        try {
+          const res = wasmCuller.cullIndices({
+            matrices: slice.arr,
+            offsetFloats: slice.off,
+            lengthFloats: slice.len,
+            stride,
+            planes: frustumPlanes,
+            useFrustum: !!useFrustumForHash,
+            radius: baseRadius,
+            padding: frustumPadding,
+            cam: [cx, cy, cz],
+            dir: [fx, fy, fz],
+            maxDistance: maxD,
+            maxBehindDistance,
+            maxOut: count,
+          });
+          if (!res || !(res.indices instanceof Uint32Array)) return null;
+          wasmStats.tested += Math.max(0, Math.floor(Number(res.tested) || 0));
+          wasmStats.kept += Math.max(0, Math.floor(Number(res.visible) || 0));
+          wasmStats.rejected += Math.max(0, Math.floor(Number(res.rejected) || 0));
+          slice.visibleIndices = res.indices;
+          return res.indices;
+        } catch {
+          _wasmCullerFailed = true;
+          _wasmCuller = null;
+          return null;
+        }
+      };
+
+      await runWebGpuBatch();
+
+      // Update bestDist2/bestDot after optional bulk culling.
+      for (const [hash, info] of infos.entries()) {
+        const hasFrustumRadius = !!(frustumPlanes && radiusByHash.has(hash));
+        const baseRadius = hasFrustumRadius ? Math.max(0.5, _safeNum(radiusByHash.get(hash), 0.5)) : 0.0;
+        for (const s of info.slices) {
+          if (webGpuHandledSlices.has(s)) continue;
+
+          const wasmIndices = runWasmSlice(hash, s, baseRadius, hasFrustumRadius);
+          if (wasmIndices) {
+            consumeVisibleIndices(info, s, wasmIndices);
+            continue;
+          }
+
+          let jsVisibleIndices = null;
+          let localIndex = 0;
+          for (let i = s.off; i + (stride - 1) < (s.off + s.len); i += stride) {
+            const px = s.arr[i + 12];
+            const py = s.arr[i + 13];
+            const pz = s.arr[i + 14];
+            if (hasFrustumRadius) {
+              if (!jsVisibleIndices) jsVisibleIndices = [];
+              frustumTested++;
+              const radius = baseRadius * Math.max(1.0, _instanceMaxScale(s.arr, i)) + frustumPadding;
+              if (!_sphereIntersectsPlanes(frustumPlanes, px, py, pz, radius)) {
+                frustumCulled++;
+                localIndex++;
+                continue;
+              }
+              jsVisibleIndices.push(localIndex);
+            }
+            info.frustumAny = true;
             const dx = px - cx;
             const dy = py - cy;
             const dz = pz - cz;
             const dist2 = dx * dx + dy * dy + dz * dz;
             if (dist2 < info.bestDist2) {
               info.bestDist2 = dist2;
-              info.bestDot = dx * fx + dy * fy + dz * fz;
+                info.bestDot = dx * fx + dy * fy + dz * fz;
             }
+            localIndex++;
           }
+          if (jsVisibleIndices) s.visibleIndices = Uint32Array.from(jsVisibleIndices);
         }
       }
 
       // Score + pick candidates.
       const scored = [];
       for (const [hash, info] of infos.entries()) {
+        if (frustumPlanes && radiusByHash.has(hash) && !info.frustumAny) continue;
         const d = Math.sqrt(Math.max(0, info.bestDist2));
         if (d > maxD) continue;
         const ba = (Number(info.bestDot) >= 0) ? 1.0 : behindPenalty;
@@ -555,23 +920,106 @@ self.onmessage = (e) => {
       scored.sort((a, b) => (a.score - b.score) || (a.hash < b.hash ? -1 : 1));
       const keep = (maxCandidates > 0) ? scored.slice(0, maxCandidates) : scored;
 
+      // Select individual transforms before transfer. Archetype-only selection still uploads every
+      // copy of a nearby model, including copies far outside the playable bubble.
+      let remainingInstances = maxVisibleInstances;
+      const selected = [];
+      let duplicateInstancesDropped = 0;
+      for (const e of keep) {
+        if (remainingInstances <= 0) break;
+        const info = infos.get(e.hash);
+        if (!info) continue;
+        const desiredCount = Math.min(maxInstancesPerArchetype, remainingInstances);
+        const nearest = []; // max-heap: the farthest retained instance stays at index 0
+        const selectedTransforms = new Set();
+        const isWorse = (a, b) => (a.dist > b.dist) || (a.dist === b.dist && a.offset > b.offset);
+        const pushNearest = (candidate) => {
+          if (desiredCount <= 0) return;
+          if (nearest.length < desiredCount) {
+            let child = nearest.length;
+            nearest.push(candidate);
+            while (child > 0) {
+              const parent = (child - 1) >> 1;
+              if (!isWorse(nearest[child], nearest[parent])) break;
+              [nearest[child], nearest[parent]] = [nearest[parent], nearest[child]];
+              child = parent;
+            }
+            return;
+          }
+          if (!isWorse(nearest[0], candidate)) return;
+          nearest[0] = candidate;
+          let parent = 0;
+          while (true) {
+            const left = parent * 2 + 1;
+            const right = left + 1;
+            let worst = parent;
+            if (left < nearest.length && isWorse(nearest[left], nearest[worst])) worst = left;
+            if (right < nearest.length && isWorse(nearest[right], nearest[worst])) worst = right;
+            if (worst === parent) break;
+            [nearest[parent], nearest[worst]] = [nearest[worst], nearest[parent]];
+            parent = worst;
+          }
+        };
+        const hasFrustumRadius = !!(frustumPlanes && radiusByHash.has(e.hash));
+        const baseRadius = hasFrustumRadius ? Math.max(0.5, _safeNum(radiusByHash.get(e.hash), 0.5)) : 0.0;
+        const considerCandidate = (arr, i, skipBoundsCull = false) => {
+          const px = arr[i + 12];
+          const py = arr[i + 13];
+          const pz = arr[i + 14];
+          if (!skipBoundsCull && hasFrustumRadius) {
+            const radius = baseRadius * Math.max(1.0, _instanceMaxScale(arr, i)) + frustumPadding;
+            if (!_sphereIntersectsPlanes(frustumPlanes, px, py, pz, radius)) return;
+          }
+          const ox = px - cx;
+          const oy = py - cy;
+          const oz = pz - cz;
+          const dist = Math.hypot(ox, oy, oz);
+          if (dist > maxD) return;
+          const dot = ox * fx + oy * fy + oz * fz;
+          if (dot < 0.0 && dist > maxBehindDistance) return;
+          const transformKey = _instanceTransformSignature(arr, i, stride);
+          if (selectedTransforms.has(transformKey)) {
+            duplicateInstancesDropped++;
+            return;
+          }
+          selectedTransforms.add(transformKey);
+          pushNearest({ arr, offset: i, dist });
+        };
+        for (const s of info.slices) {
+          const end = s.off + s.len;
+          if (s.visibleIndices instanceof Uint32Array) {
+            for (let n = 0; n < s.visibleIndices.length; n++) {
+              considerCandidate(s.arr, s.off + (s.visibleIndices[n] * stride), true);
+            }
+            continue;
+          }
+          for (let i = s.off; i + (stride - 1) < end; i += stride) {
+            considerCandidate(s.arr, i, false);
+          }
+        }
+        nearest.sort((a, b) => (a.dist - b.dist) || (a.offset - b.offset));
+        const mats = [];
+        for (const candidate of nearest) {
+          for (let j = 0; j < stride; j++) mats.push(candidate.arr[candidate.offset + j]);
+        }
+        const keptForHash = nearest.length;
+        remainingInstances -= keptForHash;
+        if (keptForHash > 0) selected.push({ ...e, mats });
+      }
+
       // Pack kept hashes into one transferable buffer (same format as parse results).
       let totalFloats = 0;
-      for (const e of keep) totalFloats += e.totalLen;
+      for (const e of selected) totalFloats += e.mats.length;
       const packed = new Float32Array(totalFloats);
       const matsIndex = [];
       const minDistEntries = [];
       const bestDotEntries = [];
 
       let cursor = 0;
-      for (const e of keep) {
-        const info = infos.get(e.hash);
-        if (!info) continue;
+      for (const e of selected) {
         const start = cursor;
-        for (const s of info.slices) {
-          packed.set(s.arr.subarray(s.off, s.off + s.len), cursor);
-          cursor += s.len;
-        }
+        packed.set(e.mats, cursor);
+        cursor += e.mats.length;
         matsIndex.push({ hash: e.hash, offsetFloats: start, lengthFloats: cursor - start });
         minDistEntries.push([e.hash, e.d]);
         bestDotEntries.push([e.hash, e.dot]);
@@ -586,6 +1034,21 @@ self.onmessage = (e) => {
         minDistEntries,
         bestDotEntries,
         totalFloats: packed.length,
+        sourceInstances,
+        duplicateInstancesDropped,
+        frustumEnabled: !!frustumPlanes,
+        frustumTested,
+        frustumCulled,
+        wasmCullingEnabled: !!wasmStats.enabled,
+        wasmCullingTested: wasmStats.tested,
+        wasmCullingKept: wasmStats.kept,
+        wasmCullingRejected: wasmStats.rejected,
+        webGpuCullingEnabled: !!webGpuStats.enabled,
+        webGpuCullingRequested: !!webGpuRequested,
+        webGpuCullingReason: webGpuReason,
+        webGpuCullingTested: webGpuStats.tested,
+        webGpuCullingKept: webGpuStats.kept,
+        webGpuCullingRejected: webGpuStats.rejected,
       }, [packed.buffer]);
       return;
     }
@@ -598,7 +1061,7 @@ self.onmessage = (e) => {
     if (type === 'parse_ent1') {
       const buffer = msg.buffer;
       if (!(buffer instanceof ArrayBuffer)) throw new Error('parse_ent1: missing buffer');
-      _parseEnt1(reqId, msg.camData, buffer, { storeKey: msg.storeKey, storeOnly: msg.storeOnly });
+      _parseEnt1(reqId, msg.camData, buffer, { storeKey: msg.storeKey, storeOnly: msg.storeOnly, worldBounds: msg.worldBounds });
       return;
     }
 
@@ -613,6 +1076,7 @@ self.onmessage = (e) => {
         camX, camY, camZ,
         storeKey: msg.storeKey || null,
         storeOnly: !!msg.storeOnly,
+        worldBounds: msg.worldBounds || null,
         totalLines: 0,
         parsed: 0,
         withArchetype: 0,
