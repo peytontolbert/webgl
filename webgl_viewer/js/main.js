@@ -1055,9 +1055,11 @@ export class App {
                 console.log(`Entity streaming enabled: chunks=${chunkCount} total_entities=${total ?? 'n/a'}`);
             }
 
-            // The district descriptor below selects either the legacy YBNC tile
-            // or the compiled stream; do not allocate both in demo mode.
-            if (!this.spawnDistrictDemo) await this.collisionWorld?.loadYbnGround?.();
+            // Load the currently active legacy tile during bootstrap. A future
+            // descriptor that explicitly opts into compiled collision replaces
+            // this world below; descriptors without that field must retain the
+            // authored YBNC ground instead of falling through to terrain.
+            await this.collisionWorld?.loadYbnGround?.();
             const derivedRoad = await this.collisionWorld?.loadDerivedRoad?.();
             if (derivedRoad) {
                 try { await this.trackRoadRenderer?.load?.(); } catch (e) { console.warn('Track road render load failed:', e); }
