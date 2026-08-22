@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import re
 import struct
@@ -196,20 +197,34 @@ def main() -> int:
             references.setdefault(rel, set()).add(index_rel)
         chunk_total += int(chunk.get("count") or 0)
 
+    packed_rels = {rel for rel, _offset, _length, _source in ranges}
     missing = {
         rel: sorted(sources)
         for rel, sources in references.items()
         if not resolve_asset(rel).is_file()
+        and not (
+            rel in packed_rels
+            and Path(f"{resolve_asset(rel)}.gz").is_file()
+        )
     }
     invalid_ranges = []
     for rel, offset, length, source in ranges:
         path = resolve_asset(rel)
-        if path.is_file() and offset + length > path.stat().st_size:
+        available_bytes = path.stat().st_size if path.is_file() else None
+        gzip_path = Path(f"{path}.gz")
+        # Production mesh packs are compressed-only. Gzip's ISIZE trailer is
+        # sufficient here because each independently emitted pack is below
+        # 4 GiB; offsets target the decompressed stream cached by ModelManager.
+        if available_bytes is None and gzip_path.is_file() and gzip_path.stat().st_size >= 4:
+            with gzip_path.open("rb") as stream:
+                stream.seek(-4, 2)
+                available_bytes = struct.unpack("<I", stream.read(4))[0]
+        if available_bytes is not None and offset + length > available_bytes:
             invalid_ranges.append({
                 "file": rel,
                 "offset": offset,
                 "length": length,
-                "bytes": path.stat().st_size,
+                "bytes": available_bytes,
                 "source": source,
             })
 
@@ -260,8 +275,20 @@ def main() -> int:
             "samples": runtime_loose_mesh_references[:20],
         },
         "referencedFiles": len(references),
+        "referencedFilesByFamily": dict(sorted(Counter(rel.split("/", 1)[0] for rel in references).items())),
+        "referencedFilesByExtension": dict(sorted(Counter(
+            ".gz" if rel.lower().endswith(".gz") else Path(rel).suffix.lower() or "[none]"
+            for rel in references
+        ).items())),
+        "nonWebpImageReferences": sorted(
+            rel for rel in references if rel.lower().endswith((".png", ".jpg", ".jpeg"))
+        ),
         "checkedJsonFiles": len(seen_json),
         "checkedPackRanges": len(ranges),
+        "compressedOnlyPackFiles": len({
+            rel for rel, _offset, _length, _source in ranges
+            if not resolve_asset(rel).is_file() and Path(f"{resolve_asset(rel)}.gz").is_file()
+        }),
         "missingReferences": hard_missing,
         "knownUnresolvedTextureReferences": {
             "count": len(unresolved_texture_refs),
