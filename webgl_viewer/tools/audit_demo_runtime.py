@@ -25,10 +25,12 @@ def run_json(command: list[str]) -> tuple[dict[str, Any], int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist-root", type=Path, required=True, help="Directory containing assets/, bundled/, and index.html")
+    parser.add_argument("--extensions-root", type=Path, help="Separately served Nexus extension directory (defaults beside dist root)")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     dist = args.dist_root.resolve()
     assets = dist / "assets"
+    extensions = args.extensions_root.resolve() if args.extensions_root else dist.parent / "nexus_extensions"
     tools = Path(__file__).resolve().parent
     descriptor_path = assets / "demo/spawn_district.json"
     if not descriptor_path.is_file():
@@ -57,6 +59,10 @@ def main() -> int:
             str(assets / "tracks/nordschleife/scene_full_v3/scene.json"), "--web-root", str(dist),
         ],
     }
+    if extensions.is_dir():
+        commands["extensionsCompression"] = [
+            sys.executable, str(tools / "audit_runtime_compression.py"), str(extensions), "--verify-json",
+        ]
     for name, command in commands.items():
         checks[name], exit_codes[name] = run_json(command)
 
@@ -78,6 +84,7 @@ def main() -> int:
             "mloCoverage": checks["mlo"].get("ok"),
             "balancedTrackCoverage": checks["trackBalanced"].get("ok"),
             "fullTrackCoverage": checks["trackFull"].get("ok"),
+            "extensionsCompressionCoverage": checks.get("extensionsCompression", {}).get("sidecarCoverage"),
         },
         "checks": checks,
     }
