@@ -60,6 +60,13 @@ MLO_TAKEOVER_ORIGIN_Z_TOLERANCE = 0.75
 # Match those by archetype and authored position so unrelated world instances
 # of the same archetype remain intact.
 MLO_TAKEOVER_INSTANCE_OVERRIDES = {
+    # MilosWalmart replaces the vanilla Davis Mega Mall shell. The native
+    # drawable uses a different origin from the MLO root, so shared-origin
+    # takeover cannot find it. Suppress only this authored instance; other
+    # instances of the same GTA archetype remain untouched.
+    3384310300: (
+        (2185785507, 70.8994, -1773.2747, 35.4353),
+    ),
     # legion_int_weed supplies hei_dt1_rd1_strm_6.ymap. Its complete resource
     # YMAP replaces the GTA map cell, so no proximity-based removals belong here.
     2219659007: (),

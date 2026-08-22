@@ -1331,6 +1331,40 @@ export class DrawableStreamer {
         return Math.hypot(dx, dy, dz);
     }
 
+    _interiorActivationRadius(def) {
+        const configured = Math.max(1.0, Number(this.interiorMaxRootDistance) || 120.0);
+        const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
+        const hasSentinelBounds = rooms.some((room) => {
+            const mn = room?.bbMin;
+            const mx = room?.bbMax;
+            if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) return false;
+            return Math.abs(Number(mx[0]) - Number(mn[0])) > 200.0
+                || Math.abs(Number(mx[1]) - Number(mn[1])) > 200.0
+                || Math.abs(Number(mx[2]) - Number(mn[2])) > 50.0;
+        });
+        if (!hasSentinelBounds) return configured;
+
+        // Some loose FiveM MLOs use a map-sized sentinel AABB for every room.
+        // Treating that box as playable interior keeps the MLO active far out in
+        // the street, where its children replace unrelated exterior content.
+        // Authored portal corners still describe the real shell aperture and
+        // give us a resource-driven activation radius without destination IDs
+        // or hand-authored world coordinates.
+        let portalRadius = 0.0;
+        for (const portal of (Array.isArray(def?.portals) ? def.portals : [])) {
+            for (const corner of (Array.isArray(portal?.corners) ? portal.corners : [])) {
+                if (!Array.isArray(corner) || corner.length < 3) continue;
+                const x = Number(corner[0]);
+                const y = Number(corner[1]);
+                const z = Number(corner[2]);
+                if (![x, y, z].every(Number.isFinite)) continue;
+                portalRadius = Math.max(portalRadius, Math.hypot(x, y, z));
+            }
+        }
+        const authoredRadius = portalRadius > 0.0 ? portalRadius + 16.0 : 48.0;
+        return Math.min(configured, Math.max(24.0, authoredRadius));
+    }
+
     _portalKey(parentGuid, portal) {
         return `${Number(parentGuid) >>> 0}:${Number(portal?.index) >>> 0}`;
     }
@@ -1485,7 +1519,7 @@ export class DrawableStreamer {
                 position[1] - Number(inst.mat16[13]),
                 position[2] - Number(inst.mat16[14]),
             );
-            if (rootDistance > this.interiorMaxRootDistance) continue;
+            if (rootDistance > this._interiorActivationRadius(def)) continue;
             const exteriorRoomIndex = this._findExteriorRoomIndex(def);
             const roomIndex = this._findContainingRoomIndex(def, local);
             if (roomIndex >= 0 && roomIndex !== exteriorRoomIndex && rootDistance < nearestInteriorDistance) {
@@ -3211,17 +3245,23 @@ export class DrawableStreamer {
                             activeInteriorChild = true;
                             const ownership = this._decodeMloFlags(mats[offset + 20]);
                             let priority = 5000;
-                            if (ownership.roomIndex === Number(this._activeInterior?.roomIndex)) {
+                            if (ownership.roomIndex === Number(this._activeInterior?.exteriorRoomIndex)
+                                && this._activeInterior?.visibleRooms?.has?.(ownership.roomIndex)) {
+                                // GTA/FiveM commonly attaches the structural shell (floor,
+                                // enclosing walls, roof) to limbo/exterior room 0. Loading
+                                // current-room props first leaves shelves floating in a void
+                                // for tens of seconds after a destination teleport.
+                                priority = 12000;
+                            } else if (ownership.roomIndex === Number(this._activeInterior?.roomIndex)) {
                                 // Load the room containing the player before adjacent rooms and
-                                // the exterior/limbo shell. Large MLOs otherwise expose a random
-                                // fragment of hundreds of equally-prioritized child meshes.
-                                priority = 10000;
+                                // other visible rooms once the enclosing shell is resident.
+                                priority = 11000;
                             } else if (ownership.portalIndex >= 0) {
                                 const def = this._mloDefs.get(String(this._activeInterior?.archHash));
                                 const portal = (def?.portals || [])[ownership.portalIndex];
                                 if (Number(portal?.roomFrom) === Number(this._activeInterior?.roomIndex)
                                     || Number(portal?.roomTo) === Number(this._activeInterior?.roomIndex)) {
-                                    priority = 9000;
+                                    priority = 10000;
                                 }
                             }
                             activeInteriorPriority = Math.max(activeInteriorPriority, priority);

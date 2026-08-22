@@ -79,4 +79,23 @@ assert.deepEqual(streamer._filterEntriesForActiveInterior([], [
 assert.equal(streamer._mloInstancesLast.length, 1);
 assert.equal(streamer._activeInterior?.roomIndex, 1);
 
+// Malformed loose-MLO room bounds must not keep an interior active out in the
+// surrounding city. Portal metadata provides the authored shell scale.
+const sentinelDefinition = {
+    rooms: [
+        { index: 0, name: 'limbo', bbMin: [-360, -330, -80], bbMax: [360, 330, 80] },
+        { index: 1, name: 'store', bbMin: [-360, -330, -80], bbMax: [360, 330, 80] },
+    ],
+    portals: [{
+        index: 0,
+        roomFrom: 1,
+        roomTo: 0,
+        corners: [[-7, 34, 0], [-7, 34, 9], [19, 34, 9], [19, 34, 0]],
+    }],
+};
+streamer._mloDefs.set('100', sentinelDefinition);
+streamer._mloInstancesLast = [{ parentGuid: 88, archHash: '100', mat16: identity }];
+assert.equal(streamer.getInteriorStateAtDataPos([61, 0, 0]), null);
+assert.equal(streamer.getInteriorStateAtDataPos([0, 0, 0])?.roomIndex, 1);
+
 console.log('mlo portal runtime: door binding, traversal, audio, light bleed, and entity sets passed');

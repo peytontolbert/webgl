@@ -16,6 +16,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--descriptor", type=Path, default=root / "assets/demo/spawn_district.json")
     parser.add_argument("--base-instances", type=Path, default=None, help="Pristine base ENT1 used to restore retained replacement entities.")
+    parser.add_argument(
+        "--root-hash",
+        action="append",
+        default=[],
+        help="Apply takeover rules only for this MLO root hash (repeatable).",
+    )
     args = parser.parse_args()
 
     descriptor_path = args.descriptor.resolve()
@@ -38,8 +44,11 @@ def main() -> int:
         if flags & 1:
             archetype_hash, x, y, z = struct.unpack_from("<I3f", record, 0)
             roots.append({"archetypeHash": archetype_hash, "position": [x, y, z]})
+    selected_root_hashes = {int(value) & 0xFFFFFFFF for value in args.root_hash}
+    if selected_root_hashes:
+        roots = [root for root in roots if int(root["archetypeHash"]) in selected_root_hashes]
     if not roots:
-        raise ValueError("No MLO root records were found")
+        raise ValueError("No matching MLO root records were found")
 
     base_path = args.base_instances.resolve() if args.base_instances else demo_dir / "spawn_district_entities.bin"
     base_records, base_stride = _read_ent1_records(base_path) if base_path.is_file() else (records[:base_count], stride)
