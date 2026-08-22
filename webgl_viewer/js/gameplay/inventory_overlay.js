@@ -10,7 +10,7 @@ const ITEM_DEFINITIONS = Object.freeze({
         fallbackLabel: 'Glock-17',
         type: 'weapon',
         weight: 3000,
-        image: `${NEXUS_INVENTORY_IMAGE_ROOT}weapon_glock17.png`,
+        image: `${NEXUS_INVENTORY_IMAGE_ROOT}weapon_glock17.webp`,
     }),
     switch: Object.freeze({
         slot: 2,
@@ -18,7 +18,7 @@ const ITEM_DEFINITIONS = Object.freeze({
         label: 'Glock switch',
         type: 'component',
         weight: 180,
-        image: `${NEXUS_INVENTORY_IMAGE_ROOT}glock-switch.png`,
+        image: `${NEXUS_INVENTORY_IMAGE_ROOT}glock-switch.webp`,
     }),
     ammo: Object.freeze({
         slot: 3,
@@ -26,7 +26,7 @@ const ITEM_DEFINITIONS = Object.freeze({
         label: 'Pistol ammo',
         type: 'ammo',
         weight: 13,
-        image: `${NEXUS_INVENTORY_IMAGE_ROOT}pistol_ammo.png`,
+        image: `${NEXUS_INVENTORY_IMAGE_ROOT}pistol_ammo.webp`,
     }),
     cocaLeaves: Object.freeze({
         slot: 4,
@@ -34,7 +34,7 @@ const ITEM_DEFINITIONS = Object.freeze({
         label: 'Coca leaves',
         type: 'material',
         weight: 25,
-        image: `${NEXUS_INVENTORY_IMAGE_ROOT}cocaineleaf.png`,
+        image: `${NEXUS_INVENTORY_IMAGE_ROOT}cocaineleaf.webp`,
     }),
     phone: Object.freeze({
         slot: 5,
@@ -42,7 +42,7 @@ const ITEM_DEFINITIONS = Object.freeze({
         label: 'Phone',
         type: 'phone',
         weight: 180,
-        image: `${NEXUS_INVENTORY_IMAGE_ROOT}phone.png`,
+        image: `${NEXUS_INVENTORY_IMAGE_ROOT}phone.webp`,
     }),
 });
 

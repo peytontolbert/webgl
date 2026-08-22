@@ -1074,12 +1074,12 @@ void main() { }
                 for (let i = 0; i < f32.length; i++) f32[i] = (hm16.dataU16[i] ?? 0) / 65535.0;
                 this.heightmap = this._uploadHeightmapFloat32(hmW, hmH, f32);
             } else {
-                try { console.log('[terrain] Using 8-bit heightmap PNG fallback: assets/heightmap.png'); } catch { /* ignore */ }
+                try { console.log('[terrain] Using 8-bit heightmap WebP fallback: assets/heightmap.webp'); } catch { /* ignore */ }
                 // Load heightmap via PNG (8-bit effective)
                 let heightmapBlob;
                 try {
                     // HIGH priority: required for the first playable frame.
-                    heightmapBlob = await fetchBlob('assets/heightmap.png', { priority: 'high' });
+                    heightmapBlob = await fetchBlob('assets/heightmap.webp', { priority: 'high' });
                 } catch {
                     console.warn('Heightmap texture not found, terrain will be rendered without heightmap');
                     return false;
@@ -1288,7 +1288,7 @@ void main() { }
 
             let blob;
             try {
-                blob = await fetchBlob('assets/heightmap.png', { priority: 'high' });
+                blob = await fetchBlob('assets/heightmap.webp', { priority: 'high' });
             } catch {
                 console.warn('Heightmap texture not found, terrain will be rendered without heightmap');
                 return false;

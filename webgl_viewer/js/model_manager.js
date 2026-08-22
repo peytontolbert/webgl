@@ -463,8 +463,8 @@ export class ModelManager {
         // - if given hash+slug, it tries hash-only first, then the original hash+slug
         //
         // So: prefer emitting hash+slug here when we have a slug, so we work with BOTH layouts.
-        if (slug) return `models_textures/${h}_${slug}.png`;
-        return `models_textures/${h}.png`;
+        if (slug) return `models_textures/${h}_${slug}.webp`;
+        return `models_textures/${h}.webp`;
     }
 
     _resolveShaderParamName(hashStr) {

@@ -63,9 +63,9 @@ export class TextureManager {
     
     loadTerrainTextures(baseUrl) {
         return Promise.all([
-            this.loadTexture(`${baseUrl}/terrain_diffuse.png`, 'diffuse'),
-            this.loadTexture(`${baseUrl}/terrain_normal.png`, 'normal'),
-            this.loadTexture(`${baseUrl}/terrain_detail.png`, 'detail')
+            this.loadTexture(`${baseUrl}/terrain_diffuse.webp`, 'diffuse'),
+            this.loadTexture(`${baseUrl}/terrain_normal.webp`, 'normal'),
+            this.loadTexture(`${baseUrl}/terrain_detail.webp`, 'detail')
         ]);
     }
     
@@ -135,4 +135,4 @@ export class TextureManager {
         this.textureUnits.clear();
         this.nextTextureUnit = 0;
     }
-} 
+}

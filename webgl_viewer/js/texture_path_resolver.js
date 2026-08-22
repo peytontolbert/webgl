@@ -9,18 +9,18 @@ const MODEL_TEXTURE_ASSET_REVISION = 'v10';
 // from falling back to untextured shader color on roads/sidewalks while the
 // exact source textures are absent from the local export.
 const MODEL_TEXTURE_REL_ALIASES = Object.freeze({
-  'models_textures/2929879111_im_road_damage_03.png': 'models_textures/214235649_im_road_damage_03_lod.png',
-  'models_textures/3601109728_im_sidewalk009.png': 'models_textures/3905304355_im_sidewalk008.png',
+  'models_textures/2929879111_im_road_damage_03.webp': 'models_textures/214235649_im_road_damage_03_lod.webp',
+  'models_textures/3601109728_im_sidewalk009.webp': 'models_textures/3905304355_im_sidewalk008.webp',
   // The downtown `im_sidewalk020` color raster is absent from the installed
   // GTA dictionaries. Use the nearest exported colored sidewalk LOD instead
   // of falling back to flat material color or its grayscale specular map.
-  'models_textures/1900857890_im_sidewalk020.png': 'models_textures/1243748460_im_sidewalk019_lod.png',
-  'models_textures/524380690_im_road_damage_001im_road_damage_001_a.png': 'models_textures/2812727009_im_road_damage_001_lodim_road_damage_001_a_lod.png',
-  'models_textures/552092152_freeway_ubderbelly_new_01_lod.png': 'models_textures/3550326802_im_freeway_barrier001_lod.png',
-  'models_textures/566413555_nxg_rbm_kerb1.png': 'models_textures/1076115283_im_kerbs03.png',
+  'models_textures/1900857890_im_sidewalk020.webp': 'models_textures/1243748460_im_sidewalk019_lod.webp',
+  'models_textures/524380690_im_road_damage_001im_road_damage_001_a.webp': 'models_textures/2812727009_im_road_damage_001_lodim_road_damage_001_a_lod.webp',
+  'models_textures/552092152_freeway_ubderbelly_new_01_lod.webp': 'models_textures/3550326802_im_freeway_barrier001_lod.webp',
+  'models_textures/566413555_nxg_rbm_kerb1.webp': 'models_textures/1076115283_im_kerbs03.webp',
   // `prop_bin_05a` is a model-local alias, not a standalone texture in GTA's
   // YTDs. Its owning `prop_bin_05.ytd` exposes the base `prop_bin_05` raster.
-  'models_textures/1329570871_prop_bin_05a.png': 'models_textures/2927588251_prop_bin_05.png',
+  'models_textures/1329570871_prop_bin_05a.webp': 'models_textures/2927588251_prop_bin_05.webp',
 });
 
 /**
@@ -70,8 +70,8 @@ export class TexturePathResolver {
 
     const extRank = (file) => {
       const f = String(file || '').toLowerCase();
-      if (f.endsWith('.png')) return 0;
-      if (f.endsWith('.jpg') || f.endsWith('.jpeg') || f.endsWith('.webp')) return 1;
+      if (f.endsWith('.webp')) return 0;
+      if (f.endsWith('.png') || f.endsWith('.jpg') || f.endsWith('.jpeg')) return 1;
       if (f.endsWith('.dds')) return 2;
       return 10;
     };
@@ -127,7 +127,7 @@ export class TexturePathResolver {
     const file = String(ent?.file || '').trim();
     if (!file) return null;
     // Never map a missing hash back to itself; normal hash resolution handles that path.
-    if (file.toLowerCase().startsWith(`${h.toLowerCase()}_`) || file.toLowerCase() === `${h.toLowerCase()}.png`) {
+    if (file.toLowerCase().startsWith(`${h.toLowerCase()}_`) || new RegExp(`^${h}\\.(?:png|jpe?g|webp|dds)$`, 'i').test(file)) {
       return null;
     }
     return `models_textures/${file}`;
@@ -139,6 +139,7 @@ export class TexturePathResolver {
       .replace(/^\/+/, '')
       .replace(/^assets\//i, '')
       .replace(/^(model_texture|model_textures|models_texture)\//i, 'models_textures/')
+      .replace(/\.(?:png|jpe?g)$/i, '.webp')
       .toLowerCase();
     const alias = MODEL_TEXTURE_REL_ALIASES[r] || null;
     if (!alias) return null;
