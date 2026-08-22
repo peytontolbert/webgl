@@ -252,10 +252,21 @@ def _iter_manifest_shards(models_dir: Path, *, max_shards: int = 0) -> List[Path
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="webgl/webgl_viewer", help="Viewer root containing assets/ (default: webgl/webgl_viewer)")
+    ap.add_argument("--manifest", default="", help="Optional manifest JSON to scan instead of the full sharded model manifest.")
     ap.add_argument("--max-shards", type=int, default=0, help="Limit number of shard files to scan (0 = all)")
     ap.add_argument("--max-meshes", type=int, default=0, help="Limit number of mesh entries scanned (0 = all)")
     ap.add_argument("--max-textures", type=int, default=0, help="Limit unique missing textures written (0 = all)")
     ap.add_argument("--max-refs-per-texture", type=int, default=25, help="Cap refs stored per texture hash")
+    ap.add_argument(
+        "--only-rel-suffix",
+        default="",
+        help="Only include canonical texture names whose slug ends with this suffix (for example: _pal).",
+    )
+    ap.add_argument(
+        "--only-rel-regex",
+        default="",
+        help="Only include canonical texture names whose slug matches this case-insensitive regular expression.",
+    )
     ap.add_argument("--out", required=True, help="Path to write missing_textures_remaining.json")
     args = ap.parse_args()
 
@@ -302,11 +313,22 @@ def main() -> int:
                 return True
         return False
 
-    shards = _iter_manifest_shards(models_dir, max_shards=int(args.max_shards or 0))
+    if str(args.manifest or "").strip():
+        manifest_path = Path(str(args.manifest)).resolve()
+        if not manifest_path.exists():
+            raise SystemExit(f"Manifest not found: {manifest_path}")
+        shards = [manifest_path]
+    else:
+        shards = _iter_manifest_shards(models_dir, max_shards=int(args.max_shards or 0))
     if not shards:
         raise SystemExit(f"No model manifests found under {models_dir}")
 
     missing_by_hash: Dict[str, dict] = {}
+    rel_suffix = str(args.only_rel_suffix or "").strip().lower()
+    try:
+        rel_regex = re.compile(str(args.only_rel_regex or "").strip(), re.IGNORECASE) if str(args.only_rel_regex or "").strip() else None
+    except re.error as exc:
+        ap.error(f"--only-rel-regex is invalid: {exc}")
     meshes_scanned = 0
     for sf in shards:
         payload = json.loads(sf.read_text(encoding="utf-8", errors="ignore"))
@@ -331,6 +353,11 @@ def main() -> int:
                     if not m:
                         continue
                     h = str(m.group("hash") or "").strip()
+                    slug = str(m.group("slug") or "").strip()
+                    if rel_suffix and not slug.lower().endswith(rel_suffix):
+                        continue
+                    if rel_regex and not rel_regex.search(slug):
+                        continue
                     ext = str(m.group("ext") or "").strip().lower()
                     if not h:
                         continue
@@ -339,7 +366,6 @@ def main() -> int:
 
                     ent = missing_by_hash.get(h)
                     if ent is None:
-                        slug = str(m.group("slug") or "")
                         req = f"models_textures/{h}_{slug}.png" if slug else f"models_textures/{h}.png"
                         ent = {"requestedRel": req, "useCount": 0, "refs": [], "_refs_set": set()}
                         missing_by_hash[h] = ent

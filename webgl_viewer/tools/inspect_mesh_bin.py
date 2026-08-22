@@ -21,6 +21,12 @@ def main() -> None:
     has_normals = version >= 2 and (flags & 1) == 1
     has_uvs = version >= 3 and (flags & 2) == 2
     has_tangents = version >= 4 and (flags & 4) == 4
+    has_color0 = version >= 5 and (flags & 8) == 8
+    has_uv1 = version >= 6 and (flags & 16) == 16
+    has_uv2 = version >= 7 and (flags & 32) == 32
+    has_color1 = version >= 7 and (flags & 64) == 64
+    has_blend_weights = version >= 8 and (flags & 128) == 128
+    has_blend_indices = version >= 8 and (flags & 256) == 256
 
     print("file:", str(p))
     print("bytes:", len(data))
@@ -32,6 +38,12 @@ def main() -> None:
     print("hasNormals:", has_normals)
     print("hasUvs:", has_uvs)
     print("hasTangents:", has_tangents)
+    print("hasColor0:", has_color0)
+    print("hasUv1:", has_uv1)
+    print("hasUv2:", has_uv2)
+    print("hasColor1:", has_color1)
+    print("hasBlendWeights:", has_blend_weights)
+    print("hasBlendIndices:", has_blend_indices)
 
 
 if __name__ == "__main__":

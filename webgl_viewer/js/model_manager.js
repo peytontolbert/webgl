@@ -1,5 +1,12 @@
 import { joaat } from './joaat.js';
-import { fetchArrayBuffer, fetchJSON } from './asset_fetcher.js';
+import { deleteAssetCacheEntry, fetchArrayBufferPreferredCompressed, fetchJSON } from './asset_fetcher.js';
+import { createWireframeIndices } from './wireframe_indices.js';
+
+// Custom-resource drawables whose required source data is known to be absent.
+// Keep these out of the placeholder path as well as future compact manifests.
+const BUILTIN_NON_RENDERABLE_HASHES = Object.freeze([
+    '1993703776', // prop_plant_florek: missing diffuse atlas 150093784.png
+]);
 
 export class ModelManager {
     constructor(gl) {
@@ -10,25 +17,61 @@ export class ModelManager {
         this._sharded = false;
         this._manifestBaseDir = 'assets/models';
         this._manifestIndex = null; // { schema, shard_bits, shard_dir, ... }
+        this._manifestShardCacheBust = '';
         this._loadedShards = new Set(); // shardId (number)
         this._loadingShards = new Map(); // shardId -> Promise<boolean>
+        // Runtime subsets (notably /demo's packed district) are authoritative.
+        // A forced source-shard load for a player/NPC can contain the same world
+        // hashes and must not replace their packed mesh/texture references.
+        this._manifestSubsetOverrides = new Map();
         /** @type {null | ((info: any) => void)} */
         this.onManifestUpdated = null;
+        // Exporting drawables mutates the asset tree and can take seconds. It is a deliberate user action,
+        // never part of the frame/streaming loop.
+        this.enableLiveExport = false;
+        this.liveExportBatchSize = 12;
+        this.liveExportTextures = false;
+        this._liveExportDisabled = false;
+        this._liveExportRequested = new Set();
+        this._liveExportInFlight = false;
+        this._liveExportQueue = [];
+        this._liveExportLastMs = 0;
+        this._nonRenderableHashes = new Set(BUILTIN_NON_RENDERABLE_HASHES);
+        this._nonRenderableLoadPromise = null;
 
         // Cache actual mesh bins by file path (since multiple submeshes/lods can reference different files).
         this.meshCache = new Map(); // key(file) -> { vao, indexCount, buffers... }
+        // Retain position/index CPU copies for precise asset picking. Disabled by
+        // default because full-world streaming can load many unique mesh bins.
+        this.retainCpuPickData = false;
 
         // Mesh cache budget + LRU eviction (Task A3).
         // Note: renderer-created per-submesh VAOs reference these buffers; eviction marks meshes as disposed
         // so renderers can drop/reload those bindings safely.
         // GTA-scale worlds have *lots* of unique mesh bins. A low default causes constant churn.
         // This is "approx GPU buffer bytes" (not exact), used only for LRU budgeting.
-        this.maxMeshCacheBytes = 2 * 1024 * 1024 * 1024; // default 2GB
+        this.maxMeshCacheBytes = 512 * 1024 * 1024; // app profiles can raise this explicitly
         this.meshCacheDebug = false;
         this._meshCacheBytes = 0;
         this._meshCacheEvictions = 0;
+        this._meshCacheHotEvictionDeferrals = 0;
+        this.meshCacheHotProtectionMs = 2500;
+        this.meshCacheHardLimitMultiplier = 1.35;
         /** @type {Map<string, number>} */
         this._meshCacheApproxBytes = new Map(); // key -> approxBytes
+        // Keep a bounded set of recently used demo packs. Camera movement tends
+        // to revisit neighboring submeshes, and immediately releasing packs can
+        // turn those revisits into duplicate HTTP/cache reads.
+        this.maxMeshPackCacheBytes = 32 * 1024 * 1024;
+        this._meshPackCacheBytes = 0;
+        this._meshPackLoads = new Map(); // pack path -> { promise, byteLength, lastUsedMs }
+
+        // Network completion is bursty. Parse/upload only a small number of
+        // packed world meshes per animation frame to protect gameplay latency.
+        this.maxPackedMeshUploadsPerFrame = 2;
+        this.maxPackedMeshUploadMsPerFrame = 4.0;
+        this._packedMeshUploadQueue = [];
+        this._packedMeshUploadScheduled = false;
 
         // If an archetype exists in the world data but wasn't exported to a mesh bin,
         // we still want "0 missing": render a small placeholder mesh instead.
@@ -60,11 +103,42 @@ export class ModelManager {
         })();
     }
 
+    _kickoffNonRenderableIndexLoad(baseDir) {
+        if (this._nonRenderableLoadPromise) return;
+        const url = `${String(baseDir || this._manifestBaseDir || 'assets/models')}/non_renderable_archetypes.json`;
+        this._nonRenderableLoadPromise = (async () => {
+            try {
+                const data = await fetchJSON(url, { priority: 'low', usePersistentCache: false, useMemoryCache: false });
+                const hashes = Array.isArray(data?.hashes) ? data.hashes : [];
+                const next = new Set(BUILTIN_NON_RENDERABLE_HASHES);
+                for (const hash of hashes) {
+                    const h = this.normalizeId(hash);
+                    if (h) next.add(h);
+                }
+                this._nonRenderableHashes = next;
+                try { this.onManifestUpdated?.({ type: 'nonRenderableIndex', count: next.size }); } catch { /* ignore */ }
+            } catch {
+                // Optional classification data. Unknown archetypes remain export candidates.
+            } finally {
+                this._nonRenderableLoadPromise = null;
+            }
+        })();
+    }
+
+    async refreshNonRenderableIndex() {
+        if (this._nonRenderableLoadPromise) {
+            try { await this._nonRenderableLoadPromise; } catch { /* ignore */ }
+        }
+        this._nonRenderableLoadPromise = null;
+        this._kickoffNonRenderableIndexLoad(this._manifestBaseDir);
+        try { await this._nonRenderableLoadPromise; } catch { /* ignore */ }
+    }
+
     /**
      * Touch a cached mesh entry to keep it hot in the LRU.
      * Uses Map insertion order as the LRU queue by moving the entry to the end.
      */
-    touchMesh(keyOrMesh) {
+    touchMesh(keyOrMesh, frameNow = null) {
         const key = (typeof keyOrMesh === 'string')
             ? keyOrMesh
             : (keyOrMesh && typeof keyOrMesh === 'object' ? String(keyOrMesh.key || '') : '');
@@ -73,11 +147,134 @@ export class ModelManager {
         if (!mesh) return false;
         // If the mesh has been disposed/evicted, treat as absent.
         if (mesh._disposed) return false;
+        const now = Number.isFinite(frameNow)
+            ? frameNow
+            : ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now());
+        // Renderers touch every visible submesh. Reordering a large Map hundreds
+        // of times per frame is unnecessary; a two-second LRU cadence still keeps
+        // resident scene meshes well ahead of inactive entries.
+        if (Number.isFinite(mesh._lastLruTouchMs) && (now - mesh._lastLruTouchMs) < 2000) {
+            mesh._lastUsedMs = now;
+            return true;
+        }
+        // At low cache pressure there is no eviction decision to improve, so
+        // moving thousands of visible entries through Map insertion order only
+        // creates periodic main-thread spikes. Keep timestamps current and
+        // restore strict LRU ordering once the cache approaches its byte cap.
+        const cap = Math.max(1, Number(this.maxMeshCacheBytes) || 1);
+        if (this._meshCacheBytes < cap * 0.80) {
+            mesh._lastLruTouchMs = now;
+            mesh._lastUsedMs = now;
+            return true;
+        }
         // Move to MRU position.
         this.meshCache.delete(key);
         this.meshCache.set(key, mesh);
-        try { mesh._lastUsedMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); } catch { /* ignore */ }
+        mesh._lastLruTouchMs = now;
+        mesh._lastUsedMs = now;
         return true;
+    }
+
+    _parseDemoMeshPackRef(file) {
+        const match = /^@demo-pack\/([^#]+)#(\d+):(\d+)$/.exec(String(file || '').trim());
+        if (!match) return null;
+        const offset = Number(match[2]);
+        const length = Number(match[3]);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length <= 0) return null;
+        return { packFile: match[1], offset, length };
+    }
+
+    async _loadDemoMeshPackSlice(ref, { usePersistentCache = true } = {}) {
+        const rawRevision = this.manifest?.meshPackRevisions?.[ref.packFile];
+        const revision = (typeof rawRevision === 'string' || Number.isFinite(rawRevision))
+            ? String(rawRevision).trim()
+            : '';
+        const path = `assets/demo/${ref.packFile}${revision ? `?rev=${encodeURIComponent(revision)}` : ''}`;
+        let cached = this._meshPackLoads.get(path);
+        if (!cached) {
+            cached = {
+                // The persistent asset cache intentionally normalizes URL query
+                // strings. Revisioned packs must bypass it or an older binary
+                // with the same basename can be returned for new slice offsets.
+                // Demo mesh packs are emitted as compressed-only `.gz` assets
+                // by the production packager.  The helper still falls back to
+                // the raw path so existing dev/legacy deployments keep working.
+                promise: fetchArrayBufferPreferredCompressed(path, {
+                    usePersistentCache: revision ? false : !!usePersistentCache,
+                }),
+                byteLength: 0,
+                lastUsedMs: Date.now(),
+            };
+            this._meshPackLoads.set(path, cached);
+            cached.promise.then((pack) => {
+                if (this._meshPackLoads.get(path) !== cached) return;
+                cached.byteLength = pack.byteLength;
+                cached.lastUsedMs = Date.now();
+                this._meshPackCacheBytes += pack.byteLength;
+                this._evictDemoMeshPacks(path);
+            }).catch(() => { /* handled by the awaiting caller */ });
+        }
+        cached.lastUsedMs = Date.now();
+        let pack;
+        try {
+            pack = await cached.promise;
+        } catch (error) {
+            this._meshPackLoads.delete(path);
+            throw error;
+        }
+        const end = ref.offset + ref.length;
+        if (end > pack.byteLength) throw new Error(`packed mesh range exceeds ${path}`);
+        return pack.slice(ref.offset, end);
+    }
+
+    _evictDemoMeshPacks(protectedPath = '') {
+        while (this._meshPackCacheBytes > this.maxMeshPackCacheBytes) {
+            let oldestPath = '';
+            let oldest = Number.POSITIVE_INFINITY;
+            for (const [path, entry] of this._meshPackLoads) {
+                if (path === protectedPath || !entry?.byteLength) continue;
+                if (entry.lastUsedMs < oldest) {
+                    oldest = entry.lastUsedMs;
+                    oldestPath = path;
+                }
+            }
+            if (!oldestPath) break;
+            const entry = this._meshPackLoads.get(oldestPath);
+            this._meshPackLoads.delete(oldestPath);
+            this._meshPackCacheBytes = Math.max(0, this._meshPackCacheBytes - (entry?.byteLength || 0));
+        }
+    }
+
+    _enqueuePackedMeshUpload(key, arrayBuffer) {
+        return new Promise((resolve, reject) => {
+            this._packedMeshUploadQueue.push({ key, arrayBuffer, resolve, reject });
+            this._schedulePackedMeshUploads();
+        });
+    }
+
+    _schedulePackedMeshUploads() {
+        if (this._packedMeshUploadScheduled || !this._packedMeshUploadQueue.length) return;
+        this._packedMeshUploadScheduled = true;
+        const schedule = typeof requestAnimationFrame === 'function'
+            ? requestAnimationFrame
+            : (callback) => setTimeout(() => callback(Date.now()), 0);
+        schedule(() => {
+            this._packedMeshUploadScheduled = false;
+            const started = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            let completed = 0;
+            while (this._packedMeshUploadQueue.length && completed < this.maxPackedMeshUploadsPerFrame) {
+                const job = this._packedMeshUploadQueue.shift();
+                try {
+                    job.resolve(this._parseAndUploadMesh(job.key, job.arrayBuffer));
+                } catch (error) {
+                    job.reject(error);
+                }
+                completed++;
+                const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                if ((now - started) >= this.maxPackedMeshUploadMsPerFrame) break;
+            }
+            this._schedulePackedMeshUploads();
+        });
     }
 
     isMeshDisposed(mesh) {
@@ -90,6 +287,8 @@ export class ModelManager {
             approxBytes: this._meshCacheBytes,
             maxBytes: this.maxMeshCacheBytes,
             evictions: this._meshCacheEvictions,
+            hotEvictionDeferrals: this._meshCacheHotEvictionDeferrals,
+            overBudgetBytes: Math.max(0, this._meshCacheBytes - this.maxMeshCacheBytes),
         };
     }
 
@@ -117,7 +316,10 @@ export class ModelManager {
         try { if (mesh.tanBuffer) gl.deleteBuffer(mesh.tanBuffer); } catch { /* ignore */ }
         try { if (mesh.col0Buffer) gl.deleteBuffer(mesh.col0Buffer); } catch { /* ignore */ }
         try { if (mesh.col1Buffer) gl.deleteBuffer(mesh.col1Buffer); } catch { /* ignore */ }
+        try { if (mesh.blendWeightsBuffer) gl.deleteBuffer(mesh.blendWeightsBuffer); } catch { /* ignore */ }
+        try { if (mesh.blendIndicesBuffer) gl.deleteBuffer(mesh.blendIndicesBuffer); } catch { /* ignore */ }
         try { if (mesh.idxBuffer) gl.deleteBuffer(mesh.idxBuffer); } catch { /* ignore */ }
+        try { if (mesh.lineIdxBuffer) gl.deleteBuffer(mesh.lineIdxBuffer); } catch { /* ignore */ }
         mesh.vao = null;
         mesh.posBuffer = null;
         mesh.nrmBuffer = null;
@@ -127,24 +329,42 @@ export class ModelManager {
         mesh.tanBuffer = null;
         mesh.col0Buffer = null;
         mesh.col1Buffer = null;
+        mesh.blendWeightsBuffer = null;
+        mesh.blendIndicesBuffer = null;
         mesh.idxBuffer = null;
+        mesh.lineIdxBuffer = null;
+        mesh.pickPositions = null;
+        mesh.pickIndices = null;
+        mesh.pickPositionMin = null;
+        mesh.pickPositionExtent = null;
     }
 
     _evictMeshCacheIfNeeded() {
         const budget = Number(this.maxMeshCacheBytes);
         const maxBytes = Number.isFinite(budget) ? Math.max(0, budget) : (256 * 1024 * 1024);
         this.maxMeshCacheBytes = maxBytes;
-        // Evict LRU entries until we're under budget.
+        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        const hotProtectionMs = Math.max(0, Number(this.meshCacheHotProtectionMs) || 0);
+        const hardMaxBytes = maxBytes * Math.max(1, Number(this.meshCacheHardLimitMultiplier) || 1);
+        // Prefer cold LRU entries. A mesh drawn in the current view must not be
+        // disposed merely because a network completion briefly pushes the cache
+        // over its soft budget; that creates a perpetual reload loop while driving.
         while (this._meshCacheBytes > maxBytes && this.meshCache.size > 0) {
-            const oldestKey = this.meshCache.keys().next().value;
-            if (!oldestKey) break;
-            const mesh = this.meshCache.get(oldestKey);
-            // Never evict placeholder (it isn't in meshCache today, but keep the guard).
-            if (oldestKey === '__placeholder__') {
-                this.meshCache.delete(oldestKey);
-                this.meshCache.set(oldestKey, mesh);
-                break;
+            let oldestKey = null;
+            let oldestMesh = null;
+            const forceOldest = this._meshCacheBytes > hardMaxBytes;
+            for (const [key, candidate] of this.meshCache) {
+                if (key === '__placeholder__') continue;
+                const lastUse = Number(candidate?._lastUsedMs);
+                const hot = Number.isFinite(lastUse) && (now - lastUse) < hotProtectionMs;
+                if (!hot || forceOldest) {
+                    oldestKey = key;
+                    oldestMesh = candidate;
+                    break;
+                }
             }
+            if (!oldestKey) break;
+            const mesh = oldestMesh;
             this.meshCache.delete(oldestKey);
             const b = this._meshCacheApproxBytes.get(oldestKey) ?? (mesh?.approxBytes ?? 0);
             this._meshCacheApproxBytes.delete(oldestKey);
@@ -160,6 +380,18 @@ export class ModelManager {
                 } catch { /* ignore */ }
             }
         }
+        if (this._meshCacheBytes > maxBytes && this._meshCacheBytes <= hardMaxBytes) {
+            this._meshCacheHotEvictionDeferrals++;
+        }
+    }
+
+    clearMeshCache() {
+        for (const mesh of this.meshCache.values()) {
+            try { this._disposeMesh(mesh); } catch { /* ignore */ }
+        }
+        this.meshCache.clear();
+        this._meshCacheApproxBytes.clear();
+        this._meshCacheBytes = 0;
     }
 
     _roundNum(x, decimals = 4) {
@@ -337,7 +569,7 @@ export class ModelManager {
 
         // Hardcoded hashes (from CodeWalker ShaderParams.cs)
         // bumpiness=4134611841, SpecularIntensity=2841625909, SpecularPower=2313518026,
-        // AlphaScale=931055822, alphaTestValue=3310830370, emissiveMultiplier=1592520008,
+        // AlphaScale=931055822, alphaTestValue=3310830370, AlphaTest=950204405, emissiveMultiplier=1592520008,
         // globalAnimUV0=3617324062, globalAnimUV1=3126116752,
         // gTexCoordScaleOffset0=3099617970, detailSettings=3038654095,
         // gTexCoordScaleOffset1=2745647232, gTexCoordScaleOffset2=2499388197, gTexCoordScaleOffset3=2456002041,
@@ -355,6 +587,7 @@ export class ModelManager {
         setIfAbsentNum('specularPower', this._vec4First(getVec('2313518026'), null));
         setIfAbsentNum('alphaScale', this._vec4First(getVec('931055822'), null));
         setIfAbsentNum('alphaCutoff', this._vec4First(getVec('3310830370'), null));
+        setIfAbsentNum('alphaCutoff', this._vec4First(getVec('950204405'), null));
         setIfAbsentNum('emissiveIntensity', this._vec4First(getVec('1592520008'), null));
         // CodeWalker BasicPS uses specularIntensityMult instead of SpecularIntensity; prefer it when present.
         setIfAbsentNum('specularIntensity', this._vec4First(getVec('4095226703'), null));
@@ -405,8 +638,9 @@ export class ModelManager {
             }
         }
 
-        // Tint mode (best-effort CodeWalker parity):
-        // 0=none, 1=instanceIndex (aTintIndex), 2=weaponDiffuseAlpha, 3=vertexColor0B, 4=vertexColor1B
+        // Tint mode (CodeWalker BasicShader parity):
+        // 0=none, 1=legacy viewer instance-index lookup, 2=weapon diffuse alpha,
+        // 3=Colour0.b, 4=Colour1.b. The per-entity tint index selects the palette row.
         if (mat.tintMode === undefined || mat.tintMode === null) {
             const hasTintPalette = !!(typeof mat.tintPalette === 'string' && mat.tintPalette);
             if (!hasTintPalette) {
@@ -471,7 +705,7 @@ export class ModelManager {
             else if (nm === 'SpecularIntensity' || nm === 'gSpecularIntensity') setIfAbsentNum('specularIntensity', this._vec4First(v, null));
             else if (nm === 'SpecularPower' || nm === 'gSpecularExponent' || nm === 'specularExponent') setIfAbsentNum('specularPower', this._vec4First(v, null));
             else if (nm === 'AlphaScale') setIfAbsentNum('alphaScale', this._vec4First(v, null));
-            else if (nm === 'alphaTestValue') setIfAbsentNum('alphaCutoff', this._vec4First(v, null));
+            else if (nm === 'alphaTestValue' || nm === 'AlphaTest' || nm === 'alphaTest') setIfAbsentNum('alphaCutoff', this._vec4First(v, null));
             else if (nm === 'emissiveMultiplier') setIfAbsentNum('emissiveIntensity', this._vec4First(v, null));
             else if (nm === 'specularIntensityMult') setIfAbsentNum('specularIntensity', this._vec4First(v, null));
             else if (nm === 'specMapIntMask') setIfAbsentArr3('specMaskWeights', this._vec3FromVec4(v, null));
@@ -521,27 +755,71 @@ export class ModelManager {
         // We patch-in best-effort defaults so textures are at least requested.
         if (!mat || typeof mat !== 'object') return;
 
-        // --- Trees/foliage LOD (CodeWalker TreesLodShader) ---
-        // CodeWalker `TreesLodPS.hlsl`: discard if alpha <= 0.25, then force alpha=1.
-        // CodeWalker `TreesLodVS.hlsl`: uses Texcoord1 as the UVs for the diffuse sample.
-        //
-        // Even though we don't implement the billboard VS math yet, we can match the *material semantics*
-        // so these drawables render closer to CodeWalker (cutout edges + correct UV set).
+        // --- Trees/foliage shaders ---
+        // Tree exports are especially susceptible to the generic material fallback: a few older
+        // manifests populated every texture field with the diffuse atlas. Keep their known sampler
+        // layout authoritative so diffuse, normal, specular, and palette maps cannot get crossed.
         try {
             const sn = String(mat.shaderName || '').toLowerCase();
-            if (sn.includes('trees_lod')) {
+            const isColorPassHelperShader = sn.includes('cpv_only')
+                || sn.includes('decal_shadow_only')
+                || sn.includes('trees_shadow_proxy');
+            if (isColorPassHelperShader) {
+                // CodeWalker does not put these shaders into a visible colour batch.
+                // Rendering them in our colour pass creates pale/proxy blobs inside foliage.
+                mat.skipColorPass = true;
+            }
+
+            const alphaMode = String(mat.alphaMode || '').toLowerCase();
+            const texNames = [];
+            try {
+                const texByHash0 = mat.shaderParams?.texturesByHash;
+                if (texByHash0 && typeof texByHash0 === 'object') {
+                    for (const v of Object.values(texByHash0)) {
+                        if (typeof v === 'string' && v) texNames.push(v);
+                    }
+                }
+            } catch { /* ignore */ }
+            for (const key of ['diffuse', 'diffuseName', 'diffuseKtx2']) {
+                if (typeof mat[key] === 'string' && mat[key]) texNames.push(mat[key]);
+            }
+            const texText = texNames.join(' ').toLowerCase();
+            const looksFoliageAtlas = texText.includes('branch')
+                || texText.includes('branches')
+                || texText.includes('leaf')
+                || texText.includes('leaves')
+                || texText.includes('foliage');
+            const isTreeFoliageShader = sn.includes('trees_');
+            const isFoliageCutout = isTreeFoliageShader
+                || ((alphaMode === 'cutout' || sn.includes('cutout')) && looksFoliageAtlas);
+
+            if (isFoliageCutout && !isColorPassHelperShader) {
                 mat.shaderFamily = 'basic';
                 mat.alphaMode = 'cutout';
-                if (!Number.isFinite(Number(mat.alphaCutoff))) mat.alphaCutoff = 0.25;
+                if (!Number.isFinite(Number(mat.alphaCutoff))) {
+                    const vecByHash = mat.shaderParams?.vectorsByHash;
+                    const getVec = (hashStr) => (vecByHash && typeof vecByHash === 'object')
+                        ? (vecByHash[String(hashStr)] ?? vecByHash[Number(hashStr)] ?? null)
+                        : null;
+                    const exportedCutoff = this._vec4First(getVec('3310830370'), this._vec4First(getVec('950204405'), null));
+                    const cutoff = Number(exportedCutoff);
+                    mat.alphaCutoff = (Number.isFinite(cutoff) && cutoff > 0.01)
+                        ? Math.max(0.0, Math.min(1.0, cutoff))
+                        : 0.33;
+                }
                 mat.doubleSided = true;
                 mat.alphaToCoverage = true;
-                if (mat.diffuseUvSet === undefined && mat.diffuseUv === undefined) mat.diffuseUv = 'uv1';
+                // TreesLodShader and TreesLod2Shader sample diffuse on Texcoord1.
+                if (sn.includes('trees_lod') && mat.diffuseUvSet === undefined && mat.diffuseUv === undefined) {
+                    mat.diffuseUv = 'uv1';
+                }
             }
         } catch { /* ignore */ }
 
         const sp = mat.shaderParams;
         const texByHash = (sp && typeof sp === 'object') ? sp.texturesByHash : null;
         if (!texByHash || typeof texByHash !== 'object') return;
+        const textureBindingsExplicit = mat.textureBindingsExplicit === true;
 
         // --- Terrain drawable detection (CodeWalker terrain_cb_* family) ---
         // In your exported manifests, many terrain drawables come through with shaderFamily="wetness"
@@ -583,7 +861,7 @@ export class ModelManager {
             // Height/parallax (best-effort)
             { key: 'height', hashes: ['1008099585', '4049987115', '4152773162'] },
             // Tint palettes
-            { key: 'tintPalette', hashes: ['4131954791'] },
+            { key: 'tintPalette', hashes: ['4131954791', '2878898974'] }, // TintPaletteSampler, TextureSamplerDiffPal
             { key: 'tint', hashes: ['1530343050'] },
             // Env maps (best-effort)
             { key: 'env', hashes: ['3317411368', '2951443911', '3837901164'] },
@@ -612,17 +890,123 @@ export class ModelManager {
             const h = String(hashStr || '');
             return texByHash[h] ?? texByHash[Number(h)] ?? null;
         };
+        const hasPreprocessedTexture = (key) => {
+            const rel = mat[key];
+            return typeof rel === 'string' && /^demo\/models_textures(?:_v\d+)?\//i.test(rel);
+        };
+
+        const clearTextureSlot = (key) => {
+            delete mat[key];
+            delete mat[`${key}Ktx2`];
+            delete mat[`${key}Name`];
+            delete mat[`${key}ParamHash`];
+            if (key === 'diffuse2') delete mat.diffuse2Uv;
+        };
+        const setTextureSlot = (key, rel, hash) => {
+            mat[key] = rel;
+            delete mat[`${key}Ktx2`];
+            mat[`${key}ParamHash`] = Number(hash);
+            if (key === 'diffuse2') mat.diffuse2Uv = 'uv1';
+        };
+
+        // Tree shader parameter layouts are compact and known. Do this before the generic mapping
+        // below, which intentionally makes broad best-effort guesses for unrelated shader families.
+        try {
+            const sn = String(mat.shaderName || '').toLowerCase();
+            if (sn.includes('trees_')) {
+                const setTreeTexture = (key, hash) => {
+                    if (hasPreprocessedTexture(key)) return;
+                    const v = getHashVal(hash);
+                    const rel = (typeof v === 'string' && v) ? this._textureRelFromShaderParamValue(v) : null;
+                    if (rel) {
+                        mat[key] = rel;
+                    } else {
+                        delete mat[key];
+                        delete mat[`${key}Ktx2`];
+                    }
+                };
+                const clearTreeTexture = (key) => {
+                    if (hasPreprocessedTexture(key)) return;
+                    delete mat[key];
+                    delete mat[`${key}Ktx2`];
+                };
+
+                setTreeTexture('diffuse', '4059966321');
+                clearTreeTexture('diffuse2');
+                clearTreeTexture('detail');
+                clearTreeTexture('ao');
+                clearTreeTexture('height');
+                clearTreeTexture('emissive');
+
+                if (sn.includes('trees_normal_spec')) {
+                    setTreeTexture('normal', '1186448975');
+                    setTreeTexture('spec', '1619499462');
+                } else {
+                    clearTreeTexture('normal');
+                    clearTreeTexture('spec');
+                }
+
+                if (sn.includes('trees_tnt')) {
+                    setTreeTexture('tintPalette', '4131954791');
+                } else {
+                    clearTreeTexture('tintPalette');
+                }
+            }
+        } catch { /* ignore */ }
 
         for (const s of SLOTS) {
-            if (typeof mat[s.key] === 'string' && mat[s.key]) continue; // already present
+            // FiveM/custom-resource exporters resolve their local YTD up front.
+            // Their raw shader metadata can reference external texture dictionaries
+            // that were not part of the resource. Preserve the verified bindings
+            // instead of synthesizing URLs that overwrite them and repeatedly 404.
+            if (textureBindingsExplicit) continue;
+            // Compact demo manifests contain authoritative, content-addressed
+            // bindings. Reconstructing them from shader texture names points the
+            // runtime back at the multi-gigabyte source PNG tree.
+            if (hasPreprocessedTexture(s.key)) continue;
+            let resolved = null;
+            let resolvedHash = null;
             for (const hash of (s.hashes || [])) {
                 const v = getHashVal(hash);
                 if (typeof v !== 'string' || !v) continue;
                 const rel = this._textureRelFromShaderParamValue(v);
                 if (rel) {
-                    mat[s.key] = rel;
+                    resolved = rel;
+                    resolvedHash = hash;
                     break;
                 }
+            }
+            if (resolved) {
+                // `shaderParams` is the source asset binding from the drawable. Older
+                // exports can prefill generic slots from a different submesh, so it
+                // must override those fallback fields rather than merely fill blanks.
+                setTextureSlot(s.key, resolved, resolvedHash);
+                continue;
+            }
+
+            const sourceHash = Number(mat[`${s.key}ParamHash`]);
+            const isKnownSource = Number.isFinite(sourceHash)
+                && (s.hashes || []).some((hash) => Number(hash) === sourceHash);
+            if (!isKnownSource && typeof mat[s.key] === 'string' && mat[s.key]) {
+                // A fallback field tagged with a sampler that belongs to another slot
+                // (for example DiffuseSampler copied into detail/AO) is invalid.
+                clearTextureSlot(s.key);
+            }
+        }
+
+        // GTA's Basic shader has no independent emissive sampler. The primary diffuse
+        // map is used by emissive shader variants, while ordinary materials must not
+        // inherit arbitrary `emissive` fields from an exporter fallback.
+        if (!textureBindingsExplicit) {
+            const shaderNameLower = String(mat.shaderName || '').toLowerCase();
+            if (shaderNameLower.includes('emissive')) {
+                if (typeof mat.diffuse === 'string' && mat.diffuse) {
+                    mat.emissive = mat.diffuse;
+                    delete mat.emissiveKtx2;
+                    mat.emissiveParamHash = 4059966321;
+                }
+            } else {
+                clearTextureSlot('emissive');
             }
         }
 
@@ -741,6 +1125,32 @@ export class ModelManager {
         }
     }
 
+    _clearStaleEntryTextureFallbackForSubmeshLodsInPlace(entry) {
+        const mat = entry?.material;
+        if (!mat || typeof mat !== 'object') return;
+        const entryHasAuthoritativeShader = !!(
+            (typeof mat.shaderName === 'string' && mat.shaderName)
+            || (mat.shaderParams && typeof mat.shaderParams === 'object')
+        );
+        if (entryHasAuthoritativeShader) return;
+
+        let submeshCount = 0;
+        let materialCount = 0;
+        const lods = entry?.lods;
+        if (lods && typeof lods === 'object') {
+            for (const lodMeta of Object.values(lods)) {
+                const subs = lodMeta?.submeshes;
+                if (!Array.isArray(subs)) continue;
+                for (const sm of subs) {
+                    if (!sm || typeof sm !== 'object') continue;
+                    submeshCount++;
+                    if (sm.material && typeof sm.material === 'object' && Object.keys(sm.material).length > 0) materialCount++;
+                }
+            }
+        }
+        if (submeshCount > 0 && submeshCount === materialCount) delete entry.material;
+    }
+
     _normalizeManifestMeshEntryInPlace(entry) {
         if (!entry || typeof entry !== 'object') return;
         if (entry.__viewerNormalizedMaterials) return;
@@ -762,6 +1172,10 @@ export class ModelManager {
                     }
                 }
             }
+        } catch { /* ignore */ }
+
+        try {
+            this._clearStaleEntryTextureFallbackForSubmeshLodsInPlace(entry);
         } catch { /* ignore */ }
 
         // Mark so we don't redo this work on every call site.
@@ -799,6 +1213,13 @@ export class ModelManager {
             alphaMask: (typeof m.alphaMask === 'string' && m.alphaMask) ? m.alphaMask : null,
             alphaMaskKtx2: (typeof m.alphaMaskKtx2 === 'string' && m.alphaMaskKtx2) ? m.alphaMaskKtx2 : null,
             isDistMap: !!m.isDistMap,
+            diffuseUvSet: (m.diffuseUvSet ?? m.diffuseUv ?? null),
+            // Store the resolved renderer behavior rather than the source spelling so aliases such as
+            // "RG" and "rg" continue to batch while distinct normal decoding cannot be combined.
+            normalEncoding: (String(m.normalSwizzle || 'rg').toLowerCase() === 'ag') ? 1 : 0,
+            normalReconstructZ: (m.normalReconstructZ === undefined || m.normalReconstructZ === null)
+                ? 1
+                : this._roundNum(m.normalReconstructZ),
             // Extra workflow textures (best-effort parity): include in signature to prevent incorrect batching.
             tintPalette: (typeof m.tintPalette === 'string' && m.tintPalette) ? m.tintPalette : null,
             env: (typeof m.env === 'string' && m.env) ? m.env : null,
@@ -817,9 +1238,6 @@ export class ModelManager {
             uv1ScaleOffset: this._normalizeUvScaleOffset(m.uv1ScaleOffset),
             uv2ScaleOffset: this._normalizeUvScaleOffset(m.uv2ScaleOffset),
             uv3ScaleOffset: this._normalizeUvScaleOffset(m.uv3ScaleOffset),
-            tintPaletteSelector: (Array.isArray(m.tintPaletteSelector) && m.tintPaletteSelector.length >= 2)
-                ? [this._roundNum(m.tintPaletteSelector[0]), this._roundNum(m.tintPaletteSelector[1])]
-                : null,
             tintMode: Number.isFinite(Number(m.tintMode)) ? (Number(m.tintMode) | 0) : null,
             globalAnimUV0: (Array.isArray(m.globalAnimUV0) && m.globalAnimUV0.length >= 3)
                 ? [this._roundNum(m.globalAnimUV0[0]), this._roundNum(m.globalAnimUV0[1]), this._roundNum(m.globalAnimUV0[2])]
@@ -830,6 +1248,7 @@ export class ModelManager {
             bumpiness: this._roundNum(m.bumpiness),
             specularIntensity: this._roundNum(m.specularIntensity),
             specularPower: this._roundNum(m.specularPower),
+            specularFalloffMult: this._roundNum(m.specularFalloffMult),
             specularFresnel: this._roundNum(m.specularFresnel),
             emissiveIntensity: this._roundNum(m.emissiveIntensity),
             aoStrength: this._roundNum(m.aoStrength),
@@ -838,6 +1257,9 @@ export class ModelManager {
                 : null,
             wetness: this._roundNum(m.wetness),
             wetDarken: this._roundNum(m.wetDarken),
+            wetSpecBoost: this._roundNum(m.wetSpecBoost),
+            reflectionIntensity: this._roundNum(m.reflectionIntensity),
+            fresnelPower: this._roundNum(m.fresnelPower),
             dirtLevel: this._roundNum(m.dirtLevel),
             dirtColor: (Array.isArray(m.dirtColor) && m.dirtColor.length >= 3)
                 ? [this._roundNum(m.dirtColor[0]), this._roundNum(m.dirtColor[1]), this._roundNum(m.dirtColor[2])]
@@ -863,6 +1285,7 @@ export class ModelManager {
             hardAlphaBlend: this._roundNum(m.hardAlphaBlend),
             alphaToCoverage: !!m.alphaToCoverage,
             doubleSided: !!m.doubleSided,
+            pedHairTint: m.pedHairTint === true,
             decalBlendMode: (typeof m.decalBlendMode === 'string' && m.decalBlendMode) ? m.decalBlendMode : null,
             decalDepthBias: this._roundNum(m.decalDepthBias),
             decalSlopeScale: this._roundNum(m.decalSlopeScale),
@@ -902,6 +1325,18 @@ export class ModelManager {
             waterFogParams: (Array.isArray(m.waterFogParams) && m.waterFogParams.length >= 4)
                 ? [this._roundNum(m.waterFogParams[0]), this._roundNum(m.waterFogParams[1]), this._roundNum(m.waterFogParams[2]), this._roundNum(m.waterFogParams[3])]
                 : null,
+            waterEnableTexture: (m.waterEnableTexture === undefined || m.waterEnableTexture === null)
+                ? !String(m.shaderName || '').toLowerCase().includes('foam')
+                : !!m.waterEnableTexture,
+            waterEnableBumpMap: (m.waterEnableBumpMap === undefined || m.waterEnableBumpMap === null)
+                ? true
+                : !!m.waterEnableBumpMap,
+            waterEnableFoamMap: (m.waterEnableFoamMap === undefined || m.waterEnableFoamMap === null)
+                ? String(m.shaderName || '').toLowerCase().includes('foam')
+                : !!m.waterEnableFoamMap,
+            waterEnableFogtex: (m.waterEnableFogtex === undefined || m.waterEnableFogtex === null)
+                ? (!!m.env && Array.isArray(m.waterFogParams) && m.waterFogParams.length >= 4)
+                : !!m.waterEnableFogtex,
             enableWaterFlow: (m.enableWaterFlow === undefined || m.enableWaterFlow === null) ? null : !!m.enableWaterFlow,
             waterMode: Number.isFinite(Number(m.waterMode)) ? (Number(m.waterMode) | 0) : null,
             rippleSpeed: this._roundNum(m.rippleSpeed),
@@ -917,6 +1352,12 @@ export class ModelManager {
         if (!base && !sm) return {};
         if (!base) return { ...sm };
         if (!sm) return { ...base };
+        const smHasAuthoritativeShaderParams = !!(sm.shaderParams && typeof sm.shaderParams === 'object');
+        const baseHasAuthoritativeShader = !!(
+            (typeof base.shaderName === 'string' && base.shaderName)
+            || (base.shaderParams && typeof base.shaderParams === 'object')
+        );
+        if (smHasAuthoritativeShaderParams || !baseHasAuthoritativeShader) return { ...sm };
         // Submesh fields override entry fields when present.
         return { ...base, ...sm };
     }
@@ -1064,15 +1505,27 @@ export class ModelManager {
         const path = String(manifestPath || 'assets/models/manifest.json');
         const baseDir = path.replace(/\/[^\/]+$/, '') || 'assets/models';
         this._manifestBaseDir = baseDir;
+        this._kickoffNonRenderableIndexLoad(baseDir);
 
         // 1) Try sharded index first: <baseDir>/manifest_index.json
         try {
             const idxPath = `${baseDir}/manifest_index.json`;
-            const idx = await fetchJSON(idxPath);
+            const idx = await fetchJSON(idxPath, {
+                priority: 'high',
+                usePersistentCache: false,
+                useMemoryCache: false,
+            });
             if (idx && typeof idx === 'object' && idx.schema === 'webglgta-manifest-index-v1') {
                 this._sharded = true;
                 this._manifestIndex = idx;
+                const shardVersion = [
+                    idx.source_mtime_ns,
+                    idx.mesh_count,
+                    idx.manifest_version,
+                ].map((v) => String(v ?? '').trim()).filter(Boolean).join('-');
+                this._manifestShardCacheBust = shardVersion ? `?v=${encodeURIComponent(shardVersion)}` : '';
                 this.manifest = { version: (idx.manifest_version ?? 1), meshes: {} };
+                this._applyManifestSubsetOverrides();
                 return true;
             }
         } catch {
@@ -1082,6 +1535,7 @@ export class ModelManager {
         // 2) Monolithic manifest path
         this._sharded = false;
         this._manifestIndex = null;
+        this._manifestShardCacheBust = '';
         this._loadedShards.clear();
         this._loadingShards.clear();
 
@@ -1096,6 +1550,16 @@ export class ModelManager {
             if (canWorker) {
                 try {
                     const w = new Worker(new URL('./manifest_worker.js', import.meta.url), { type: 'module' });
+                    // Relative URLs inside a module worker resolve against the worker
+                    // bundle (for example /bundled/), not the viewer document. Resolve
+                    // here so compact deployments can fall back to manifest.json.
+                    const workerManifestUrl = (() => {
+                        try {
+                            return new URL(path, document.baseURI).href;
+                        } catch {
+                            return path;
+                        }
+                    })();
                     const data = await new Promise((resolve, reject) => {
                         const cleanup = () => {
                             try { w.terminate(); } catch { /* ignore */ }
@@ -1114,10 +1578,11 @@ export class ModelManager {
                             cleanup();
                             reject(err?.error || err);
                         };
-                        w.postMessage({ url: path });
+                        w.postMessage({ url: workerManifestUrl });
                     });
 
                     this.manifest = data;
+                    this._applyManifestSubsetOverrides();
                     return true;
                 } catch {
                     // Fall back to main-thread JSON if Worker path fails (older browsers / CSP / file://, etc.)
@@ -1125,6 +1590,7 @@ export class ModelManager {
             }
 
             this.manifest = await fetchJSON(path);
+            this._applyManifestSubsetOverrides();
             return true;
         } catch {
             console.warn(`ModelManager: no manifest at ${path}`);
@@ -1158,17 +1624,68 @@ export class ModelManager {
 
     isShardLoadedForHash(hash) {
         if (!this._sharded) return true;
+        const h = this.normalizeId(hash);
+        if (h && this.manifest?.meshes?.[h]) return true;
         const sid = this._shardIdForHash(hash);
         if (sid === null) return true;
         return this._loadedShards.has(sid);
     }
 
-    prefetchMeta(hash) {
+    prefetchMeta(hash, { priority = 'high', force = false } = {}) {
         // Fire-and-forget loading of metadata shard for this archetype.
-        if (!this._sharded) return;
+        if (!this._sharded) return Promise.resolve(true);
+        const h = this.normalizeId(hash);
+        // /demo installs one spatially-filtered manifest before it starts the instance
+        // stream. Do not then fetch the source shard for every one of those hashes.
+        if (!force && h && this.manifest?.meshes?.[h]) return Promise.resolve(true);
         const sid = this._shardIdForHash(hash);
-        if (sid === null) return;
-        this.prefetchShardById(sid, { priority: 'high' });
+        if (sid === null) return Promise.resolve(false);
+        return this.prefetchShardById(sid, { priority, force });
+    }
+
+    installManifestSubset(data, { source = 'runtime' } = {}) {
+        const meshes = data?.meshes;
+        if (!this.manifest || !this.manifest.meshes || !meshes || typeof meshes !== 'object') return 0;
+        if (data?.meshPackRevisions && typeof data.meshPackRevisions === 'object') {
+            this.manifest.meshPackRevisions = {
+                ...(this.manifest.meshPackRevisions || {}),
+                ...data.meshPackRevisions,
+            };
+        }
+        let added = 0;
+        for (const [hash, entry] of Object.entries(meshes)) {
+            const h = this.normalizeId(hash);
+            if (!h || !entry || typeof entry !== 'object') continue;
+            this._normalizeManifestMeshEntryInPlace(entry);
+            if (!this.manifest.meshes[h]) added++;
+            this._manifestSubsetOverrides.set(h, entry);
+            this.manifest.meshes[h] = entry;
+        }
+        let nonRenderableAdded = 0;
+        for (const rawHash of (Array.isArray(data?.nonRenderableHashes) ? data.nonRenderableHashes : [])) {
+            const h = this.normalizeId(rawHash);
+            if (!h || this._nonRenderableHashes.has(h)) continue;
+            this._nonRenderableHashes.add(h);
+            nonRenderableAdded++;
+        }
+        if (added > 0 || nonRenderableAdded > 0) {
+            try {
+                this.onManifestUpdated?.({
+                    type: 'manifestSubset',
+                    source,
+                    added,
+                    nonRenderableAdded,
+                });
+            } catch { /* ignore */ }
+        }
+        return added;
+    }
+
+    _applyManifestSubsetOverrides() {
+        if (!this.manifest?.meshes || !this._manifestSubsetOverrides.size) return;
+        for (const [hash, entry] of this._manifestSubsetOverrides.entries()) {
+            this.manifest.meshes[hash] = entry;
+        }
     }
 
     /**
@@ -1176,24 +1693,40 @@ export class ModelManager {
      * This is useful when we have a spatial index that maps world chunks -> shard IDs, and
      * we want to warm manifest metadata *before* parsing chunk contents.
      */
-    prefetchShardById(shardId, { priority = 'high' } = {}) {
-        if (!this._sharded) return;
+    prefetchShardById(shardId, { priority = 'high', force = false } = {}) {
+        if (!this._sharded) return Promise.resolve(false);
         const sid0 = Number(shardId);
-        if (!Number.isFinite(sid0)) return;
+        if (!Number.isFinite(sid0)) return Promise.resolve(false);
         const sid = (sid0 | 0) >>> 0;
-        if (this._loadedShards.has(sid)) return;
-        if (this._loadingShards.has(sid)) return;
+        if (this._loadedShards.has(sid) && !force) return Promise.resolve(true);
+        if (this._loadingShards.has(sid)) return this._loadingShards.get(sid);
 
-        const url = this._shardFilename(sid);
+        if (force) this._loadedShards.delete(sid);
+        const urlBase = this._shardFilename(sid);
+        const bust = String(this._manifestShardCacheBust || '');
+        const versionedUrl = `${urlBase}${bust}`;
+        const url = force
+            ? `${versionedUrl}${bust ? '&' : '?'}live=${Date.now()}`
+            : versionedUrl;
         const p = (async () => {
             try {
+                if (force) {
+                    try { await deleteAssetCacheEntry(urlBase); } catch { /* ignore */ }
+                    try { await deleteAssetCacheEntry(versionedUrl); } catch { /* ignore */ }
+                }
                 // Shard meta gates whether we can render real meshes for nearby archetypes.
-                const data = await fetchJSON(url, { priority: (priority === 'low' ? 'low' : 'high') });
+                const data = await fetchJSON(url, {
+                    priority: (priority === 'low' ? 'low' : 'high'),
+                    usePersistentCache: !force,
+                    useMemoryCache: !force,
+                });
                 const meshes = data?.meshes;
                 if (this.manifest && this.manifest.meshes && meshes && typeof meshes === 'object') {
                     const before = Object.keys(this.manifest.meshes).length;
                     for (const [k, v] of Object.entries(meshes)) {
-                        this.manifest.meshes[k] = v;
+                        const h = this.normalizeId(k);
+                        if (h && this._manifestSubsetOverrides.has(h)) continue;
+                        this.manifest.meshes[h || k] = v;
                     }
                     const after = Object.keys(this.manifest.meshes).length;
                     this._loadedShards.add(sid);
@@ -1206,9 +1739,11 @@ export class ModelManager {
                     this._loadedShards.add(sid);
                 }
                 return true;
-            } catch {
-                // If shard fetch fails, don't spam retries; mark as "loaded" so we won't loop forever.
-                this._loadedShards.add(sid);
+            } catch (error) {
+                // A failed shard is not loaded. Callers that depend on its metadata
+                // must be able to retry instead of permanently treating meshes as absent.
+                this._loadedShards.delete(sid);
+                console.warn(`ModelManager: manifest shard ${sid} failed to load`, error);
                 return false;
             } finally {
                 this._loadingShards.delete(sid);
@@ -1216,6 +1751,83 @@ export class ModelManager {
         })();
 
         this._loadingShards.set(sid, p);
+        return p;
+    }
+
+    async refreshMetaForHashes(hashes) {
+        if (!this._sharded) return false;
+        const sids = new Set();
+        for (const hash of (Array.isArray(hashes) ? hashes : [])) {
+            const sid = this._shardIdForHash(hash);
+            if (sid !== null) sids.add(sid);
+        }
+        if (!sids.size) return false;
+        const jobs = [];
+        for (const sid of sids) jobs.push(this.prefetchShardById(sid, { priority: 'high', force: true }));
+        await Promise.allSettled(jobs);
+        return true;
+    }
+
+    requestLiveExportForHashes(hashes, { exportTextures = this.liveExportTextures } = {}) {
+        if (!this.enableLiveExport || this._liveExportDisabled || this._liveExportInFlight) return;
+        let batch = [];
+        for (const hash of (Array.isArray(hashes) ? hashes : [])) {
+            const h = this.normalizeId(hash);
+            if (!h) continue;
+            if (this.hasRealMesh(h)) continue;
+            if (this._liveExportRequested.has(h)) continue;
+            this._liveExportRequested.add(h);
+            batch.push(h);
+            if (batch.length >= this.liveExportBatchSize) break;
+        }
+        if (!batch.length) return;
+
+        const now = Date.now();
+        const delayMs = Math.max(0, 12000 - (now - this._liveExportLastMs));
+        this._liveExportQueue.push({ hashes: batch, exportTextures: !!exportTextures });
+        window.setTimeout(() => this._drainLiveExportQueue(), delayMs);
+    }
+
+    async _drainLiveExportQueue() {
+        if (this._liveExportInFlight || this._liveExportDisabled) return;
+        const next = this._liveExportQueue.shift();
+        if (!next) return;
+        this._liveExportInFlight = true;
+        this._liveExportLastMs = Date.now();
+        try {
+            const resp = await fetch('/__live_export/archetypes', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    hashes: next.hashes,
+                    top: next.hashes.length,
+                    exportTextures: !!next.exportTextures,
+                }),
+            });
+            if (resp.status === 404 || resp.status === 405) {
+                this._liveExportDisabled = true;
+                return;
+            }
+            const data = await resp.json().catch(() => null);
+            if (!resp.ok || !data?.ok) {
+                console.warn('ModelManager: live export failed', data || resp.status);
+                return;
+            }
+            await this.refreshMetaForHashes(next.hashes);
+            await this.refreshNonRenderableIndex();
+            try {
+                this.onManifestUpdated?.({ type: 'liveExport', hashes: next.hashes, durationMs: data.durationMs });
+            } catch {
+                // ignore
+            }
+        } catch (e) {
+            console.warn('ModelManager: live export request failed', e);
+        } finally {
+            this._liveExportInFlight = false;
+            if (this._liveExportQueue.length) {
+                window.setTimeout(() => this._drainLiveExportQueue(), 12000);
+            }
+        }
     }
 
     hasMesh(hash) {
@@ -1230,6 +1842,69 @@ export class ModelManager {
         return !!(this.manifest && this.manifest.meshes && this.manifest.meshes[h0] && this.manifest.meshes[h0].lods);
     }
 
+    isNonRenderable(hash) {
+        const h0 = this.normalizeId(hash);
+        return !!h0 && this._nonRenderableHashes.has(h0);
+    }
+
+    getNonRenderableHashes() {
+        return Array.from(this._nonRenderableHashes);
+    }
+
+    getApproxRadiusForHash(hash, lod = null, fallback = null) {
+        const fallbackNumber = Number(fallback);
+        const fallbackRadius = Number.isFinite(fallbackNumber) && fallbackNumber > 0 ? fallbackNumber : null;
+        const h = this.normalizeId(hash);
+        if (!h || !this.manifest || !this.manifest.meshes || !this.manifest.meshes[h]) return fallbackRadius;
+
+        const entry = this.manifest.meshes[h];
+        const finiteRadius = (v) => {
+            const n = Number(v);
+            return Number.isFinite(n) && n > 0 ? n : null;
+        };
+        const scanLod = (lodMeta) => {
+            if (!lodMeta || typeof lodMeta !== 'object') return null;
+            let best = finiteRadius(lodMeta.radius);
+            const subs = Array.isArray(lodMeta.submeshes)
+                ? lodMeta.submeshes
+                : (Array.isArray(lodMeta.meshes) ? lodMeta.meshes : []);
+            for (const sm of subs) {
+                const r = finiteRadius(sm?.radius);
+                if (r !== null && (best === null || r > best)) best = r;
+            }
+            return best;
+        };
+
+        if (lod) {
+            const r = scanLod(this._getLodMetaEntry(h, lod));
+            if (r !== null) return r;
+        }
+
+        const entryRadius = finiteRadius(entry.radius);
+        if (entryRadius !== null) return entryRadius;
+
+        let best = null;
+        const lods = entry.lods || {};
+        for (const lodMeta of Object.values(lods)) {
+            const r = scanLod(lodMeta);
+            if (r !== null && (best === null || r > best)) best = r;
+        }
+        return best !== null ? best : fallbackRadius;
+    }
+
+    getApproxRadiusEntries({ lod = null, limit = 5000, fallback = null } = {}) {
+        const meshes = this.manifest?.meshes;
+        if (!meshes || typeof meshes !== 'object') return [];
+        const lim = Number.isFinite(Number(limit)) ? Math.max(0, Math.floor(Number(limit))) : 5000;
+        const out = [];
+        for (const hash of Object.keys(meshes)) {
+            const radius = this.getApproxRadiusForHash(hash, lod, fallback);
+            if (Number.isFinite(radius) && radius > 0) out.push([String(hash), radius]);
+            if (lim > 0 && out.length >= lim) break;
+        }
+        return out;
+    }
+
     /**
      * Return the chosen LOD metadata node for an archetype (supports both v3 and v4 manifests).
      * @returns {any|null}
@@ -1239,7 +1914,17 @@ export class ModelManager {
         if (!this.manifest || !this.manifest.meshes || !this.manifest.meshes[h]) return null;
         const metaEntry = this.manifest.meshes[h];
         const lods = metaEntry.lods || {};
-        return lods[l] || lods.high || lods.med || lods.low || lods.vlow || null;
+        const orders = {
+            high: ['high', 'med', 'low', 'vlow'],
+            med: ['med', 'low', 'vlow', 'high'],
+            low: ['low', 'vlow', 'med', 'high'],
+            vlow: ['vlow', 'low', 'med', 'high'],
+        };
+        const order = orders[l] || orders.high;
+        for (const key of order) {
+            if (lods[key]) return lods[key];
+        }
+        return null;
     }
 
     /**
@@ -1247,7 +1932,7 @@ export class ModelManager {
      * - v4: lodMeta = { submeshes: [ {file, material, ...}, ... ] }
      * - v3: lodMeta = { file, ... } and material is at metaEntry.material
      *
-     * @returns {Array<{file: string, material: any}>}
+     * @returns {Array<{file: string, material: any, skinned?: boolean, boneIds?: number[], hasBlendWeights?: boolean, hasBlendIndices?: boolean, fragmentBoneTag?: number|null}>}
      */
     getLodSubmeshes(hash, lod = 'high') {
         const h = this.normalizeId(hash);
@@ -1260,17 +1945,46 @@ export class ModelManager {
         const lodMeta = this._getLodMetaEntry(h, lod);
         if (!lodMeta) return [];
         const entryMat = metaEntry?.material ?? null;
+        const pedComponent = (metaEntry?.pedComponent && typeof metaEntry.pedComponent === 'object')
+            ? metaEntry.pedComponent
+            : null;
 
         // v4 path
         if (lodMeta && typeof lodMeta === 'object' && Array.isArray(lodMeta.submeshes)) {
             return lodMeta.submeshes
+                .filter((sm) => {
+                    const material = this._effectiveMaterialForSubmesh(entryMat, sm?.material ?? null);
+                    const shaderName = String(material?.shaderName || '').toLowerCase();
+                    if (!shaderName.includes('ped_hair_spiked')) return true;
+                    const order = material?.shaderParams?.vectorsByHash?.['1617153586'];
+                    return !(Array.isArray(order) && Number(order[0]) > 0);
+                })
                 .map((sm) => {
                     const file = String(sm?.file || '');
                     if (!file) return null;
                     // Always return an *effective* material so downstream paths (bucketing, renderer)
                     // can reliably see diffuse/normal/spec even if some fields are only present at the entry level.
                     const eff = this._effectiveMaterialForSubmesh(entryMat, sm?.material ?? null);
-                    return { file, material: eff };
+                    return {
+                        file,
+                        material: eff,
+                        pedComponent,
+                        skinned: !!sm?.skinned,
+                        boneIds: Array.isArray(sm?.boneIds) ? sm.boneIds.slice(0) : [],
+                        hasBlendWeights: !!sm?.hasBlendWeights,
+                        hasBlendIndices: !!sm?.hasBlendIndices,
+                        fragmentBoneTag: Number.isFinite(Number(sm?.fragmentBoneTag)) ? Number(sm.fragmentBoneTag) : null,
+                        // Fragment metadata is consumed by the vehicle renderer. Keep it
+                        // alongside the render-facing copy instead of dropping it here.
+                        fragmentPivot: Array.isArray(sm?.fragmentPivot) ? sm.fragmentPivot.slice(0, 3).map(Number) : null,
+                        bounds: sm?.bounds && typeof sm.bounds === 'object' ? sm.bounds : null,
+                        radius: Number.isFinite(Number(sm?.radius)) ? Number(sm.radius) : 0,
+                        trackSource: typeof sm?.trackSource === 'string' ? sm.trackSource : null,
+                        trackGroup: sm?.trackGroup !== null && sm?.trackGroup !== undefined && Number.isFinite(Number(sm.trackGroup))
+                            ? Number(sm.trackGroup)
+                            : null,
+                        loadPriority: Number.isFinite(Number(sm?.loadPriority)) ? Number(sm.loadPriority) : 0,
+                    };
                 })
                 .filter(Boolean);
         }
@@ -1278,33 +1992,84 @@ export class ModelManager {
         // v3 path (single mesh)
         const file = String(lodMeta?.file || '');
         if (!file) return [];
-        return [{ file, material: entryMat }];
+        return [{
+            file,
+            material: entryMat,
+            skinned: false,
+            boneIds: [],
+            hasBlendWeights: false,
+            hasBlendIndices: false,
+            fragmentPivot: Array.isArray(lodMeta?.fragmentPivot) ? lodMeta.fragmentPivot.slice(0, 3).map(Number) : null,
+            bounds: lodMeta?.bounds && typeof lodMeta.bounds === 'object' ? lodMeta.bounds : null,
+            radius: Number.isFinite(Number(lodMeta?.radius)) ? Number(lodMeta.radius) : 0,
+            trackSource: typeof lodMeta?.trackSource === 'string' ? lodMeta.trackSource : null,
+            trackGroup: lodMeta?.trackGroup !== null && lodMeta?.trackGroup !== undefined && Number.isFinite(Number(lodMeta.trackGroup))
+                ? Number(lodMeta.trackGroup)
+                : null,
+            loadPriority: Number.isFinite(Number(lodMeta?.loadPriority)) ? Number(lodMeta.loadPriority) : 0,
+        }];
     }
 
-    async loadMeshFile(file) {
+    async loadMeshFile(file, {
+        usePersistentCache = true,
+        cacheBust = '',
+        requireBlendAttributes = false,
+    } = {}) {
         const f = String(file || '').trim();
         if (!f) return null;
         const key = f;
         if (this.meshCache.has(key)) {
             const m = this.meshCache.get(key);
-            if (m && !m._disposed) {
+            const hasRequiredBlendAttributes = !requireBlendAttributes || (
+                !!m?.blendWeightsBuffer && !!m?.blendIndicesBuffer
+            );
+            if (m && !m._disposed && hasRequiredBlendAttributes) {
                 this.touchMesh(key);
                 return m;
             }
-            // If it was disposed but still referenced somewhere, drop it and reload.
+            // Drop stale pre-skinning cache entries before a ped requests the current v8 mesh.
             this.meshCache.delete(key);
+            const bytes = this._meshCacheApproxBytes.get(key) ?? (m?.approxBytes ?? 0);
             this._meshCacheApproxBytes.delete(key);
+            if (Number.isFinite(bytes)) this._meshCacheBytes = Math.max(0, this._meshCacheBytes - Math.max(0, bytes));
+            this._disposeMesh(m);
         }
 
-        const path = `assets/models/${f}`;
+        const packedRef = this._parseDemoMeshPackRef(f);
+        const basePath = packedRef ? `assets/demo/${packedRef.packFile}` : `assets/models/${f}`;
+        const freshToken = String(cacheBust || '').trim();
+        const path = freshToken
+            ? `${basePath}${basePath.includes('?') ? '&' : '?'}live=${encodeURIComponent(freshToken)}`
+            : basePath;
         let buf;
         try {
-            buf = await fetchArrayBuffer(path);
+            buf = packedRef
+                ? await this._loadDemoMeshPackSlice(packedRef, { usePersistentCache })
+                : await fetchArrayBufferPreferredCompressed(path, { usePersistentCache: !!usePersistentCache });
         } catch (e) {
             console.warn(`ModelManager: failed to fetch/read mesh bin ${path}`, e);
             return null;
         }
-        const mesh = this._parseAndUploadMesh(key, buf);
+        const compressedByName = /\.(?:gz|gzip)$/i.test(f);
+        const hasGzipHeader = buf.byteLength >= 2
+            && new Uint8Array(buf, 0, 2)[0] === 0x1f
+            && new Uint8Array(buf, 0, 2)[1] === 0x8b;
+        // Vite serves .gz files with Content-Encoding, so fetch() has already
+        // decompressed those responses. Static production hosting serves the
+        // raw file, where the signature remains and needs decompression here.
+        if (compressedByName && hasGzipHeader) {
+            if (typeof DecompressionStream !== 'function') throw new Error('This browser does not support compressed mesh assets');
+            const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'));
+            buf = await new Response(stream).arrayBuffer();
+        }
+        const mesh = packedRef
+            ? await this._enqueuePackedMeshUpload(key, buf)
+            : this._parseAndUploadMesh(key, buf);
+        if (mesh && requireBlendAttributes && (!mesh.blendWeightsBuffer || !mesh.blendIndicesBuffer)) {
+            console.warn(`ModelManager: ${f} was requested as skinned but has no blend attributes`);
+            this._disposeMesh(mesh);
+            return null;
+        }
         if (mesh) {
             this.meshCache.set(key, mesh);
             const bytes = Number(mesh.approxBytes ?? 0);
@@ -1384,9 +2149,29 @@ export class ModelManager {
         gl.enableVertexAttribArray(1);
         gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
 
+        let uploadIndices = indices;
+        let indexType = gl.UNSIGNED_INT;
+        if (indices.length > 0) {
+            let maxIndex = 0;
+            for (let i = 0; i < indices.length; i++) maxIndex = Math.max(maxIndex, indices[i]);
+            if (maxIndex <= 0xffff) {
+                uploadIndices = new Uint16Array(indices);
+                indexType = gl.UNSIGNED_SHORT;
+            }
+        }
+
         const idxBuffer = gl.createBuffer();
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuffer);
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, uploadIndices, gl.STATIC_DRAW);
+
+        const lineIndices = createWireframeIndices(
+            uploadIndices,
+            indexType === gl.UNSIGNED_SHORT ? Uint16Array : Uint32Array,
+        );
+        const lineIdxBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineIdxBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lineIndices, gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuffer);
 
         // aColor0: location 8 (default to white when absent)
         try {
@@ -1407,8 +2192,14 @@ export class ModelManager {
             tanBuffer: null,
             col0Buffer: null,
             col1Buffer: null,
+            blendWeightsBuffer: null,
+            blendIndicesBuffer: null,
             idxBuffer,
+            lineIdxBuffer,
             indexCount: indices.length,
+            lineIndexCount: lineIndices.length,
+            indexType,
+            lineIndexType: indexType,
             // Conservative local-space bounds (unit cube) + bounding sphere radius.
             bounds: { min: [-0.5, -0.5, -0.5], max: [0.5, 0.5, 0.5], center: [0, 0, 0] },
             radius: Math.sqrt(0.5 * 0.5 + 0.5 * 0.5 + 0.5 * 0.5),
@@ -1430,56 +2221,155 @@ export class ModelManager {
         const indexCount = dv.getUint32(12, true);
         const flags = dv.getUint32(16, true);
 
-        if (magic !== 'MSH0' || (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7)) {
+        if (magic !== 'MSH0' || (version < 1 || version > 10)) {
             console.warn(`ModelManager: bad mesh header for ${key} (magic=${magic}, version=${version})`);
             return null;
         }
 
-        const headerBytes = 20;
-        const posBytes = vertexCount * 3 * 4;
+        const affinePositions = version === 10;
+        const headerBytes = affinePositions ? 44 : 20;
+        if (arrayBuffer.byteLength < headerBytes) {
+            console.warn(`ModelManager: truncated mesh header for ${key}`);
+            return null;
+        }
+        const packed = version >= 9;
+        const positionMin = affinePositions
+            ? [dv.getFloat32(20, true), dv.getFloat32(24, true), dv.getFloat32(28, true)]
+            : null;
+        const positionExtent = affinePositions
+            ? [dv.getFloat32(32, true), dv.getFloat32(36, true), dv.getFloat32(40, true)]
+            : null;
+        const posBytes = vertexCount * 3 * (packed ? 2 : 4);
         const hasNormals = version >= 2 && (flags & 1) === 1;
-        const nrmBytes = hasNormals ? vertexCount * 3 * 4 : 0;
+        const hasInt8Normals = packed && (flags & 1024) === 1024;
+        const hasTightInt8Normals = hasInt8Normals && (flags & 2048) === 2048;
+        const nrmBytes = hasNormals ? vertexCount * (hasTightInt8Normals ? 3 : (hasInt8Normals ? 4 : (packed ? 6 : 12))) : 0;
         const hasUvs = version >= 3 && (flags & 2) === 2;
-        const uvBytes = hasUvs ? vertexCount * 2 * 4 : 0;
+        const uvBytes = hasUvs ? vertexCount * 2 * (packed ? 2 : 4) : 0;
         const hasUv1 = version >= 6 && (flags & 16) === 16;
-        const uv1Bytes = hasUv1 ? vertexCount * 2 * 4 : 0;
+        const uv1Bytes = hasUv1 ? vertexCount * 2 * (packed ? 2 : 4) : 0;
         const hasUv2 = version >= 7 && (flags & 32) === 32;
-        const uv2Bytes = hasUv2 ? vertexCount * 2 * 4 : 0;
+        const uv2Bytes = hasUv2 ? vertexCount * 2 * (packed ? 2 : 4) : 0;
         const hasTangents = version >= 4 && (flags & 4) === 4;
-        const tanBytes = hasTangents ? vertexCount * 4 * 4 : 0;
+        const tanBytes = hasTangents ? vertexCount * 4 * (packed ? 1 : 4) : 0;
         const hasColor0 = version >= 5 && (flags & 8) === 8;
         const col0Bytes = hasColor0 ? vertexCount * 4 : 0;
         const hasColor1 = version >= 7 && (flags & 64) === 64;
         const col1Bytes = hasColor1 ? vertexCount * 4 : 0;
-        const idxBytes = indexCount * 4;
-        if (headerBytes + posBytes + nrmBytes + uvBytes + uv1Bytes + uv2Bytes + tanBytes + col0Bytes + col1Bytes + idxBytes > arrayBuffer.byteLength) {
+        const hasBlendWeights = version >= 8 && (flags & 128) === 128;
+        const blendWeightsBytes = hasBlendWeights ? vertexCount * 4 : 0;
+        const hasBlendIndices = version >= 8 && (flags & 256) === 256;
+        const blendIndicesBytes = hasBlendIndices ? vertexCount * 4 : 0;
+        const hasUint16Indices = packed && (flags & 512) === 512;
+        const hasDeltaIndices = hasUint16Indices && (flags & 4096) === 4096;
+        const fixedIdxBytes = indexCount * (hasUint16Indices ? 2 : 4);
+        const normalOffset = headerBytes + posBytes;
+        const uvOffset = hasTightInt8Normals ? ((normalOffset + nrmBytes + 1) & ~1) : normalOffset + nrmBytes;
+        const uv1Offset = uvOffset + uvBytes;
+        const uv2Offset = uv1Offset + uv1Bytes;
+        const tangentOffset = uv2Offset + uv2Bytes;
+        const color0Offset = tangentOffset + tanBytes;
+        const color1Offset = color0Offset + col0Bytes;
+        const blendWeightsOffset = color1Offset + col1Bytes;
+        const blendIndicesOffset = blendWeightsOffset + blendWeightsBytes;
+        const vertexPayloadEnd = blendIndicesOffset + blendIndicesBytes;
+        const indexOffset = packed ? ((vertexPayloadEnd + 3) & ~3) : vertexPayloadEnd;
+        const idxBytes = hasDeltaIndices ? arrayBuffer.byteLength - indexOffset : fixedIdxBytes;
+        if (indexOffset + idxBytes > arrayBuffer.byteLength) {
             console.warn(`ModelManager: truncated mesh ${key}`);
             return null;
         }
 
-        const positions = new Float32Array(arrayBuffer, headerBytes, vertexCount * 3);
-        const normals = hasNormals ? new Float32Array(arrayBuffer, headerBytes + posBytes, vertexCount * 3) : null;
-        const uvs = hasUvs ? new Float32Array(arrayBuffer, headerBytes + posBytes + nrmBytes, vertexCount * 2) : null;
-        const uv1 = hasUv1 ? new Float32Array(arrayBuffer, headerBytes + posBytes + nrmBytes + uvBytes, vertexCount * 2) : null;
-        const uv2 = hasUv2 ? new Float32Array(arrayBuffer, headerBytes + posBytes + nrmBytes + uvBytes + uv1Bytes, vertexCount * 2) : null;
-        const tangents = hasTangents ? new Float32Array(arrayBuffer, headerBytes + posBytes + nrmBytes + uvBytes + uv1Bytes + uv2Bytes, vertexCount * 4) : null;
-        const color0 = hasColor0 ? new Uint8Array(arrayBuffer, headerBytes + posBytes + nrmBytes + uvBytes + uv1Bytes + uv2Bytes + tanBytes, vertexCount * 4) : null;
-        const color1 = hasColor1 ? new Uint8Array(arrayBuffer, headerBytes + posBytes + nrmBytes + uvBytes + uv1Bytes + uv2Bytes + tanBytes + col0Bytes, vertexCount * 4) : null;
-        const indices = new Uint32Array(arrayBuffer, headerBytes + posBytes + nrmBytes + uvBytes + uv1Bytes + uv2Bytes + tanBytes + col0Bytes + col1Bytes, indexCount);
+        if (headerBytes + posBytes > arrayBuffer.byteLength) {
+            console.warn(`ModelManager: truncated position stream for ${key}`);
+            return null;
+        }
+
+        const diskPositions = packed ? new Uint16Array(arrayBuffer, headerBytes, vertexCount * 3) : null;
+        // MSH10 stores each local position as unorm16 inside the affine bounds
+        // from its header. Keep that compact stream on the GPU and decode in the
+        // vertex shader instead of expanding it into a Float32Array per mesh.
+        const positions = packed ? diskPositions : new Float32Array(arrayBuffer, headerBytes, vertexCount * 3);
+        const normals = hasNormals ? (hasInt8Normals
+            ? new Int8Array(arrayBuffer, normalOffset, vertexCount * (hasTightInt8Normals ? 3 : 4))
+            : (packed ? new Int16Array(arrayBuffer, normalOffset, vertexCount * 3) : new Float32Array(arrayBuffer, normalOffset, vertexCount * 3))) : null;
+        const uvs = hasUvs ? (packed ? new Uint16Array(arrayBuffer, uvOffset, vertexCount * 2) : new Float32Array(arrayBuffer, uvOffset, vertexCount * 2)) : null;
+        const uv1 = hasUv1 ? (packed ? new Uint16Array(arrayBuffer, uv1Offset, vertexCount * 2) : new Float32Array(arrayBuffer, uv1Offset, vertexCount * 2)) : null;
+        const uv2 = hasUv2 ? (packed ? new Uint16Array(arrayBuffer, uv2Offset, vertexCount * 2) : new Float32Array(arrayBuffer, uv2Offset, vertexCount * 2)) : null;
+        const tangents = hasTangents ? (packed ? new Int8Array(arrayBuffer, tangentOffset, vertexCount * 4) : new Float32Array(arrayBuffer, tangentOffset, vertexCount * 4)) : null;
+        const color0 = hasColor0 ? new Uint8Array(arrayBuffer, color0Offset, vertexCount * 4) : null;
+        const color1 = hasColor1 ? new Uint8Array(arrayBuffer, color1Offset, vertexCount * 4) : null;
+        const blendWeights = hasBlendWeights ? new Uint8Array(arrayBuffer, blendWeightsOffset, vertexCount * 4) : null;
+        const blendIndices = hasBlendIndices ? new Uint8Array(arrayBuffer, blendIndicesOffset, vertexCount * 4) : null;
+        let indices;
+        if (hasDeltaIndices) {
+            indices = new Uint32Array(indexCount);
+            const encoded = new Uint8Array(arrayBuffer, indexOffset, idxBytes);
+            let cursor = 0;
+            let previous = 0;
+            for (let i = 0; i < indexCount; i += 1) {
+                let value = 0;
+                let shift = 0;
+                let byte = 0;
+                do {
+                    if (cursor >= encoded.length || shift > 28) throw new Error(`ModelManager: invalid delta indices in ${key}`);
+                    byte = encoded[cursor++];
+                    value |= (byte & 0x7f) << shift;
+                    shift += 7;
+                } while (byte & 0x80);
+                const delta = (value >>> 1) ^ -(value & 1);
+                previous = (previous + delta) >>> 0;
+                indices[i] = previous;
+            }
+        } else {
+            const diskIndices = hasUint16Indices
+                ? new Uint16Array(arrayBuffer, indexOffset, indexCount)
+                : new Uint32Array(arrayBuffer, indexOffset, indexCount);
+            indices = hasUint16Indices ? new Uint32Array(diskIndices) : diskIndices;
+        }
+
+        // Do this before any GPU allocation. WebGL only reports a bad index at
+        // draw time, where the error otherwise looks like an unrelated renderer
+        // failure and can leave subsequent passes with stale state.
+        for (let i = 0; i < indices.length; i += 1) {
+            if (indices[i] >= vertexCount) {
+                console.warn(`ModelManager: mesh ${key} has index ${indices[i]} outside ${vertexCount} vertices`);
+                return null;
+            }
+        }
+
+        const halfToFloat = (value) => {
+            const sign = (value & 0x8000) ? -1 : 1;
+            const exponent = (value >>> 10) & 0x1f;
+            const fraction = value & 0x03ff;
+            if (exponent === 0) return sign * Math.pow(2, -14) * (fraction / 1024);
+            if (exponent === 0x1f) return fraction ? Number.NaN : sign * Number.POSITIVE_INFINITY;
+            return sign * Math.pow(2, exponent - 15) * (1 + fraction / 1024);
+        };
 
         // Conservative local-space bounds + sphere radius (used by occlusion/culling).
-        const bmin = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
-        const bmax = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY];
-        for (let i = 0; i < positions.length; i += 3) {
-            const x = positions[i + 0];
-            const y = positions[i + 1];
-            const z = positions[i + 2];
-            if (x < bmin[0]) bmin[0] = x;
-            if (y < bmin[1]) bmin[1] = y;
-            if (z < bmin[2]) bmin[2] = z;
-            if (x > bmax[0]) bmax[0] = x;
-            if (y > bmax[1]) bmax[1] = y;
-            if (z > bmax[2]) bmax[2] = z;
+        const bmin = affinePositions
+            ? [positionMin[0], positionMin[1], positionMin[2]]
+            : [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
+        const bmax = affinePositions
+            ? [
+                positionMin[0] + positionExtent[0],
+                positionMin[1] + positionExtent[1],
+                positionMin[2] + positionExtent[2],
+            ]
+            : [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY];
+        if (!affinePositions) {
+            for (let i = 0; i < positions.length; i += 3) {
+                const x = packed ? halfToFloat(positions[i + 0]) : positions[i + 0];
+                const y = packed ? halfToFloat(positions[i + 1]) : positions[i + 1];
+                const z = packed ? halfToFloat(positions[i + 2]) : positions[i + 2];
+                if (x < bmin[0]) bmin[0] = x;
+                if (y < bmin[1]) bmin[1] = y;
+                if (z < bmin[2]) bmin[2] = z;
+                if (x > bmax[0]) bmax[0] = x;
+                if (y > bmax[1]) bmax[1] = y;
+                if (z > bmax[2]) bmax[2] = z;
+            }
         }
         if (!Number.isFinite(bmin[0])) {
             bmin[0] = bmin[1] = bmin[2] = 0;
@@ -1503,7 +2393,7 @@ export class ModelManager {
 
         // aPosition: location 0.
         gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+        gl.vertexAttribPointer(0, 3, affinePositions ? gl.UNSIGNED_SHORT : (packed ? gl.HALF_FLOAT : gl.FLOAT), affinePositions, 0, 0);
 
         let nrmBuffer = null;
         if (normals) {
@@ -1512,7 +2402,7 @@ export class ModelManager {
             gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
             // aNormal: location 1
             gl.enableVertexAttribArray(1);
-            gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribPointer(1, 3, hasInt8Normals ? gl.BYTE : (packed ? gl.SHORT : gl.FLOAT), packed, hasInt8Normals ? (hasTightInt8Normals ? 3 : 4) : 0, 0);
         }
 
         let uvBuffer = null;
@@ -1522,7 +2412,7 @@ export class ModelManager {
             gl.bufferData(gl.ARRAY_BUFFER, uvs, gl.STATIC_DRAW);
             // aTexcoord0: location 2
             gl.enableVertexAttribArray(2);
-            gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribPointer(2, 2, packed ? gl.HALF_FLOAT : gl.FLOAT, false, 0, 0);
         }
 
         let uv1Buffer = null;
@@ -1532,12 +2422,12 @@ export class ModelManager {
             gl.bufferData(gl.ARRAY_BUFFER, uv1, gl.STATIC_DRAW);
             // aTexcoord1: location 9
             gl.enableVertexAttribArray(9);
-            gl.vertexAttribPointer(9, 2, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribPointer(9, 2, packed ? gl.HALF_FLOAT : gl.FLOAT, false, 0, 0);
         } else if (uvBuffer) {
             // Fallback: bind UV0 to UV1 so shaders that expect UV1 degrade gracefully.
             gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
             gl.enableVertexAttribArray(9);
-            gl.vertexAttribPointer(9, 2, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribPointer(9, 2, packed ? gl.HALF_FLOAT : gl.FLOAT, false, 0, 0);
         } else {
             try {
                 gl.disableVertexAttribArray(9);
@@ -1552,7 +2442,7 @@ export class ModelManager {
             gl.bufferData(gl.ARRAY_BUFFER, tangents, gl.STATIC_DRAW);
             // aTangent: location 3
             gl.enableVertexAttribArray(3);
-            gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribPointer(3, 4, packed ? gl.BYTE : gl.FLOAT, packed, 0, 0);
         }
 
         let col0Buffer = null;
@@ -1578,11 +2468,11 @@ export class ModelManager {
             gl.bufferData(gl.ARRAY_BUFFER, uv2, gl.STATIC_DRAW);
             // aTexcoord2: location 10
             gl.enableVertexAttribArray(10);
-            gl.vertexAttribPointer(10, 2, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribPointer(10, 2, packed ? gl.HALF_FLOAT : gl.FLOAT, false, 0, 0);
         } else if (uvBuffer) {
             gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
             gl.enableVertexAttribArray(10);
-            gl.vertexAttribPointer(10, 2, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribPointer(10, 2, packed ? gl.HALF_FLOAT : gl.FLOAT, false, 0, 0);
         } else {
             try {
                 gl.disableVertexAttribArray(10);
@@ -1605,11 +2495,75 @@ export class ModelManager {
             } catch { /* ignore */ }
         }
 
+        let blendWeightsBuffer = null;
+        if (blendWeights) {
+            blendWeightsBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, blendWeightsBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, blendWeights, gl.STATIC_DRAW);
+            // aBlendWeights: location 13 (normalized u8 -> 0..1)
+            gl.enableVertexAttribArray(13);
+            gl.vertexAttribPointer(13, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+        } else {
+            try {
+                gl.disableVertexAttribArray(13);
+                gl.vertexAttrib4f(13, 1.0, 0.0, 0.0, 0.0);
+            } catch { /* ignore */ }
+        }
+
+        let blendIndicesBuffer = null;
+        if (blendIndices) {
+            blendIndicesBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, blendIndicesBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, blendIndices, gl.STATIC_DRAW);
+            // aBlendIndices: location 14 (raw u8 palette indices)
+            gl.enableVertexAttribArray(14);
+            gl.vertexAttribPointer(14, 4, gl.UNSIGNED_BYTE, false, 0, 0);
+        } else {
+            try {
+                gl.disableVertexAttribArray(14);
+                gl.vertexAttrib4f(14, 0.0, 0.0, 0.0, 0.0);
+            } catch { /* ignore */ }
+        }
+
+        let uploadIndices = indices;
+        let indexType = gl.UNSIGNED_INT;
+        if (indices.length > 0) {
+            let maxIndex = 0;
+            for (let i = 0; i < indices.length; i++) maxIndex = Math.max(maxIndex, indices[i]);
+            if (maxIndex <= 0xffff) {
+                uploadIndices = new Uint16Array(indices);
+                indexType = gl.UNSIGNED_SHORT;
+            }
+        }
+
         const idxBuffer = gl.createBuffer();
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuffer);
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, uploadIndices, gl.STATIC_DRAW);
+
+        const lineIndices = createWireframeIndices(
+            uploadIndices,
+            indexType === gl.UNSIGNED_SHORT ? Uint16Array : Uint32Array,
+        );
+        const lineIdxBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineIdxBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lineIndices, gl.STATIC_DRAW);
+        const lineIdxBytes = lineIndices.byteLength || (lineIndices.length * 4);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuffer);
 
         gl.bindVertexArray(null);
+
+        // Keep a compact CPU copy only when the opt-in asset inspector is
+        // active. MSH10 positions are unorm16 within the affine bounds, so
+        // expanding them to floats would double the diagnostic memory cost.
+        const retainPick = !!this.retainCpuPickData
+            && vertexCount > 0
+            && indexCount > 0
+            && indexCount <= 300000;
+        const pickPositions = retainPick
+            ? (affinePositions ? new Uint16Array(diskPositions) : new Float32Array(positions))
+            : null;
+        const pickIndices = retainPick ? new Uint32Array(indices) : null;
+        const pickBytes = (pickPositions?.byteLength || 0) + (pickIndices?.byteLength || 0);
 
         return {
             key,
@@ -1622,9 +2576,36 @@ export class ModelManager {
             tanBuffer,
             col0Buffer,
             col1Buffer,
+            blendWeightsBuffer,
+            blendIndicesBuffer,
+            // InstancedModelRenderer builds its own VAO so it can attach the
+            // per-instance matrix. Preserve the compact source attribute
+            // format: MSH9 uses f16 positions and MSH10 uses normalized u16
+            // positions decoded from its affine header in the vertex shader.
+            positionAttribType: affinePositions ? gl.UNSIGNED_SHORT : (packed ? gl.HALF_FLOAT : gl.FLOAT),
+            positionAttribNormalized: affinePositions,
+            positionQuantized: affinePositions,
+            positionMin: affinePositions ? positionMin : null,
+            positionExtent: affinePositions ? positionExtent : null,
+            normalAttribType: hasInt8Normals ? gl.BYTE : (packed ? gl.SHORT : gl.FLOAT),
+            normalAttribNormalized: !!packed,
+            normalAttribStride: hasInt8Normals ? (hasTightInt8Normals ? 3 : 4) : 0,
+            uvAttribType: packed ? gl.HALF_FLOAT : gl.FLOAT,
+            tangentAttribType: packed ? gl.BYTE : gl.FLOAT,
+            tangentAttribNormalized: !!packed,
             idxBuffer,
+            lineIdxBuffer,
+            vertexCount,
             indexCount,
-            approxBytes: (posBytes + nrmBytes + uvBytes + uv1Bytes + uv2Bytes + tanBytes + col0Bytes + col1Bytes + idxBytes),
+            lineIndexCount: lineIndices.length,
+            indexType,
+            lineIndexType: indexType,
+            pickPositions,
+            pickIndices,
+            pickPositionQuantized: !!(retainPick && affinePositions),
+            pickPositionMin: retainPick && affinePositions ? [...positionMin] : null,
+            pickPositionExtent: retainPick && affinePositions ? [...positionExtent] : null,
+            approxBytes: (positions.byteLength + nrmBytes + uvBytes + uv1Bytes + uv2Bytes + tanBytes + col0Bytes + col1Bytes + blendWeightsBytes + blendIndicesBytes + uploadIndices.byteLength + lineIdxBytes + pickBytes),
             bounds,
             radius,
             _lastUsedMs: (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(),

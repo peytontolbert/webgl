@@ -90,6 +90,10 @@ def try_get_ytd(gfc: Any, txd_hash_u32: int, *, spins: int = 400) -> Any:
         ytd = None
     if ytd is None:
         return None
+    # GetYtd returns a file descriptor on several CodeWalker builds but does
+    # not itself enqueue the resource. Pumping without LoadFile then leaves a
+    # permanently unloaded YTD and makes valid texture hashes look missing.
+    try_loadfile(gfc, ytd)
     # Some CodeWalker builds load lazily; pumping is usually enough.
     s = 0
     max_s = max(0, int(spins or 0))

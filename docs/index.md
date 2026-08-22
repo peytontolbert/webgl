@@ -13,6 +13,7 @@ This documentation provides a comprehensive reference for CodeWalker's systems a
    - Occluder Systems
 
 ## Parity / Integration Reports
+- [Browser spawn grounding regression runbook](spawn_grounding_regression.md)
 - [CodeWalker ↔ WebGL Viewer parity](CODEWALKER_PARITY_WEBGL_VIEWER.md)
 
 2. [RPF System](rpf_system.md)

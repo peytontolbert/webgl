@@ -1,0 +1,22 @@
+:root { color-scheme: dark; font-family: ui-monospace, Consolas, monospace; background: #080b13; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #243452, #080b13 62%); }
+.arcade { width: min(100vw, 1000px); padding: 14px; position: relative; }
+header, footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: #dbe9ff; font-size: 12px; letter-spacing: .08em; }
+header strong { color: #ffe36a; font-size: 17px; text-shadow: 2px 2px #8a3e5b; }
+canvas { display: block; width: 100%; height: auto; margin: 12px 0; image-rendering: pixelated; background: #233656; border: 5px solid #f5d965; box-shadow: 0 0 0 5px #263248, 0 22px 65px #000b; }
+button { border: 0; border-radius: 4px; background: #f5d965; color: #172032; cursor: pointer; font: inherit; font-weight: 700; padding: 8px 12px; }
+button:hover { background: #fff1a0; }
+.match-menu { position: absolute; inset: 54px 14px 51px; display: grid; place-items: center; background: #060a12aa; z-index: 2; }
+.match-menu[hidden] { display: none; }
+.menu-card { width: min(420px, calc(100% - 30px)); padding: 24px; border: 3px solid #f5d965; background: #172438ee; box-shadow: 0 18px 48px #000; color: #edf5ff; }
+.menu-card h1 { margin: 0 0 20px; color: #ffe36a; font-size: 34px; text-shadow: 3px 3px #8a3e5b; }
+.eyebrow { margin: 0 0 3px; color: #9ac4ff; font-size: 11px; letter-spacing: .16em; }
+.menu-card label { display: grid; gap: 6px; margin: 12px 0; color: #c9dbf2; font-size: 12px; }
+.map-preview-label { min-height: 18px; margin: -4px 0 10px; color: #83e8ff; font-size: 11px; letter-spacing: .05em; }
+select { width: 100%; border: 1px solid #647b9a; border-radius: 3px; background: #0d1727; color: #fff; padding: 9px; font: inherit; }
+.menu-options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.menu-card button { width: 100%; margin-top: 12px; }
+.menu-card button:disabled { cursor: wait; opacity: .65; }
+.menu-help { margin: 16px 0 0; color: #aac1dc; font-size: 10px; line-height: 1.5; }
+@media (max-width: 640px) { .arcade { padding: 8px; } header { flex-wrap: wrap; } #status { width: 100%; font-size: 10px; } }

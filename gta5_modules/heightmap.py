@@ -65,6 +65,7 @@ class HeightmapFile:
         self.bounds: Optional[Bounds] = None
         self.max_heights: Optional[np.ndarray] = None
         self.min_heights: Optional[np.ndarray] = None
+        self.valid_mask: Optional[np.ndarray] = None
         self.compressed: bool = False
         
         # Always try to use CodeWalker DLL first if available
@@ -106,6 +107,15 @@ class HeightmapFile:
             # Get compression headers
             comp_headers = heightmap_file.CompHeaders
             self.compressed = len(comp_headers) > 0  # Set compressed flag based on headers
+            self.valid_mask = np.ones((self.height, self.width), dtype=np.uint8)
+            if self.compressed:
+                self.valid_mask.fill(0)
+                for y in range(self.height):
+                    header = comp_headers[y]
+                    start = max(0, int(header.Start))
+                    end = min(self.width, start + max(0, int(header.Count)))
+                    if end > start:
+                        self.valid_mask[y, start:end] = 1
             
             # Get height data
             if hasattr(heightmap_file, 'MaxHeights') and hasattr(heightmap_file, 'MinHeights'):
@@ -245,11 +255,22 @@ class HeightmapFile:
                             data_idx = h2off + header.data_offset + i
                             if data_idx < len(data_section):
                                 self.min_heights[idx] = data_section[data_idx]
+                self.max_heights = self.max_heights.reshape((self.height, self.width))
+                self.min_heights = self.min_heights.reshape((self.height, self.width))
+                self.valid_mask = np.zeros((self.height, self.width), dtype=np.uint8)
+                for y, header in enumerate(self.comp_headers):
+                    start = max(0, int(header.start))
+                    end = min(self.width, start + max(0, int(header.count)))
+                    if end > start:
+                        self.valid_mask[y, start:end] = 1
             else:
                 # For uncompressed data, read directly from data section
                 data_section = data[header_size:]
                 self.max_heights = np.frombuffer(data_section[:self.data_len], dtype=np.uint8)
                 self.min_heights = np.frombuffer(data_section[self.data_len:], dtype=np.uint8)
+                self.max_heights = self.max_heights.reshape((self.height, self.width))
+                self.min_heights = self.min_heights.reshape((self.height, self.width))
+                self.valid_mask = np.ones((self.height, self.width), dtype=np.uint8)
             
             logger.info("Successfully parsed heightmap data")
             

@@ -515,6 +515,23 @@ class DllManager:
                 logger.error("GameFileCache not created")
                 return False
 
+            # IMPORTANT DEFAULT:
+            # CodeWalker coverage for archetypes/drawables generally requires DLC overlay mode so it scans:
+            # - update/update.rpf
+            # - dlcpacks/* (per dlclist.xml)
+            #
+            # Our previous default was "base title only" (EnableDlc=false), which leads to lots of
+            # exporter `no_archetype` because many archetypes live in update/DLC ytyp files.
+            #
+            # If the caller doesn't specify a DLC, enable DLC mode and let CodeWalker auto-pick the
+            # latest DLC during InitDlcList() (it sets SelectedDlc to the last entry when empty).
+            if selected_dlc is None:
+                try:
+                    self.game_file_cache.EnableDlc = True
+                    # Keep SelectedDlc empty so CodeWalker can choose latest automatically.
+                    self.game_file_cache.SelectedDlc = ""
+                except Exception:
+                    pass
             # Apply DLC/mod selection BEFORE Init() so CodeWalker builds ActiveMapRpfFiles correctly.
             try:
                 # If the caller didn't specify a DLC level, default to "all DLC overlays" for maximal coverage.
@@ -999,6 +1016,7 @@ class DllManager:
         z_start: float,
         max_dist: float = 20000.0,
         ybn_only: bool = True,
+        collision_load_passes: int = 20,
     ) -> Optional[Dict[str, Any]]:
         """
         Raycast downward in GTA/data-space and return the closest hit.
@@ -1007,6 +1025,7 @@ class DllManager:
             x,y,z_start: ray origin
             max_dist: max distance to test
             ybn_only: if True, ignore hits that are only from HD entity bounds (bridges/props)
+            collision_load_passes: maximum cache-drain retries for lazily discovered YBNs
 
         Returns:
             dict with keys: hit(bool), z(float), position(tuple), normal(tuple), hit_entity(bool)
@@ -1035,7 +1054,22 @@ class DllManager:
             except Exception:
                 layers = None
 
+            # Space.RayIntersect discovers matching YBN bounds lazily.  Its first
+            # pass queues those archives in GameFileCache, so drain that queue and
+            # retry before declaring empty space.  The desktop CodeWalker UI has a
+            # background content thread doing this continuously; batch callers do not.
             res = self.world_space.RayIntersect(ray, float(max_dist), layers)
+            retry_count = max(0, int(collision_load_passes or 0))
+            for _ in range(retry_count):
+                if bool(getattr(res, "Hit", False)):
+                    break
+                if bool(getattr(res, "TestComplete", True)):
+                    break
+                try:
+                    self.game_file_cache.ContentThreadProc()
+                except Exception:
+                    break
+                res = self.world_space.RayIntersect(ray, float(max_dist), layers)
             hit = bool(getattr(res, "Hit", False))
             if not hit:
                 return {"hit": False}
@@ -1372,4 +1406,4 @@ class DllManager:
             
         except Exception as e:
             logger.error(f"Error getting shader parameters: {e}")
-            return {} 
+            return {}

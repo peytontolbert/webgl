@@ -18,6 +18,12 @@ from pathlib import Path
 import time
 import glob
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
+
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.rpf_reader import RpfReader
 from gta5_modules.script_paths import auto_assets_dir
@@ -91,9 +97,130 @@ def _load_hashes_from_input(p: Path) -> list[int]:
     return hashes
 
 
+def _update_manifest_shards_for_hashes(models_dir: Path, manifest: dict, hash_strings: list[str]) -> None:
+    """
+    Update only the manifest shard files touched by this export.
+
+    The browser normally reads assets/models/manifest_index.json + manifest_shards/*.json,
+    not the huge monolithic manifest.json. Full re-sharding after every live export would
+    be too slow on Windows, so patch just the shards containing exported hashes.
+    """
+    if not hash_strings:
+        return
+
+    index_path = models_dir / "manifest_index.json"
+    if not index_path.exists():
+        return
+
+    try:
+        idx = json.loads(index_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return
+    if not isinstance(idx, dict) or idx.get("schema") != "webglgta-manifest-index-v1":
+        return
+
+    try:
+        bits = int(idx.get("shard_bits") or 8)
+    except Exception:
+        bits = 8
+    bits = max(4, min(12, bits))
+    mask = (1 << bits) - 1
+    hex_digits = max(1, (bits + 3) // 4)
+    shard_dir = models_dir / str(idx.get("shard_dir") or "manifest_shards")
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    ext = str(idx.get("shard_file_ext") or ".json")
+    if not ext.startswith("."):
+        ext = "." + ext
+
+    by_sid: dict[int, list[str]] = {}
+    meshes = manifest.get("meshes") if isinstance(manifest, dict) else {}
+    if not isinstance(meshes, dict):
+        return
+
+    for hs in hash_strings:
+        try:
+            h = int(str(hs).strip()) & 0xFFFFFFFF
+        except Exception:
+            continue
+        by_sid.setdefault(h & mask, []).append(str(h))
+
+    wrote = 0
+    for sid, hss in by_sid.items():
+        shard_path = shard_dir / (f"{sid:0{hex_digits}x}{ext}")
+        payload = None
+        if shard_path.exists():
+            try:
+                payload = json.loads(shard_path.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            payload = {
+                "schema": "webglgta-manifest-shard-v1",
+                "manifest_version": manifest.get("version", 1),
+                "shard_id": int(sid),
+                "meshes": {},
+            }
+        shard_meshes = payload.get("meshes")
+        if not isinstance(shard_meshes, dict):
+            shard_meshes = {}
+            payload["meshes"] = shard_meshes
+
+        changed = False
+        for hs in hss:
+            ent = meshes.get(hs)
+            if isinstance(ent, dict):
+                shard_meshes[hs] = ent
+                changed = True
+
+        if changed:
+            payload["manifest_version"] = manifest.get("version", payload.get("manifest_version", 1))
+            shard_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            wrote += 1
+
+    if wrote:
+        print(f"Updated sharded manifest files for live export: shards={wrote}")
+
+
+def _record_non_renderable_hashes(models_dir: Path, hashes: set[str]) -> int:
+    """Persist archetypes proven by CodeWalker to have no drawable.
+
+    These hashes are valid GTA archetypes (often collision/metadata/LOD helpers), not failed mesh
+    exports. The browser uses this list to avoid placeholder spam and repeat export attempts.
+    """
+    if not hashes:
+        return 0
+    path = models_dir / "non_renderable_archetypes.json"
+    existing: set[str] = set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="ignore")) if path.exists() else {}
+        for raw in (data.get("hashes") or []):
+            try:
+                existing.add(str(int(str(raw).strip()) & 0xFFFFFFFF))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    before = len(existing)
+    for raw in hashes:
+        try:
+            existing.add(str(int(str(raw).strip()) & 0xFFFFFFFF))
+        except Exception:
+            continue
+    if len(existing) == before:
+        return 0
+    payload = {
+        "schema": "webglgta-non-renderable-archetypes-v1",
+        "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "hashes": sorted(existing, key=lambda s: int(s)),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return len(existing) - before
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
+    ap.add_argument("--game-path", default=(os.getenv("gta_location") or os.getenv("gta5_path") or ""), help="GTA5 install folder (or set gta_location/gta5_path)")
     ap.add_argument("--assets-dir", default="", help="WebGL viewer assets directory (auto if omitted)")
     ap.add_argument("--input", required=True, help="Path to missing archetypes json (from viewer) or newline list")
     ap.add_argument("--top", type=int, default=0, help="Only export first N hashes from the input (0 = all)")
@@ -160,12 +287,14 @@ def main():
     skipped_existing = 0
     exported_now = 0
     textures_exported_now = 0
+    touched_hashes: set[str] = set()
     requested = 0
     no_archetype = 0
     no_drawable = 0
     no_lods = 0
     errors = 0
     failures_sample = []  # [{hash, reason}...]
+    confirmed_no_drawable: set[str] = set()
     for i, h in enumerate(hashes):
         requested += 1
         hs = str(int(h) & 0xFFFFFFFF)
@@ -196,6 +325,7 @@ def main():
         drawable = _try_get_drawable(gfc, arch, spins=400)
         if drawable is None:
             no_drawable += 1
+            confirmed_no_drawable.add(hs)
             if len(failures_sample) < 200:
                 failures_sample.append({"hash": hs, "reason": "no_drawable"})
             continue
@@ -318,6 +448,7 @@ def main():
 
         if entry is not None:
             manifest["meshes"][hs] = entry
+            touched_hashes.add(hs)
             already.add(hs)
             if not have_mesh_already:
                 exported_now += 1
@@ -326,10 +457,14 @@ def main():
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
+    if touched_hashes:
+        _update_manifest_shards_for_hashes(models_dir, manifest, sorted(touched_hashes))
+    non_renderable_recorded = _record_non_renderable_hashes(models_dir, confirmed_no_drawable)
+
     print(
         f"Done. manifestMeshes={len(manifest.get('meshes') or {})} "
         f"requested={requested} exported_now={exported_now} textures_exported_now={textures_exported_now} skipped_existing={skipped_existing} "
-        f"no_archetype={no_archetype} no_drawable={no_drawable} no_lods={no_lods} errors={errors}"
+        f"no_archetype={no_archetype} no_drawable={no_drawable} no_lods={no_lods} errors={errors} non_renderable_recorded={non_renderable_recorded}"
     )
 
     if args.write_report:
@@ -349,6 +484,7 @@ def main():
                 "noDrawable": no_drawable,
                 "noLods": no_lods,
                 "errors": errors,
+                "nonRenderableRecorded": non_renderable_recorded,
                 "failuresSample": failures_sample,
             }
             rp = models_dir / f"export_report_list_{int(time.time())}.json"

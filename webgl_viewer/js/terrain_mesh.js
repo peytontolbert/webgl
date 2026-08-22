@@ -1,3 +1,5 @@
+import { createWireframeIndices } from './wireframe_indices.js';
+
 export class TerrainMesh {
     constructor(gl) {
         this.gl = gl;
@@ -5,14 +7,17 @@ export class TerrainMesh {
         this._vaosByProgram = new Map(); // Map<WebGLProgram, WebGLVertexArrayObject>
         this.vertexBuffer = null;
         this.indexBuffer = null;
+        this.lineIndexBuffer = null;
         this.vertexCount = 0;
         this.indexCount = 0;
+        this.lineIndexCount = 0;
         this.indexType = null; // gl.UNSIGNED_SHORT or gl.UNSIGNED_INT
+        this.lineIndexType = null; // gl.UNSIGNED_SHORT or gl.UNSIGNED_INT
         // 3(pos) + 3(normal) + 2(texcoord) + 2(texcoord1) + 2(texcoord2) + 2(color0) = 14 floats = 56 bytes
         this.vertexStride = 56;
     }
 
-    createFromHeightmap(width, height, bounds) {
+    createFromHeightmap(width, height, bounds, coverageMask = null) {
         // Generate vertices
         const vertices = [];
         const indices = [];
@@ -46,9 +51,21 @@ export class TerrainMesh {
             }
         }
 
-        // Generate indices and calculate normals
+        const maskWidth = Math.max(0, Number(coverageMask?.width) | 0);
+        const maskHeight = Math.max(0, Number(coverageMask?.height) | 0);
+        const maskData = coverageMask?.data || null;
+        const isCovered = (x, y) => {
+            if (!maskData || !maskWidth || !maskHeight) return true;
+            const mx = Math.round((x / Math.max(1, width - 1)) * (maskWidth - 1));
+            const my = Math.round((y / Math.max(1, height - 1)) * (maskHeight - 1));
+            return (maskData[my * maskWidth + mx] || 0) !== 0;
+        };
+
+        // Omit cells outside the compressed GTA heightfield coverage. Without this
+        // mask, zero-filled gaps connect to valid hills as large artificial sheets.
         for (let y = 0; y < height - 1; y++) {
             for (let x = 0; x < width - 1; x++) {
+                if (!isCovered(x, y) || !isCovered(x + 1, y) || !isCovered(x, y + 1) || !isCovered(x + 1, y + 1)) continue;
                 // Get vertex indices
                 const v0 = y * width + x;
                 const v1 = v0 + 1;
@@ -119,6 +136,13 @@ export class TerrainMesh {
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indexArray, gl.STATIC_DRAW);
 
+        const lineIndexArray = createWireframeIndices(indexArray, indexArray.constructor);
+        this.lineIndexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.lineIndexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lineIndexArray, gl.STATIC_DRAW);
+        this.lineIndexType = this.indexType;
+        this.lineIndexCount = lineIndexArray.length;
+
         this.vertexCount = vcount;
         this.indexCount = indices.length;
     }
@@ -163,12 +187,20 @@ export class TerrainMesh {
     /**
      * @param {{ program: any }} shaderProgram - expects a `.program` WebGLProgram handle (see ShaderProgram).
      */
-    render(shaderProgram) {
+    render(shaderProgram, { wireframe = false } = {}) {
         const vao = this._getOrCreateVao(shaderProgram);
         if (!vao || !this.indexBuffer || !this.indexType) return;
         const gl = this.gl;
+        const drawWireframe = !!wireframe && !!this.lineIndexBuffer && this.lineIndexCount > 0;
         gl.bindVertexArray(vao);
-        gl.drawElements(gl.TRIANGLES, this.indexCount, this.indexType, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, drawWireframe ? this.lineIndexBuffer : this.indexBuffer);
+        gl.drawElements(
+            drawWireframe ? gl.LINES : gl.TRIANGLES,
+            drawWireframe ? this.lineIndexCount : this.indexCount,
+            drawWireframe ? this.lineIndexType : this.indexType,
+            0
+        );
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
         gl.bindVertexArray(null);
     }
 
@@ -185,5 +217,9 @@ export class TerrainMesh {
             this.gl.deleteBuffer(this.indexBuffer);
             this.indexBuffer = null;
         }
+        if (this.lineIndexBuffer) {
+            this.gl.deleteBuffer(this.lineIndexBuffer);
+            this.lineIndexBuffer = null;
+        }
     }
-} 
+}

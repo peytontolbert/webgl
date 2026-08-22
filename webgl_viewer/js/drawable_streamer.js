@@ -3,6 +3,20 @@ import { extractFrustumPlanes, aabbIntersectsFrustum } from './frustum_culling.j
 import { fetchArrayBufferWithPriority, fetchJSON, fetchNDJSON, fetchStreamBytes, fetchText } from './asset_fetcher.js';
 import { joaat } from './joaat.js';
 
+const MLO_FLAG_INSTANCE = 1;
+const MLO_FLAG_ENTITY_SET_DEFAULT = 8;
+const MLO_ROOM_SHIFT = 8;
+const MLO_PORTAL_SHIFT = 16;
+const MLO_PORTAL_FLAG_ONE_WAY = 1;
+const MLO_PORTAL_FLAG_HIDE_WHEN_DOOR_CLOSED = 64;
+const MLO_PORTAL_FLAG_LIGHT_BLEED = 8192;
+
+function ent1RecordKey(bytes, offset, stride) {
+    // Position alone is not a duplicate definition for GTA compound assets. A
+    // byte-identical ENT1 record includes the transform, tint, and MLO metadata.
+    return String.fromCharCode(...bytes.subarray(offset, offset + stride));
+}
+
 /**
  * Streams entity chunks and converts entity transforms into per-archetype instance matrices,
  * but only for archetypes that have exported mesh bins in assets/models/manifest.json.
@@ -17,6 +31,7 @@ export class DrawableStreamer {
         this.modelRenderer = modelRenderer;
 
         this.index = null;
+        this._demoChunkIndex = null;
         this.ready = false;
 
         this.loading = new Set();
@@ -31,15 +46,56 @@ export class DrawableStreamer {
         this.lastLoadStats = null; // { key, totalLines, parsed, withArchetype, matchedMesh, instancedArchetypes }
         this.coverageStats = null; // aggregated over loaded chunks (rebuilt when dirty)
 
-        // Streaming window:
-        // - radiusChunks controls the "core" square around the camera.
-        // - extraFrontChunks extends the window in the camera-forward direction to reduce visible pop-in.
-        this.maxLoadedChunks = 64;
-        this.radiusChunks = 3;
-        this.extraFrontChunks = 2;
+        // Streaming window. The player-centered core is independent of camera direction, so looking
+        // around cannot replace chunks under the player. Any forward extension is prefetch-only.
+        this.maxLoadedChunks = 9;
+        // Optional overlap cache above the current wanted set. A value <= 0
+        // follows maxLoadedChunks exactly.
+        this.maxResidentChunks = 0;
+        this.staleChunkGraceMs = 0;
+        this.chunkRebuildSettleMs = 0;
+        this.radiusChunks = 1;
+        this.extraFrontChunks = 1;
+        this.prefetchHorizonSeconds = 10.0;
+        this.residencyHysteresisChunks = 0.18;
+        this._residentCenterChunk = null;
+        this._prefetchFocusSample = null;
+        this._prefetchMoveDir = null;
+        this._prefetchMoveDirMs = 0;
+        this._prefetchMoveSpeed = 0;
+        this._lastResidentCoreCount = 0;
+        this._lastPrefetchStats = { speed: 0, leadChunks: 0, core: 0, forward: 0 };
+        this._chunkLastWantedMs = new Map();
+        this._lastChunkSetChangeMs = 0;
+        this._instanceRebuildCount = 0;
+        this._lastInstanceRebuildCompletedMs = 0;
+        this._lastWantedKeys = [];
+        this._lastCoreWantedSet = new Set();
+        this._lastCoreSignature = '';
+        // Optional data-space rectangle used by the spawn-district demo. Chunks that
+        // overlap it are parsed, then individual instances outside it are discarded.
+        this.worldBounds = null;
+        // /demo replaces a much larger source chunk with one prefiltered ENT1 tile.
+        // It is kept as a single resident key so player movement cannot trigger reloads.
+        this.demoBootstrap = null;
+        this._demoDataSourceSignature = null;
         this.enableFrustumCulling = true;
+        // Aggressive per-instance frustum culling is opt-in because it requires camera-coupled
+        // instance-buffer rebuilds. /demo enables it; full-map streaming keeps resident buffers stable.
+        this.enableWorkerFrustumCulling = false;
+        this.workerFrustumPadding = 16.0;
+        // WASM culling is for high-density non-demo rebuilds. It bulk-filters packed instance slices in
+        // the worker, then JS keeps the existing dedupe/selection/packing behavior.
+        this.enableWasmCulling = true;
+        this.wasmCullingMinInstances = 50000;
+        this.wasmCullingMinSliceInstances = 512;
+        // Optional WebGPU compute culler is available as a backend module, but stays
+        // opt-in because WebGPU upload/readback can lose to WASM below very high density.
+        this.enableWebGpuCulling = false;
+        this.webGpuCullingMinInstances = 100000;
+        this.webGpuCullingMinSliceInstances = 2048;
         // Avoid scheduling huge bursts of chunk work in a single frame.
-        this.maxNewLoadsPerUpdate = 10;
+        this.maxNewLoadsPerUpdate = 3;
 
         // Optional fast-path: binary ENT1 tiles in assets/entities_chunks_inst/*.bin.
         // If they aren't present, browsers will log noisy 404s. Auto-disable after first 404.
@@ -49,17 +105,22 @@ export class DrawableStreamer {
         // Whether to use CacheStorage for streamed chunk files (JSONL / ENT1 bins).
         // Default false because chunks can be very large; controlled by the UI.
         this.usePersistentCacheForChunks = false;
-        this.maxArchetypes = 250; // cap instanced archetypes to avoid loading thousands at once
+        this.maxArchetypes = 96; // cap instanced archetypes to avoid loading thousands at once
         // Distance-based selection: only instance archetypes whose nearest instance is within this distance.
         // Set to Infinity to disable distance cutoff.
         //
         // NOTE: 350 is far too small at GTA scale and looks like geometry is "cut off" in front of the camera.
-        this.maxModelDistance = 2000.0;
+        this.maxModelDistance = 320.0;
+        // Enforced before instance buffers reach the GPU.
+        this.maxVisibleInstances = 12000;
+        this.maxInstancesPerArchetype = 128;
+        this.maxBehindModelDistance = 180.0;
         this._dirty = true; // rebuild instances only when chunk set changes (not every frame)
+        this._instanceTransformOverridesByHash = new Map();
 
-        // Cross-archetype instancing: group by (lod + meshFile + materialSignature) instead of per-archetype.
-        // This can reduce draw calls when many different hashes share the same exported mesh bins/materials.
-        this.enableCrossArchetypeInstancing = true;
+        // Cross-archetype instancing is only useful when the asset export shares mesh-bin files across
+        // archetypes. The current export emits one file namespace per archetype, so keep this opt-in.
+        this.enableCrossArchetypeInstancing = false;
 
         // Entity-level LOD traversal (CodeWalker-style parent-vs-children leaf selection).
         // NOTE: requires updated `entities_chunks/*.jsonl` that include:
@@ -83,27 +144,39 @@ export class DrawableStreamer {
         this._lastEntityLodMs = 0;
         this._lastEntityLodLeafCount = 0;
 
-        // Interiors / MLOs (minimal viable)
+        // Interiors / MLOs. Child room and portal ownership is packed into the
+        // upper bytes of the ENT1 MLO flags field by the demo preprocessor.
         this.enableInteriors = true;
         this.enableRoomGating = true;         // portal/room gating
-        this.interiorPortalDepth = 2;         // BFS depth through portals from current room
+        this.interiorPortalDepth = 3;         // BFS depth through portals from current room
+        this.interiorExteriorDistance = 80.0; // retain nearby interiors through exterior portals
+        // Some custom MLOs export sentinel room bounds hundreds of metres wide. Limit those
+        // claims to their actual district and rank overlaps by distance to the MLO root.
+        this.interiorMaxRootDistance = 120.0;
         this.enableMloEntitySets = true;      // gate entity-set entities
 
         this._mloDefs = new Map();            // mloArchetypeHash -> def JSON
         this._mloDefsLoading = new Set();     // hashes currently loading
+        this._mloDefinitionRevision = 'v1';   // cache key for preprocessed interior definitions
         this._mloSetOverrides = new Map();    // key `${parentGuid}:${setHash}` -> boolean
+        this._mloSetDefaults = new Map();     // key `${parentGuid}:${setHash}` -> authored default
+        this._mloPortalOpenOverrides = new Map(); // key `${parentGuid}:${portalIndex}` -> door progress
         this._activeInterior = null;          // { parentGuid, archHash, roomIndex, visibleRooms:Set<number> }
         this._activeInteriorKey = '';         // cached change detector
         this._mloInstancesLast = [];          // last discovered MLO instances (from last rebuild)
         this._lastCamDataPos = [0, 0, 0];     // updated each frame (data-space)
         this._lastCamDataDir = [0, 0, -1];    // updated each frame (data-space, normalized)
 
-        // When the chunk set is stable, we still want the "nearby" area to feel responsive as you move.
-        // Rebuilding only re-sorts/re-caps instances from already-loaded chunks (no network), but can be heavy,
-        // so keep it throttled.
-        this.instanceRebuildMinMove = 35.0; // data-space units
-        this.instanceRebuildMinMs = 250;    // ms throttle
+        // Static world instance buffers stay resident while the chunk set is stable.  Re-selecting every
+        // few metres recreates large typed arrays and reuploads them, which looks like the city is resetting.
+        // This remains opt-in for diagnostics or a future fine-grained culling path; normal movement only
+        // updates the player and camera, while chunk/interior changes mark the stream dirty.
+        this.rebuildInstancesOnMove = false;
+        this.instanceRebuildMinMove = 512.0; // data-space units when explicitly enabled
+        this.instanceRebuildMinMs = 1000;    // ms throttle when explicitly enabled
+        this.instanceRebuildMinDirDot = 0.985; // rebuild when camera turns by ~10 degrees (if enabled)
         this._lastInstanceRebuildCam = null; // [x,y,z] data-space
+        this._lastInstanceRebuildDir = null; // [x,y,z] data-space
         this._lastInstanceRebuildMs = 0;
 
         // Prefer keeping/rendering archetypes that are in front of the camera when capped.
@@ -119,6 +192,10 @@ export class DrawableStreamer {
 
         // Track previous desired (hash:lod) keys so we can delete stale instances on rebuild.
         this._prevDesiredInstanceKeys = new Set();
+        // Destroyed fragment instances are suppressed by hash + world-space origin.
+        // The compact ENT1 format has no stable entity id, so this is the narrowest
+        // identity available without re-exporting the tile schema.
+        this._suppressedInstancesByHash = new Map();
 
         // Off-main-thread chunk parsing/matrix building.
         this._chunkWorker = null;
@@ -132,6 +209,12 @@ export class DrawableStreamer {
         this._tmpVec4Out = glMatrix.vec4.create();
         this._tmpVpData = glMatrix.mat4.create();
         this._tmpFrustumPlanes = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+        this._tmpFrustumPlanesFlat = new Float32Array(24);
+        this._lastFrustumPlanesData = null;
+        this._lastFrustumStats = { enabled: false, tested: 0, culled: 0 };
+        this._lastInstanceLimitStats = { eligible: 0, kept: 0, capped: 0 };
+        this._lastWasmStats = { enabled: false, tested: 0, kept: 0, rejected: 0 };
+        this._lastWebGpuStats = { enabled: false, requested: false, reason: '', tested: 0, kept: 0, rejected: 0 };
         this._tmpWantedKeys = [];
         this._tmpWantedScored = [];
         this._tmpInFrustumSet = new Set();
@@ -145,7 +228,6 @@ export class DrawableStreamer {
         this.enableWorkerRebuild = true;
         this._workerStoredChunks = new Set(); // chunkKeys stored in worker
         this._rebuildWorkerReqInFlight = false;
-        this._rebuildWorkerPending = false;
         this._rebuildWorkerLastReqId = 0;
 
         // Adaptive load budget (based on frame time)
@@ -340,6 +422,8 @@ export class DrawableStreamer {
             return null;
         }
         try {
+            // Keep this exact inline new Worker(new URL(...)) form: Vite uses
+            // it to bundle the worker's module imports into the emitted asset.
             const w = new Worker(new URL('./chunk_worker.js', import.meta.url), { type: 'module' });
             w.onmessage = (e) => {
                 const m = e?.data || {};
@@ -373,7 +457,13 @@ export class DrawableStreamer {
                         subsystem: 'chunkWorker',
                         level: 'error',
                         message: 'chunk worker crashed; falling back to main-thread parsing',
-                        detail: { error: String(err?.message || err || '') },
+                        detail: {
+                            error: String(err?.message || err || ''),
+                            eventType: String(err?.type || ''),
+                            filename: String(err?.filename || ''),
+                            line: Number(err?.lineno) || 0,
+                            column: Number(err?.colno) || 0,
+                        },
                     });
                 } catch { /* ignore */ }
                 for (const [reqId, pending] of this._chunkWorkerPending.entries()) {
@@ -390,7 +480,7 @@ export class DrawableStreamer {
         }
     }
 
-    async _parseChunkNDJSONInWorker(url, camData, priority, { storeKey = null, storeOnly = false, signal = undefined, onReqId = null } = {}) {
+    async _parseChunkNDJSONInWorker(url, camData, priority, { storeKey = null, storeOnly = false, worldBounds = null, signal = undefined, onReqId = null } = {}) {
         const w = this._getChunkWorker();
         if (!w) return null;
         const reqId = (this._chunkWorkerNextReqId++ >>> 0);
@@ -400,7 +490,7 @@ export class DrawableStreamer {
         });
 
         try {
-            w.postMessage({ type: 'begin_ndjson', reqId, camData, storeKey, storeOnly });
+            w.postMessage({ type: 'begin_ndjson', reqId, camData, storeKey, storeOnly, worldBounds });
             await fetchStreamBytes(url, {
                 usePersistentCache: this.usePersistentCacheForChunks,
                 priority,
@@ -426,7 +516,7 @@ export class DrawableStreamer {
         }
     }
 
-    async _parseENT1InWorker(buffer, camData, { storeKey = null, storeOnly = false, onReqId = null } = {}) {
+    async _parseENT1InWorker(buffer, camData, { storeKey = null, storeOnly = false, worldBounds = null, dedupeExactRecords = false, onReqId = null } = {}) {
         const w = this._getChunkWorker();
         if (!w) return null;
         const reqId = (this._chunkWorkerNextReqId++ >>> 0);
@@ -435,7 +525,7 @@ export class DrawableStreamer {
             this._chunkWorkerPending.set(reqId, { resolve, reject });
         });
         try {
-            w.postMessage({ type: 'parse_ent1', reqId, camData, buffer, storeKey, storeOnly }, [buffer]);
+            w.postMessage({ type: 'parse_ent1', reqId, camData, buffer, storeKey, storeOnly, worldBounds, dedupeExactRecords }, [buffer]);
             return await p;
         } catch (e) {
             try { w.postMessage({ type: 'cancel', reqId }); } catch { /* ignore */ }
@@ -450,12 +540,8 @@ export class DrawableStreamer {
         if (!w) return false;
         if (this.enableEntityLodTraversal) return false; // keep entity LOD path as-is for now
 
-        if (this._rebuildWorkerReqInFlight) {
-            this._rebuildWorkerPending = true;
-            return true;
-        }
+        if (this._rebuildWorkerReqInFlight) return false;
         this._rebuildWorkerReqInFlight = true;
-        this._rebuildWorkerPending = false;
 
         const reqId = (this._chunkWorkerNextReqId++ >>> 0);
         this._rebuildWorkerLastReqId = reqId;
@@ -468,7 +554,15 @@ export class DrawableStreamer {
             const dir = this._lastCamDataDir || [0, 0, -1];
             const maxCandidates = Math.max(1, (this.maxArchetypes | 0) > 0 ? (this.maxArchetypes | 0) * 4 : 1200);
             const behindPenalty = Number.isFinite(Number(this.cameraBehindPenalty)) ? Math.max(1.0, Number(this.cameraBehindPenalty)) : 1.6;
-            const keys = Array.from(this._workerStoredChunks);
+            const keys = this._lastWantedKeys.length
+                ? this._lastWantedKeys.filter((key) => this._workerStoredChunks.has(key))
+                : Array.from(this._workerStoredChunks);
+            const frustumPlanes = (this.enableFrustumCulling && this.enableWorkerFrustumCulling && this._lastFrustumPlanesData)
+                ? this._lastFrustumPlanesData
+                : null;
+            this._lastFrustumStats = { enabled: !!frustumPlanes, tested: 0, culled: 0 };
+            this._lastWasmStats = { enabled: false, tested: 0, kept: 0, rejected: 0 };
+            this._lastWebGpuStats = { enabled: false, requested: false, reason: '', tested: 0, kept: 0, rejected: 0 };
             w.postMessage({
                 type: 'rebuild_stored',
                 reqId,
@@ -478,16 +572,67 @@ export class DrawableStreamer {
                 maxCandidates,
                 maxModelDistance: this.maxModelDistance,
                 behindPenalty,
+                maxVisibleInstances: this.maxVisibleInstances,
+                maxInstancesPerArchetype: this.maxInstancesPerArchetype,
+                maxBehindModelDistance: this.maxBehindModelDistance,
+                nonRenderableHashes: this.modelManager?.getNonRenderableHashes?.() ?? [],
+                frustumPlanes,
+                frustumPadding: this.workerFrustumPadding,
+                cullRadiusEntries: frustumPlanes ? this._buildFrustumCullRadiusEntries() : [],
+                enableWasmCulling: !!(this.enableWasmCulling && !this.demoBootstrap),
+                wasmCullingMinInstances: this.wasmCullingMinInstances,
+                wasmCullingMinSliceInstances: this.wasmCullingMinSliceInstances,
+                // Keep WASM disabled for the fixed demo bootstrap, but allow the
+                // explicit WebGPU toggle so /demo can exercise the compute backend.
+                enableWebGpuCulling: !!this.enableWebGpuCulling,
+                webGpuCullingMinInstances: this.webGpuCullingMinInstances,
+                webGpuCullingMinSliceInstances: this.webGpuCullingMinSliceInstances,
             });
 
             const res = await p;
             if (!res || !res.ok) return false;
+            this._lastFrustumStats = {
+                enabled: !!res.frustumEnabled,
+                tested: Math.max(0, Math.floor(Number(res.frustumTested) || 0)),
+                culled: Math.max(0, Math.floor(Number(res.frustumCulled) || 0)),
+            };
+            this._lastWasmStats = {
+                enabled: !!res.wasmCullingEnabled,
+                tested: Math.max(0, Math.floor(Number(res.wasmCullingTested) || 0)),
+                kept: Math.max(0, Math.floor(Number(res.wasmCullingKept) || 0)),
+                rejected: Math.max(0, Math.floor(Number(res.wasmCullingRejected) || 0)),
+            };
+            this._lastWebGpuStats = {
+                enabled: !!res.webGpuCullingEnabled,
+                requested: !!res.webGpuCullingRequested,
+                reason: String(res.webGpuCullingReason || ''),
+                tested: Math.max(0, Math.floor(Number(res.webGpuCullingTested) || 0)),
+                kept: Math.max(0, Math.floor(Number(res.webGpuCullingKept) || 0)),
+                rejected: Math.max(0, Math.floor(Number(res.webGpuCullingRejected) || 0)),
+            };
 
             // Convert packed response to entries compatible with existing apply pipeline.
             const buf = res.matsBuffer;
             const idxArr = Array.isArray(res.matsIndex) ? res.matsIndex : [];
             const minDistByHash = new Map(Array.isArray(res.minDistEntries) ? res.minDistEntries : []);
             const bestDotByHash = new Map(Array.isArray(res.bestDotEntries) ? res.bestDotEntries : []);
+            const mloInstances = [];
+            for (const packedRoot of (Array.isArray(res.mloInstanceEntries) ? res.mloInstanceEntries : [])) {
+                if (!Array.isArray(packedRoot) || packedRoot.length < 18) continue;
+                const archHash = String(packedRoot[0] ?? '');
+                const parentGuid = Number(packedRoot[1]) >>> 0;
+                if (!archHash || !parentGuid) continue;
+                const mat16 = new Float32Array(16);
+                let valid = true;
+                for (let i = 0; i < 16; i++) {
+                    const value = Number(packedRoot[i + 2]);
+                    if (!Number.isFinite(value)) { valid = false; break; }
+                    mat16[i] = value;
+                }
+                if (!valid) continue;
+                mloInstances.push({ parentGuid, archHash, mat16 });
+                void this._ensureMloDefLoaded(archHash);
+            }
 
             const agg = new Map();
             if (buf && buf.byteLength && idxArr.length) {
@@ -498,7 +643,9 @@ export class DrawableStreamer {
                     const lenFloats = Number(it?.lengthFloats ?? 0);
                     if (!Number.isFinite(offFloats) || !Number.isFinite(lenFloats) || lenFloats <= 0) continue;
                     try {
-                        agg.set(hash, new Float32Array(buf, offFloats * 4, lenFloats));
+                        const mats = new Float32Array(buf, offFloats * 4, lenFloats);
+                        mats.__webglgtaInstanceStride = this._instanceStrideFloatsForLen(mats.length, it?.strideFloats);
+                        agg.set(hash, mats);
                     } catch { /* ignore */ }
                 }
             }
@@ -506,6 +653,7 @@ export class DrawableStreamer {
             const entries = Array.from(agg.entries()).map(([hash, mats]) => ({
                 hash,
                 mats,
+                instanceStrideFloats: this._instanceStrideFloatsForLen(mats.length, mats.__webglgtaInstanceStride),
                 d: Number(minDistByHash.get(hash) ?? 1e30),
                 dot: Number(bestDotByHash.get(hash) ?? 0.0),
                 isPlaceholder: !(this.modelManager?.hasRealMesh?.(hash) ?? true),
@@ -513,7 +661,12 @@ export class DrawableStreamer {
 
             // Apply interior gating + sorting + renderer updates using existing logic by temporarily
             // swapping in a lightweight agg map.
-            this._applyRebuiltEntries(entries);
+            this._applyRebuiltEntries(entries, {
+                sourceInstanceCount: Number(res.sourceInstances),
+                duplicateInstancesDropped: Number(res.duplicateInstancesDropped),
+                preCappedInstances: Number(res.cappedInstances),
+                mloInstances,
+            });
 
             return true;
         } catch {
@@ -521,11 +674,6 @@ export class DrawableStreamer {
         } finally {
             this._chunkWorkerPending.delete(reqId);
             this._rebuildWorkerReqInFlight = false;
-            if (this._rebuildWorkerPending) {
-                // Coalesce: run one more rebuild after the current completes.
-                this._rebuildWorkerPending = false;
-                void this._rebuildAllInstancesInWorker();
-            }
         }
     }
 
@@ -567,10 +715,16 @@ export class DrawableStreamer {
 
     async init() {
         try {
-            this.index = await fetchJSON('assets/entities_index.json');
+            const globalIndex = await fetchJSON('assets/entities_index.json');
+            // /demo may install its compact index while this request is in
+            // flight. Network completion order must not replace that index.
+            if (!this._demoChunkIndex) this.index = globalIndex;
         } catch {
-            console.warn('No entities_index.json found; drawable streaming disabled.');
-            return;
+            if (!this._demoChunkIndex && !this.demoBootstrap) {
+                console.warn('No entities_index.json found; drawable streaming disabled.');
+                return;
+            }
+            console.info('[demo] Generic entity index unavailable; using the installed compact district index.');
         }
 
         // Cache-bust token for entity chunk URLs.
@@ -589,23 +743,30 @@ export class DrawableStreamer {
         // Avoid probing a directory (static servers often 404/deny directory listings),
         // and be resilient to servers that don't support HEAD.
         try {
-            const chunks = this.index?.chunks || {};
-            const firstKey = Object.keys(chunks)[0];
-            const firstMeta = firstKey ? chunks[firstKey] : null;
-            const firstJsonl = String(firstMeta?.file || '');
-            const binFile = (firstJsonl
-                ? firstJsonl.replace(/\.jsonl(\.gz)?$/i, '.bin')
-                : (firstKey ? `${firstKey}.bin` : ''));
-
-            if (!binFile) {
-                this.preferBinary = false;
+            if (this.demoBootstrap || this._demoChunkIndex) {
+                this.preferBinary = true;
             } else {
-                const url = `assets/entities_chunks_inst/${binFile}`;
-                let resp = await fetch(url, { method: 'HEAD', cache: 'no-store' });
-                if (!resp.ok && (resp.status === 405 || resp.status === 501)) {
-                    resp = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-31' }, cache: 'no-store' });
+                const chunks = this.index?.chunks || {};
+                const firstKey = Object.keys(chunks)[0];
+                const firstMeta = firstKey ? chunks[firstKey] : null;
+                const firstJsonl = String(firstMeta?.file || '');
+                const explicitBinary = String(firstMeta?.binaryFile || '');
+                const binFile = (explicitBinary || (firstJsonl
+                    ? firstJsonl.replace(/\.jsonl(\.gz)?$/i, '.bin')
+                    : (firstKey ? `${firstKey}.bin` : '')));
+
+                if (!binFile) {
+                    this.preferBinary = false;
+                } else {
+                    const url = explicitBinary
+                        ? `assets/${binFile.replace(/^assets\//i, '').replace(/^\/+/, '')}`
+                        : `assets/entities_chunks_inst/${binFile}`;
+                    let resp = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+                    if (!resp.ok && (resp.status === 405 || resp.status === 501)) {
+                        resp = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-31' }, cache: 'no-store' });
+                    }
+                    this.preferBinary = !!resp.ok;
                 }
-                this.preferBinary = !!resp.ok;
             }
         } catch {
             this.preferBinary = false;
@@ -667,8 +828,150 @@ export class DrawableStreamer {
         };
     }
 
+    setWorldBounds(bounds = null) {
+        const minX = Number(bounds?.minX);
+        const minY = Number(bounds?.minY);
+        const maxX = Number(bounds?.maxX);
+        const maxY = Number(bounds?.maxY);
+        this.worldBounds = [minX, minY, maxX, maxY].every(Number.isFinite) && maxX > minX && maxY > minY
+            ? { minX, minY, maxX, maxY }
+            : null;
+        this._residentCenterChunk = null;
+        this._dirty = true;
+    }
+
+    setDemoBootstrap(config = null) {
+        const instanceFile = String(config?.instanceFile || '').replace(/^assets\//i, '').replace(/^\/+/, '');
+        if (!instanceFile) {
+            if (this._demoDataSourceSignature) this.clear();
+            this.demoBootstrap = null;
+            this._demoDataSourceSignature = null;
+            this._residentCenterChunk = null;
+            this._dirty = true;
+            return;
+        }
+        const key = String(config?.key || '__demo_spawn_district__');
+        const signature = `bootstrap:${key}:${instanceFile}`;
+        if (this._demoDataSourceSignature && this._demoDataSourceSignature !== signature) this.clear();
+        this.demoBootstrap = {
+            key,
+            instanceFile,
+        };
+        this._demoChunkIndex = null;
+        this._demoDataSourceSignature = signature;
+        this._residentCenterChunk = null;
+        this._dirty = true;
+    }
+
+    setDemoChunkIndex(config = null) {
+        const chunkSize = Number(config?.chunk_size);
+        const chunks = config?.chunks;
+        if (!(chunkSize > 0) || !chunks || typeof chunks !== 'object') return false;
+
+        const signature = `chunks:${String(config?.revision || '')}:${String(config?.chunks_dir || '')}:${chunkSize}:${JSON.stringify(chunks)}`;
+        if (this._demoDataSourceSignature && this._demoDataSourceSignature !== signature) this.clear();
+
+        // Drop the fixed-cell bootstrap and use the regular, player-centered
+        // residency path with a compact demo-only index.
+        this.demoBootstrap = null;
+        this._demoChunkIndex = {
+            version: Number(config?.version) || 1,
+            revision: String(config?.revision || ''),
+            chunk_size: chunkSize,
+            chunks_dir: String(config?.chunks_dir || 'demo/spawn_district_chunks'),
+            bounds: config?.bounds || this.index?.bounds || null,
+            chunks,
+        };
+        this.index = this._demoChunkIndex;
+        this._demoDataSourceSignature = signature;
+        this.preferBinary = true;
+        this._residentCenterChunk = null;
+        this._prefetchFocusSample = null;
+        this._prefetchMoveDir = null;
+        this._prefetchMoveDirMs = 0;
+        this._prefetchMoveSpeed = 0;
+        this._lastResidentCoreCount = 0;
+        this._lastPrefetchStats = { speed: 0, leadChunks: 0, core: 0, forward: 0 };
+        this._chunkLastWantedMs.clear();
+        this._lastChunkSetChangeMs = 0;
+        this._lastWantedKeys = [];
+        this._lastCoreWantedSet.clear();
+        this._lastCoreSignature = '';
+        this._dirty = true;
+        return true;
+    }
+
+    _isDataPositionInWorldBounds(x, y) {
+        const b = this._effectiveWorldBounds();
+        if (!b) return true;
+        return x >= b.minX && x <= b.maxX && y >= b.minY && y <= b.maxY;
+    }
+
+    _effectiveWorldBounds() {
+        if (this.worldBounds) return this.worldBounds;
+        const bounds = this.index?.bounds;
+        const minX = Number(bounds?.minX ?? bounds?.min_x);
+        const minY = Number(bounds?.minY ?? bounds?.min_y);
+        const maxX = Number(bounds?.maxX ?? bounds?.max_x);
+        const maxY = Number(bounds?.maxY ?? bounds?.max_y);
+        return [minX, minY, maxX, maxY].every(Number.isFinite) && maxX > minX && maxY > minY
+            ? { minX, minY, maxX, maxY }
+            : null;
+    }
+
+    _isChunkInWorldBounds(key) {
+        const b = this._effectiveWorldBounds();
+        if (!b) return true;
+        const aabb = this._chunkAABBDataSpace(key);
+        if (!aabb) return false;
+        return aabb.max[0] > b.minX && aabb.min[0] < b.maxX &&
+            aabb.max[1] > b.minY && aabb.min[1] < b.maxY;
+    }
+
+    _hasIndexedChunk(key) {
+        const chunks = this.index?.chunks;
+        return !chunks || typeof chunks !== 'object' || Object.prototype.hasOwnProperty.call(chunks, key);
+    }
+
+    _resolveResidentCenterChunk(p, chunkSize) {
+        let x = Number(p?.[0]);
+        let y = Number(p?.[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !(chunkSize > 0)) return null;
+
+        // Multiplayer corrections can briefly place a demo client beyond the
+        // compact district. Keep residency on the nearest authored tile instead
+        // of falling through to missing global JSONL chunks.
+        const bounds = this._effectiveWorldBounds();
+        if (bounds) {
+            const epsilon = Math.min(0.01, chunkSize * 1e-5);
+            x = Math.max(Number(bounds.minX) + epsilon, Math.min(Number(bounds.maxX) - epsilon, x));
+            y = Math.max(Number(bounds.minY) + epsilon, Math.min(Number(bounds.maxY) - epsilon, y));
+        }
+
+        const nextX = Math.floor(x / chunkSize);
+        const nextY = Math.floor(y / chunkSize);
+        const previous = this._residentCenterChunk;
+        if (!previous || !Number.isFinite(previous.x) || !Number.isFinite(previous.y)) {
+            this._residentCenterChunk = { x: nextX, y: nextY };
+            return this._residentCenterChunk;
+        }
+
+        // Avoid stream ping-pong when a character jitters around a chunk boundary.
+        const margin = Math.max(0, Math.min(0.45, Number(this.residencyHysteresisChunks) || 0)) * chunkSize;
+        if (
+            x >= previous.x * chunkSize - margin &&
+            x < (previous.x + 1) * chunkSize + margin &&
+            y >= previous.y * chunkSize - margin &&
+            y < (previous.y + 1) * chunkSize + margin
+        ) return previous;
+
+        this._residentCenterChunk = { x: nextX, y: nextY };
+        return this._residentCenterChunk;
+    }
+
     _wantedKeysForCamera(camera, centerDataPos = null) {
         if (!this.index) return [];
+        if (this.demoBootstrap) return [this.demoBootstrap.key];
         const chunkSize = this.index.chunk_size;
         const p = centerDataPos
             ? (() => {
@@ -677,92 +980,122 @@ export class DrawableStreamer {
                 return v;
             })()
             : this._cameraToDataSpace(camera.position, this._tmpVec4Out);
-        const cx = Math.floor(p[0] / chunkSize);
-        const cy = Math.floor(p[1] / chunkSize);
+        const anchor = this._resolveResidentCenterChunk(p, chunkSize);
+        if (!anchor) return [];
+        const cx = anchor.x;
+        const cy = anchor.y;
+
+        // Derive look-ahead from actual focus movement, not camera rotation. A
+        // short dead zone prevents idle/network jitter from changing residency.
+        const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        const px = Number(p[0]);
+        const py = Number(p[1]);
+        const previousFocus = this._prefetchFocusSample;
+        if (previousFocus && Number.isFinite(px) && Number.isFinite(py)) {
+            const dt = Math.max(0, (nowMs - previousFocus.ms) / 1000.0);
+            const dx = px - previousFocus.x;
+            const dy = py - previousFocus.y;
+            const distance = Math.hypot(dx, dy);
+            if (dt >= 0.04 && distance >= 0.3) {
+                if (!this._prefetchMoveDir) this._prefetchMoveDir = new Float32Array(2);
+                this._prefetchMoveDir[0] = dx / distance;
+                this._prefetchMoveDir[1] = dy / distance;
+                const instantSpeed = Math.min(120.0, distance / dt);
+                const response = 1.0 - Math.exp(-Math.min(1.0, dt) * 5.0);
+                this._prefetchMoveSpeed = this._prefetchMoveSpeed > 0
+                    ? this._prefetchMoveSpeed + (instantSpeed - this._prefetchMoveSpeed) * response
+                    : instantSpeed;
+                this._prefetchMoveDirMs = nowMs;
+            }
+        }
+        if (!previousFocus || nowMs - previousFocus.ms >= 40) {
+            this._prefetchFocusSample = { x: px, y: py, ms: nowMs };
+        }
 
         const keys = this._tmpWantedKeys;
         keys.length = 0;
-        const inFrustumSet = this._tmpInFrustumSet;
-        inFrustumSet.clear();
-        // IMPORTANT: chunk AABBs are in *data space*, so extract frustum planes in data space too.
-        // Clip = cameraVP * (modelMatrix * dataPos) => use (cameraVP * modelMatrix).
-        const planes = this.enableFrustumCulling
-            ? (() => {
-                const vpData = this._tmpVpData;
-                glMatrix.mat4.multiply(vpData, camera.viewProjectionMatrix, this.modelMatrix);
-                return extractFrustumPlanes(vpData, this._tmpFrustumPlanes);
-            })()
-            : null;
-        // Include a larger window in the camera-forward direction so the world doesn't "cut off" when moving.
         const r = Math.max(0, Math.floor(this.radiusChunks));
-        const extra = Math.max(0, Math.floor(this.extraFrontChunks || 0));
-        const fwd2 = this._cameraDirToDataSpace(camera.direction || [0, 0, -1]);
-        // Chunking is on X/Y (data space). Ignore Z for forward window decisions.
-        const fxyLen2 = Math.hypot(fwd2[0], fwd2[1]) || 1.0;
-        const fx2 = fwd2[0] / fxyLen2, fy2 = fwd2[1] / fxyLen2;
+        const maxWanted = Math.max(1, Math.floor(Number(this.maxLoadedChunks) || 1));
 
+        // The core is the resident gameplay bubble: nearest-first, always player-centered, never frustum
+        // or direction filtered. With the default r=1 / max=9 this is exactly a stable 3x3 block.
+        const core = this._tmpWantedScored;
+        let coreCount = 0;
+        for (let dy = -r; dy <= r; dy++) {
+            for (let dx = -r; dx <= r; dx++) {
+                const key = `${cx + dx}_${cy + dy}`;
+                if (!this._isChunkInWorldBounds(key)) continue;
+                if (!this._hasIndexedChunk(key)) continue;
+                if (coreCount >= core.length) core.push({ k: '', score: 0 });
+                core[coreCount].k = key;
+                core[coreCount].score = dx * dx + dy * dy;
+                coreCount++;
+            }
+        }
+        core.length = coreCount;
+        core.sort((a, b) => a.score - b.score || (a.k < b.k ? -1 : 1));
+        for (let i = 0; i < core.length && keys.length < maxWanted; i++) keys.push(core[i].k);
+        this._lastResidentCoreCount = keys.length;
+        if (keys.length >= maxWanted) {
+            this._lastPrefetchStats = { speed: this._prefetchMoveSpeed, leadChunks: 0, core: keys.length, forward: 0 };
+            return keys;
+        }
+
+        // Larger custom budgets can retain a forward prefetch ring. The resident core above remains intact
+        // when the camera turns, so this can improve travel look-ahead without causing local resets.
+        const maxExtra = Math.max(0, Math.floor(this.extraFrontChunks || 0));
+        if (maxExtra <= 0) {
+            this._lastPrefetchStats = { speed: this._prefetchMoveSpeed, leadChunks: 0, core: keys.length, forward: 0 };
+            return keys;
+        }
+        const moveDir = (this._prefetchMoveDir && nowMs - this._prefetchMoveDirMs <= 1200)
+            ? this._prefetchMoveDir
+            : null;
+        if (!moveDir) {
+            this._prefetchMoveSpeed = 0;
+            this._lastPrefetchStats = { speed: 0, leadChunks: 0, core: keys.length, forward: 0 };
+            return keys;
+        }
+        const fx2 = moveDir[0], fy2 = moveDir[1];
+        const speed = Math.max(0, Number(this._prefetchMoveSpeed) || 0);
+        const horizon = Math.max(1.0, Math.min(20.0, Number(this.prefetchHorizonSeconds) || 10.0));
+        const leadChunks = Math.max(0.5, Math.min(maxExtra, speed * horizon / chunkSize));
+        const extra = Math.max(1, Math.min(maxExtra, Math.ceil(leadChunks)));
+        const seen = this._tmpInFrustumSet;
+        seen.clear();
+        for (const k of keys) seen.add(k);
+        const prefetch = [];
         for (let dy = -(r + extra); dy <= (r + extra); dy++) {
             for (let dx = -(r + extra); dx <= (r + extra); dx++) {
-                // If the chunk offset is behind the camera direction, keep the tighter radius.
-                // If it's in front, allow the extended radius.
+                if (Math.abs(dx) <= r && Math.abs(dy) <= r) continue;
                 const dot2 = dx * fx2 + dy * fy2;
                 const allow = (dot2 >= 0)
                     ? (Math.abs(dx) <= (r + extra) && Math.abs(dy) <= (r + extra))
                     : (Math.abs(dx) <= r && Math.abs(dy) <= r);
                 if (!allow) continue;
                 const k = `${cx + dx}_${cy + dy}`;
-                if (planes) {
-                    const aabb = this._chunkAABBDataSpace(k);
-                    // Missing AABB => treat as visible so we don't accidentally starve it.
-                    const inFrustum = !aabb || aabbIntersectsFrustum(planes, aabb.min, aabb.max);
-                    if (inFrustum) inFrustumSet.add(k);
-                } else {
-                    inFrustumSet.add(k);
+                if (!this._isChunkInWorldBounds(k)) continue;
+                if (!this._hasIndexedChunk(k)) continue;
+                if (!seen.has(k)) {
+                    const predictedDx = dx - fx2 * leadChunks;
+                    const predictedDy = dy - fy2 * leadChunks;
+                    const lateral = dx * -fy2 + dy * fx2;
+                    prefetch.push({
+                        k,
+                        score: predictedDx * predictedDx + predictedDy * predictedDy
+                            + lateral * lateral * 0.2 + (dx * dx + dy * dy) * 0.04,
+                    });
                 }
-                keys.push(k);
             }
         }
-
-        // Sort near-first with a slight "in front of camera" bias for faster look-around.
-        if (keys.length <= 1) return keys;
-        const fwd = this._cameraDirToDataSpace(camera.direction || [0, 0, -1]);
-        const fwdLen = Math.hypot(fwd[0], fwd[1], fwd[2]) || 1.0;
-        const fx = fwd[0] / fwdLen, fy = fwd[1] / fwdLen, fz = fwd[2] / fwdLen;
-
-        const scored = this._tmpWantedScored;
-        // Ensure we have enough entries to reuse (avoid churn).
-        if (scored.length < keys.length) {
-            for (let i = scored.length; i < keys.length; i++) scored.push({ k: '', score: 1e30 });
-        }
-        for (let i = 0; i < keys.length; i++) {
-            const k = keys[i];
-            const j = k.indexOf('_');
-            const sx = (j >= 0) ? parseInt(k.slice(0, j), 10) : NaN;
-            const sy = (j >= 0) ? parseInt(k.slice(j + 1), 10) : NaN;
-            if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
-                scored[i].k = k;
-                scored[i].score = 1e30;
-                continue;
-            }
-            const ccx = (sx + 0.5) * chunkSize;
-            const ccy = (sy + 0.5) * chunkSize;
-            const dx = ccx - p[0];
-            const dy = ccy - p[1];
-            const dz = 0.0 - p[2];
-            const dist2 = dx * dx + dy * dy + dz * dz;
-            const dot = dx * fx + dy * fy + dz * fz;
-            const behindPenalty = (dot >= 0) ? 1.0 : 1.6;
-            let score = dist2 * behindPenalty;
-            // Game-like preload: frustum culling acts as PRIORITY, not inclusion.
-            if (this.enableFrustumCulling && inFrustumSet && !inFrustumSet.has(k)) {
-                score *= 1.9;
-            }
-            scored[i].k = k;
-            scored[i].score = score;
-        }
-        scored.length = keys.length;
-        scored.sort((a, b) => a.score - b.score);
-        for (let i = 0; i < scored.length; i++) keys[i] = scored[i].k;
+        prefetch.sort((a, b) => a.score - b.score || (a.k < b.k ? -1 : 1));
+        for (let i = 0; i < prefetch.length && keys.length < maxWanted; i++) keys.push(prefetch[i].k);
+        this._lastPrefetchStats = {
+            speed,
+            leadChunks,
+            core: this._lastResidentCoreCount,
+            forward: Math.max(0, keys.length - this._lastResidentCoreCount),
+        };
         return keys;
     }
 
@@ -888,7 +1221,7 @@ export class DrawableStreamer {
         return m;
     }
 
-    _instanceStrideFloatsForLen(len) {
+    _instanceStrideFloatsForLen(len, explicitStride = null) {
         const n = Number(len ?? 0);
         if (!Number.isFinite(n) || n <= 0) return 16;
         // Layouts:
@@ -896,10 +1229,28 @@ export class DrawableStreamer {
         // - v1: 17 (mat4 + tintIndex)
         // - v3: 21 (mat4 + tintIndex + guid + mloParentGuid + mloEntitySetHash + mloFlags)
         // - v4: 22 (mat4 + tintIndex + guid + mloParentGuid + mloEntitySetHash + mloFlags + ymapHash)
+        const requested = Math.floor(Number(explicitStride));
+        if ([16, 17, 21, 22].includes(requested) && (n % requested) === 0) return requested;
         if ((n % 22) === 0) return 22;
         if ((n % 21) === 0) return 21;
         if ((n % 17) === 0) return 17;
         return 16;
+    }
+
+    _instanceTransformSignature(mats, offset, stride) {
+        // Match the worker-side duplicate key. Repeated YMAP records have the
+        // same drawable transform and otherwise waste upload/draw budget.
+        const q = (index, scale) => {
+            const n = Number(mats[offset + index]);
+            return Number.isFinite(n) ? Math.round(n * scale) : 0;
+        };
+        return [
+            q(0, 10000), q(1, 10000), q(2, 10000),
+            q(4, 10000), q(5, 10000), q(6, 10000),
+            q(8, 10000), q(9, 10000), q(10, 10000),
+            q(12, 1000), q(13, 1000), q(14, 1000),
+            stride >= 17 ? q(16, 1) : 0,
+        ].join(',');
     }
 
     async _ensureMloDefLoaded(archHash) {
@@ -908,7 +1259,8 @@ export class DrawableStreamer {
         if (this._mloDefs.has(h) || this._mloDefsLoading.has(h)) return;
         this._mloDefsLoading.add(h);
         try {
-            const def = await fetchJSON(`assets/interiors/${h}.json`);
+            const revision = encodeURIComponent(this._mloDefinitionRevision || 'v1');
+            const def = await fetchJSON(`assets/interiors/${h}.json?rev=${revision}`);
             if (def && typeof def === 'object') this._mloDefs.set(h, def);
         } catch {
             // ignore missing interiors defs
@@ -918,12 +1270,143 @@ export class DrawableStreamer {
     }
 
     _pointInAABB(p, minV, maxV) {
-        return (p[0] >= minV[0] && p[0] <= maxV[0]) &&
-               (p[1] >= minV[1] && p[1] <= maxV[1]) &&
-               (p[2] >= minV[2] && p[2] <= maxV[2]);
+        // Several FiveM MLO room definitions store one or more AABB axes in
+        // descending order. Treat the values as endpoints instead of assuming
+        // the exporter normalized them; otherwise a valid room becomes limbo.
+        return (p[0] >= Math.min(Number(minV[0]), Number(maxV[0])) && p[0] <= Math.max(Number(minV[0]), Number(maxV[0]))) &&
+               (p[1] >= Math.min(Number(minV[1]), Number(maxV[1])) && p[1] <= Math.max(Number(minV[1]), Number(maxV[1]))) &&
+               (p[2] >= Math.min(Number(minV[2]), Number(maxV[2])) && p[2] <= Math.max(Number(minV[2]), Number(maxV[2])));
     }
 
-    _computeVisibleRooms(def, startRoomIdx) {
+    _decodeMloFlags(flagsValue) {
+        const flags = Number(flagsValue) >>> 0;
+        return {
+            flags,
+            roomIndex: ((flags >>> MLO_ROOM_SHIFT) & 0xff) - 1,
+            portalIndex: ((flags >>> MLO_PORTAL_SHIFT) & 0xff) - 1,
+            entitySetDefault: (flags & MLO_FLAG_ENTITY_SET_DEFAULT) !== 0,
+        };
+    }
+
+    _findExteriorRoomIndex(def) {
+        const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
+        const named = rooms.findIndex((room) => String(room?.name || '').trim().toLowerCase() === 'limbo');
+        return named >= 0 ? named : (rooms.length ? 0 : -1);
+    }
+
+    _findContainingRoomIndex(def, local) {
+        const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
+        const exterior = this._findExteriorRoomIndex(def);
+        let best = -1;
+        let bestVolume = Number.POSITIVE_INFINITY;
+        for (let ri = 0; ri < rooms.length; ri++) {
+            const mn = rooms[ri]?.bbMin;
+            const mx = rooms[ri]?.bbMax;
+            if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) continue;
+            if (!this._pointInAABB(local, mn, mx)) continue;
+            if (ri === exterior) {
+                if (best < 0) best = ri;
+                continue;
+            }
+            const volume = Math.abs(Number(mx[0]) - Number(mn[0]))
+                * Math.abs(Number(mx[1]) - Number(mn[1]))
+                * Math.abs(Number(mx[2]) - Number(mn[2]));
+            if (volume < bestVolume) {
+                best = ri;
+                bestVolume = volume;
+            }
+        }
+        return best;
+    }
+
+    _distanceToInteriorBounds(def, local) {
+        const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
+        const room = rooms[this._findExteriorRoomIndex(def)] || rooms[0];
+        const mn = room?.bbMin;
+        const mx = room?.bbMax;
+        if (!Array.isArray(mn) || !Array.isArray(mx)) return Number.POSITIVE_INFINITY;
+        const dx = Math.max(Math.min(Number(mn[0]), Number(mx[0])) - local[0], 0, local[0] - Math.max(Number(mn[0]), Number(mx[0])));
+        const dy = Math.max(Math.min(Number(mn[1]), Number(mx[1])) - local[1], 0, local[1] - Math.max(Number(mn[1]), Number(mx[1])));
+        const dz = Math.max(Math.min(Number(mn[2]), Number(mx[2])) - local[2], 0, local[2] - Math.max(Number(mn[2]), Number(mx[2])));
+        return Math.hypot(dx, dy, dz);
+    }
+
+    _portalKey(parentGuid, portal) {
+        return `${Number(parentGuid) >>> 0}:${Number(portal?.index) >>> 0}`;
+    }
+
+    _isPortalOpen(parentGuid, portal) {
+        const flags = Number(portal?.flags) >>> 0;
+        if ((flags & MLO_PORTAL_FLAG_HIDE_WHEN_DOOR_CLOSED) === 0) return true;
+        const progress = this._portalOpenProgress(parentGuid, portal);
+        // A hide-when-closed portal without a bound door is an open architectural portal.
+        return progress >= 0.35;
+    }
+
+    _portalOpenProgress(parentGuid, portal) {
+        const progress = this._mloPortalOpenOverrides.get(this._portalKey(parentGuid, portal));
+        return progress === undefined ? 1 : Math.max(0, Math.min(1, Number(progress) || 0));
+    }
+
+    _portalCenterData(instance, portal) {
+        const corners = Array.isArray(portal?.corners) ? portal.corners : [];
+        if (!instance?.mat16 || corners.length === 0) return null;
+        const local = [0, 0, 0];
+        let count = 0;
+        for (const corner of corners) {
+            if (!Array.isArray(corner) || corner.length < 3) continue;
+            local[0] += Number(corner[0]) || 0;
+            local[1] += Number(corner[1]) || 0;
+            local[2] += Number(corner[2]) || 0;
+            count++;
+        }
+        if (!count) return null;
+        const point = glMatrix.vec4.fromValues(local[0] / count, local[1] / count, local[2] / count, 1);
+        const output = glMatrix.vec4.create();
+        glMatrix.vec4.transformMat4(output, point, instance.mat16);
+        return [output[0], output[1], output[2]];
+    }
+
+    syncMloPortalDoors(doors = [], states = new Map()) {
+        const next = new Map();
+        for (const instance of this._mloInstancesLast || []) {
+            const def = this._mloDefs.get(String(instance.archHash));
+            for (const portal of (def?.portals || [])) {
+                if (((Number(portal?.flags) >>> 0) & MLO_PORTAL_FLAG_HIDE_WHEN_DOOR_CLOSED) === 0) continue;
+                const center = this._portalCenterData(instance, portal);
+                if (!center) continue;
+                let progress = -1;
+                for (const door of (Array.isArray(doors) ? doors : [])) {
+                    const coords = door?.coords;
+                    if (!coords) continue;
+                    const distance = Math.hypot(
+                        center[0] - Number(coords.x),
+                        center[1] - Number(coords.y),
+                        center[2] - Number(coords.z),
+                    );
+                    const bindRadius = Math.max(2.5, Math.min(4.5, Number(door?.radius) || 0));
+                    if (!(distance <= bindRadius)) continue;
+                    progress = Math.max(progress, Number(states?.get?.(door.id)?.progress) || 0);
+                }
+                if (progress >= 0) next.set(this._portalKey(instance.parentGuid, portal), progress);
+            }
+        }
+        let visibilityChanged = next.size !== this._mloPortalOpenOverrides.size;
+        if (!visibilityChanged) {
+            for (const [key, value] of next) {
+                const previous = this._mloPortalOpenOverrides.get(key);
+                if ((Number(previous) >= 0.35) !== (Number(value) >= 0.35)) {
+                    visibilityChanged = true;
+                    break;
+                }
+            }
+        }
+        this._mloPortalOpenOverrides = next;
+        if (visibilityChanged) this._dirty = true;
+        return next.size;
+    }
+
+    _computeVisibleRooms(def, startRoomIdx, parentGuid = 0) {
         const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
         const portals = Array.isArray(def?.portals) ? def.portals : [];
         const maxDepth = Math.max(0, Math.min(8, Math.floor(this.interiorPortalDepth || 0)));
@@ -933,17 +1416,20 @@ export class DrawableStreamer {
         if (!this.enableRoomGating || maxDepth <= 0) return vis;
 
         // Build adjacency from portals.
-        /** @type {Map<number, number[]>} */
+        /** @type {Map<number, Array<{ room:number, portal:object }>>} */
         const adj = new Map();
         for (const p of portals) {
             const a = Number(p?.roomFrom);
             const b = Number(p?.roomTo);
             if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
             if (a < 0 || b < 0 || a >= rooms.length || b >= rooms.length) continue;
+            if (!this._isPortalOpen(parentGuid, p)) continue;
             if (!adj.has(a)) adj.set(a, []);
-            if (!adj.has(b)) adj.set(b, []);
-            adj.get(a).push(b);
-            adj.get(b).push(a);
+            adj.get(a).push({ room: b, portal: p });
+            if (((Number(p?.flags) >>> 0) & MLO_PORTAL_FLAG_ONE_WAY) === 0) {
+                if (!adj.has(b)) adj.set(b, []);
+                adj.get(b).push({ room: a, portal: p });
+            }
         }
 
         /** @type {Array<{r:number,d:number}>} */
@@ -952,89 +1438,128 @@ export class DrawableStreamer {
             const { r, d } = q.shift();
             if (d >= maxDepth) continue;
             const ns = adj.get(r) || [];
-            for (const n of ns) {
+            for (const edge of ns) {
+                const n = edge.room;
                 if (vis.has(n)) continue;
+                const nextDepth = d + 1;
+                const exteriorDepth = Number(rooms[n]?.exteriorVisibilityDepth);
+                if (startRoomIdx === this._findExteriorRoomIndex(def)
+                    && Number.isFinite(exteriorDepth) && exteriorDepth >= 0 && nextDepth > exteriorDepth) continue;
                 vis.add(n);
-                q.push({ r: n, d: d + 1 });
+                q.push({ r: n, d: nextDepth });
             }
         }
         return vis;
     }
 
-    _isMloSetEnabled(parentGuid, setHash) {
+    _isMloSetEnabled(parentGuid, setHash, flags = 0) {
         if (!this.enableMloEntitySets) return true;
         const pg = (Number(parentGuid) >>> 0);
         const sh = (Number(setHash) >>> 0);
         if (!pg || !sh) return true; // not an entity-set child
         const key = `${pg}:${sh}`;
         const v = this._mloSetOverrides.get(key);
-        return (v === undefined) ? true : !!v;
+        if (v !== undefined) return !!v;
+        const decoded = this._decodeMloFlags(flags);
+        const hasRuntimeOwnership = ((decoded.flags >>> MLO_ROOM_SHIFT) & 0xffff) !== 0;
+        if (hasRuntimeOwnership) this._mloSetDefaults.set(key, decoded.entitySetDefault);
+        return hasRuntimeOwnership ? decoded.entitySetDefault : true;
     }
 
-    _filterEntriesForActiveInterior(entries) {
+    _resolveActiveInterior(instances, position) {
+        let nearestInterior = null;
+        let nearestInteriorDistance = Number.POSITIVE_INFINITY;
+        let nearestExterior = null;
+        let nearestDistance = Number.POSITIVE_INFINITY;
+        for (const inst of instances || []) {
+            const def = this._mloDefs.get(String(inst.archHash));
+            if (!def || !Array.isArray(def.rooms) || def.rooms.length === 0) continue;
+            const inv = glMatrix.mat4.create();
+            if (!glMatrix.mat4.invert(inv, inst.mat16)) continue;
+            const input = glMatrix.vec4.fromValues(position[0], position[1], position[2], 1.0);
+            const output = glMatrix.vec4.create();
+            glMatrix.vec4.transformMat4(output, input, inv);
+            const local = [output[0], output[1], output[2]];
+            const rootDistance = Math.hypot(
+                position[0] - Number(inst.mat16[12]),
+                position[1] - Number(inst.mat16[13]),
+                position[2] - Number(inst.mat16[14]),
+            );
+            if (rootDistance > this.interiorMaxRootDistance) continue;
+            const exteriorRoomIndex = this._findExteriorRoomIndex(def);
+            const roomIndex = this._findContainingRoomIndex(def, local);
+            if (roomIndex >= 0 && roomIndex !== exteriorRoomIndex && rootDistance < nearestInteriorDistance) {
+                nearestInteriorDistance = rootDistance;
+                nearestInterior = {
+                    parentGuid: inst.parentGuid,
+                    archHash: String(inst.archHash),
+                    roomIndex,
+                    exteriorRoomIndex,
+                    isExterior: false,
+                    visibleRooms: this._computeVisibleRooms(def, roomIndex, inst.parentGuid),
+                    invMat: inv,
+                    mat16: inst.mat16,
+                    localPosition: local,
+                };
+                continue;
+            }
+            const distance = this._distanceToInteriorBounds(def, local);
+            if (exteriorRoomIndex >= 0 && distance <= this.interiorExteriorDistance && distance < nearestDistance) {
+                nearestDistance = distance;
+                nearestExterior = {
+                    parentGuid: inst.parentGuid,
+                    archHash: String(inst.archHash),
+                    roomIndex: exteriorRoomIndex,
+                    exteriorRoomIndex,
+                    isExterior: true,
+                    visibleRooms: this._computeVisibleRooms(def, exteriorRoomIndex, inst.parentGuid),
+                    invMat: inv,
+                    mat16: inst.mat16,
+                    localPosition: local,
+                };
+            }
+        }
+        return nearestInterior || nearestExterior;
+    }
+
+    _filterEntriesForActiveInterior(entries, suppliedMloInstances = null) {
         if (!this.enableInteriors) return entries;
 
         // Discover MLO instances present in the loaded set (metadata stride=21).
         /** @type {Array<{ parentGuid:number, archHash:string, mat16:Float32Array }>} */
-        const mloInstances = [];
-        for (const e of entries) {
-            const mats = e.mats;
-            const stride = this._instanceStrideFloatsForLen(mats.length ?? 0);
-            if (stride < 21) continue;
-            for (let i = 0; i + 20 < mats.length; i += stride) {
-                const flags = (mats[i + 20] >>> 0);
-                if ((flags & 1) === 0) continue; // not isMloInstance
-                const guid = (mats[i + 17] >>> 0);
-                if (!guid) continue;
-                // Copy mat4 floats (avoid aliasing into the big array).
-                const m = new Float32Array(16);
-                for (let k = 0; k < 16; k++) m[k] = mats[i + k];
-                mloInstances.push({ parentGuid: guid, archHash: String(e.hash), mat16: m });
-                void this._ensureMloDefLoaded(String(e.hash));
+        const mloInstances = Array.isArray(suppliedMloInstances) ? suppliedMloInstances : [];
+        if (!Array.isArray(suppliedMloInstances)) {
+            for (const e of entries) {
+                const mats = e.mats;
+                const stride = this._instanceStrideFloatsForLen(mats.length ?? 0, e.instanceStrideFloats);
+                if (stride < 21) continue;
+                for (let i = 0; i + 20 < mats.length; i += stride) {
+                    const flags = (mats[i + 20] >>> 0);
+                    if ((flags & 1) === 0) continue; // not isMloInstance
+                    const guid = (mats[i + 17] >>> 0);
+                    if (!guid) continue;
+                    // Copy mat4 floats (avoid aliasing into the big array).
+                    const m = new Float32Array(16);
+                    for (let k = 0; k < 16; k++) m[k] = mats[i + k];
+                    mloInstances.push({ parentGuid: guid, archHash: String(e.hash), mat16: m });
+                    void this._ensureMloDefLoaded(String(e.hash));
+                }
             }
         }
         this._mloInstancesLast = mloInstances;
 
-        // Compute active interior (if camera is inside any room AABB in local space).
-        let active = null;
-        const cam = this._lastCamDataPos || [0, 0, 0];
-        for (const inst of mloInstances) {
-            const def = this._mloDefs.get(String(inst.archHash));
-            if (!def) continue;
-            const rooms = Array.isArray(def.rooms) ? def.rooms : [];
-            if (rooms.length === 0) continue;
+        const active = this._resolveActiveInterior(mloInstances, this._lastCamDataPos || [0, 0, 0]);
 
-            const inv = glMatrix.mat4.create();
-            if (!glMatrix.mat4.invert(inv, inst.mat16)) continue;
-            const v4 = glMatrix.vec4.fromValues(cam[0], cam[1], cam[2], 1.0);
-            const out = glMatrix.vec4.create();
-            glMatrix.vec4.transformMat4(out, v4, inv);
-            const local = [out[0], out[1], out[2]];
-
-            let roomIdx = -1;
-            for (let ri = 0; ri < rooms.length; ri++) {
-                const r = rooms[ri];
-                const mn = r?.bbMin;
-                const mx = r?.bbMax;
-                if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) continue;
-                if (this._pointInAABB(local, mn, mx)) { roomIdx = ri; break; }
-            }
-            if (roomIdx >= 0) {
-                const visibleRooms = this._computeVisibleRooms(def, roomIdx);
-                active = { parentGuid: inst.parentGuid, archHash: String(inst.archHash), roomIndex: roomIdx, visibleRooms, invMat: inv };
-                break;
-            }
-        }
-
-        const key = active ? `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${Array.from(active.visibleRooms).sort((a,b)=>a-b).join(',')}` : '';
+        const key = active ? `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${active.isExterior ? 1 : 0}:${Array.from(active.visibleRooms).sort((a,b)=>a-b).join(',')}` : '';
         this._activeInterior = active;
         this._activeInteriorKey = key;
+        this._publishInteriorRuntimeStatus();
 
         // If we are not inside any interior, drop all interior-child instances.
         if (!active) {
             const outEntries = [];
             for (const e of entries) {
-                const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
+                const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0, e.instanceStrideFloats);
                 if (stride < 21) { outEntries.push(e); continue; }
                 const filtered = [];
                 const a = e.mats;
@@ -1051,34 +1576,38 @@ export class DrawableStreamer {
         // Inside one interior: only render that interior's children, with room + entity-set gating.
         const outEntries = [];
         for (const e of entries) {
-            const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
+            const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0, e.instanceStrideFloats);
             if (stride < 21) { outEntries.push(e); continue; }
             const filtered = [];
             const a = e.mats;
             for (let i = 0; i + (stride - 1) < a.length; i += stride) {
                 const mloParentGuid = (a[i + 18] >>> 0);
                 const mloSetHash = (a[i + 19] >>> 0);
+                const mloFlags = (a[i + 20] >>> 0);
                 if (mloParentGuid) {
                     if (mloParentGuid !== (active.parentGuid >>> 0)) continue;
-                    if (!this._isMloSetEnabled(mloParentGuid, mloSetHash)) continue;
+                    if (!this._isMloSetEnabled(mloParentGuid, mloSetHash, mloFlags)) continue;
 
                     if (this.enableRoomGating && active.invMat) {
-                        const tx = a[i + 12], ty = a[i + 13], tz = a[i + 14];
-                        const v4 = glMatrix.vec4.fromValues(tx, ty, tz, 1.0);
-                        const out = glMatrix.vec4.create();
-                        glMatrix.vec4.transformMat4(out, v4, active.invMat);
-                        const local = [out[0], out[1], out[2]];
                         const def = this._mloDefs.get(String(active.archHash));
                         const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
-                        let ri = -1;
-                        for (let rj = 0; rj < rooms.length; rj++) {
-                            const r = rooms[rj];
-                            const mn = r?.bbMin;
-                            const mx = r?.bbMax;
-                            if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) continue;
-                            if (this._pointInAABB(local, mn, mx)) { ri = rj; break; }
+                        const ownership = this._decodeMloFlags(mloFlags);
+                        if (ownership.portalIndex >= 0) {
+                            const portal = (def?.portals || [])[ownership.portalIndex];
+                            const from = Number(portal?.roomFrom);
+                            const to = Number(portal?.roomTo);
+                            if (!active.visibleRooms.has(from) && !active.visibleRooms.has(to)) continue;
+                        } else {
+                            let ri = ownership.roomIndex;
+                            if (ri < 0) {
+                                const tx = a[i + 12], ty = a[i + 13], tz = a[i + 14];
+                                const v4 = glMatrix.vec4.fromValues(tx, ty, tz, 1.0);
+                                const out = glMatrix.vec4.create();
+                                glMatrix.vec4.transformMat4(out, v4, active.invMat);
+                                ri = this._findContainingRoomIndex(def, [out[0], out[1], out[2]]);
+                            }
+                            if (ri >= 0 && ri < rooms.length && !active.visibleRooms.has(ri)) continue;
                         }
-                        if (ri >= 0 && !active.visibleRooms.has(ri)) continue;
                     }
                 }
                 for (let k = 0; k < stride; k++) filtered.push(a[i + k]);
@@ -1090,36 +1619,160 @@ export class DrawableStreamer {
 
     _computeActiveInteriorFromCache() {
         if (!this.enableInteriors) return { active: null, key: '' };
-        const cam = this._lastCamDataPos || [0, 0, 0];
-        for (const inst of (this._mloInstancesLast || [])) {
-            const def = this._mloDefs.get(String(inst.archHash));
-            if (!def) continue;
-            const rooms = Array.isArray(def.rooms) ? def.rooms : [];
-            if (rooms.length === 0) continue;
+        const active = this._resolveActiveInterior(this._mloInstancesLast || [], this._lastCamDataPos || [0, 0, 0]);
+        const key = active
+            ? `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${active.isExterior ? 1 : 0}:${Array.from(active.visibleRooms).sort((a, b) => a - b).join(',')}`
+            : '';
+        return { active, key };
+    }
 
-            const inv = glMatrix.mat4.create();
-            if (!glMatrix.mat4.invert(inv, inst.mat16)) continue;
-            const v4 = glMatrix.vec4.fromValues(cam[0], cam[1], cam[2], 1.0);
-            const out = glMatrix.vec4.create();
-            glMatrix.vec4.transformMat4(out, v4, inv);
-            const local = [out[0], out[1], out[2]];
+    getInteriorStateAtDataPos(posData, { includeExterior = true } = {}) {
+        if (!this.enableInteriors || !posData || posData.length < 3) return null;
+        const position = [Number(posData[0]), Number(posData[1]), Number(posData[2])];
+        if (!position.every(Number.isFinite)) return null;
+        const active = this._resolveActiveInterior(this._mloInstancesLast || [], position);
+        if (!active || (!includeExterior && active.isExterior)) return null;
+        const def = this._mloDefs.get(String(active.archHash));
+        const room = def?.rooms?.[active.roomIndex] || null;
+        return {
+            ...active,
+            definition: def || null,
+            room: room || null,
+            roomName: String(room?.name || ''),
+        };
+    }
 
-            let roomIdx = -1;
-            for (let ri = 0; ri < rooms.length; ri++) {
-                const r = rooms[ri];
-                const mn = r?.bbMin;
-                const mx = r?.bbMax;
-                if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) continue;
-                if (this._pointInAABB(local, mn, mx)) { roomIdx = ri; break; }
-            }
-            if (roomIdx >= 0) {
-                const visibleRooms = this._computeVisibleRooms(def, roomIdx);
-                const active = { parentGuid: inst.parentGuid, archHash: String(inst.archHash), roomIndex: roomIdx, visibleRooms };
-                const key = `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${Array.from(active.visibleRooms).sort((a,b)=>a-b).join(',')}`;
-                return { active, key };
+    _findPortalPath(def, fromRoom, toRoom, parentGuid = 0) {
+        if (fromRoom === toRoom) return [];
+        const portals = Array.isArray(def?.portals) ? def.portals : [];
+        const queue = [{ room: fromRoom, path: [] }];
+        const visited = new Set([fromRoom]);
+        while (queue.length) {
+            const current = queue.shift();
+            if (current.path.length >= 12) continue;
+            for (const portal of portals) {
+                if (!this._isPortalOpen(parentGuid, portal)) continue;
+                const a = Number(portal?.roomFrom);
+                const b = Number(portal?.roomTo);
+                const oneWay = ((Number(portal?.flags) >>> 0) & MLO_PORTAL_FLAG_ONE_WAY) !== 0;
+                const next = a === current.room ? b : (!oneWay && b === current.room ? a : -1);
+                if (next < 0 || visited.has(next)) continue;
+                const path = current.path.concat(portal);
+                if (next === toRoom) return path;
+                visited.add(next);
+                queue.push({ room: next, path });
             }
         }
-        return { active: null, key: '' };
+        return null;
+    }
+
+    getMloAcousticPath(sourcePosData, listenerPosData) {
+        const source = this.getInteriorStateAtDataPos(sourcePosData, { includeExterior: true });
+        const listener = this.getInteriorStateAtDataPos(listenerPosData, { includeExterior: true });
+        if (!source && !listener) return { occluded: false, gain: 1, cutoffHz: 20000, portalCount: 0 };
+        if (!source || !listener || source.parentGuid !== listener.parentGuid) {
+            const enclosed = !!(source && !source.isExterior) || !!(listener && !listener.isExterior);
+            return enclosed
+                ? { occluded: true, gain: 0.32, cutoffHz: 1050, portalCount: 0 }
+                : { occluded: false, gain: 1, cutoffHz: 20000, portalCount: 0 };
+        }
+        const path = this._findPortalPath(source.definition, source.roomIndex, listener.roomIndex, source.parentGuid);
+        if (path === null) return { occluded: true, gain: 0.18, cutoffHz: 700, portalCount: 0 };
+        if (path.length === 0) return { occluded: false, gain: 1, cutoffHz: 20000, portalCount: 0 };
+        let authored = 0;
+        let doorClosure = 0;
+        for (const portal of path) {
+            const raw = Math.max(0, Number(portal?.audioOcclusion) || 0);
+            const normalized = raw <= 1 ? raw : Math.min(1, raw / 255);
+            authored += normalized;
+            doorClosure += 1 - this._portalOpenProgress(source.parentGuid, portal);
+        }
+        const barrier = Math.min(1, 0.18 * path.length + 0.62 * authored + 0.55 * doorClosure);
+        return {
+            occluded: barrier > 0.02,
+            gain: Math.max(0.18, 1 - barrier * 0.72),
+            cutoffHz: Math.max(650, 20000 * Math.pow(0.075, barrier)),
+            portalCount: path.length,
+        };
+    }
+
+    getActiveInteriorEnvironment(hour = 12) {
+        const active = this._activeInterior;
+        if (!active || active.isExterior) return null;
+        const def = this._mloDefs.get(String(active.archHash));
+        const room = def?.rooms?.[active.roomIndex];
+        if (!room) return null;
+        let modifierStrength = 0;
+        const local = active.localPosition || [0, 0, 0];
+        const h = ((Number(hour) || 0) % 24 + 24) % 24;
+        for (const modifier of (def.timecycleModifiers || [])) {
+            const start = Number(modifier?.startHour) || 0;
+            const end = Number(modifier?.endHour) || 24;
+            const activeHour = start <= end ? (h >= start && h <= end) : (h >= start || h <= end);
+            if (!activeHour) continue;
+            const sphere = modifier?.sphere;
+            if (!Array.isArray(sphere) || sphere.length < 4) continue;
+            const distance = Math.hypot(local[0] - sphere[0], local[1] - sphere[1], local[2] - sphere[2]);
+            const radius = Math.max(0.001, Number(sphere[3]) || Number(modifier?.range) || 0.001);
+            const spatial = Math.max(0, 1 - distance / radius);
+            const percentage = Number(modifier?.percentage);
+            const weight = Number.isFinite(percentage) ? Math.min(1, percentage > 1 ? percentage / 100 : percentage) : 1;
+            modifierStrength = Math.max(modifierStrength, spatial * weight);
+        }
+        const blend = Math.max(0, Math.min(1, Number(room.blend) || 0));
+        const hasNamedTimecycle = (Number(room.timecycleName) >>> 0) !== 0 || (Number(room.secondaryTimecycleName) >>> 0) !== 0;
+        const exteriorRoom = this._findExteriorRoomIndex(def);
+        const exteriorPath = exteriorRoom >= 0
+            ? this._findPortalPath(def, active.roomIndex, exteriorRoom, active.parentGuid)
+            : null;
+        let exteriorInfluence = 0;
+        if (Array.isArray(exteriorPath) && exteriorPath.length > 0) {
+            let transmission = 1;
+            for (const portal of exteriorPath) {
+                const flags = Number(portal?.flags) >>> 0;
+                const opacityRaw = Math.max(0, Number(portal?.opacity) || 0);
+                const opacity = opacityRaw <= 1 ? opacityRaw : Math.min(1, opacityRaw / 255);
+                const doorTransmission = this._portalOpenProgress(active.parentGuid, portal);
+                transmission *= ((flags & MLO_PORTAL_FLAG_LIGHT_BLEED) !== 0 ? (1 - opacity * 0.75) : 0.55)
+                    * doorTransmission;
+            }
+            exteriorInfluence = Math.max(0, Math.min(0.65, 0.58 * transmission / Math.sqrt(exteriorPath.length)));
+        }
+        const authoredStrength = Math.max(modifierStrength, hasNamedTimecycle ? 0.72 : 0.45 + 0.25 * blend);
+        return {
+            parentGuid: active.parentGuid,
+            archetypeHash: active.archHash,
+            roomIndex: active.roomIndex,
+            roomName: String(room.name || ''),
+            timecycleName: Number(room.timecycleName) >>> 0,
+            timecycleNameText: String(room.timecycleNameText || ''),
+            secondaryTimecycleName: Number(room.secondaryTimecycleName) >>> 0,
+            secondaryTimecycleNameText: String(room.secondaryTimecycleNameText || ''),
+            exteriorInfluence,
+            strength: authoredStrength * (1 - exteriorInfluence * 0.5),
+        };
+    }
+
+    getInteriorRuntimeStatus() {
+        const active = this._activeInterior;
+        return {
+            definitions: this._mloDefs.size,
+            instances: this._mloInstancesLast.length,
+            active: !!active,
+            exterior: !!active?.isExterior,
+            archetypeHash: active?.archHash || '',
+            roomIndex: Number.isFinite(active?.roomIndex) ? active.roomIndex : -1,
+            visibleRooms: active ? Array.from(active.visibleRooms).sort((a, b) => a - b) : [],
+            rootArchetypeHashes: this._mloInstancesLast.map((instance) => String(instance.archHash)),
+            loadedChunks: Array.from(this.loaded || []).map(String).sort(),
+            focus: Array.from(this._lastCamDataPos || []).slice(0, 3).map((value) => Math.round(Number(value) * 100) / 100),
+        };
+    }
+
+    _publishInteriorRuntimeStatus() {
+        try {
+            document.documentElement.dataset.mloRuntime = JSON.stringify(this.getInteriorRuntimeStatus());
+        } catch { /* non-browser tests */ }
     }
 
     /**
@@ -1163,7 +1816,10 @@ export class DrawableStreamer {
                 glMatrix.vec4.transformMat4(out, v4, inv);
                 const lx = out[0], ly = out[1], lz = out[2];
 
-                for (let ri = 0; ri < rooms.length; ri++) {
+                const exteriorRoomIndex = this._findExteriorRoomIndex(def);
+                const roomOrder = rooms.map((_room, index) => index)
+                    .sort((a, b) => (a === exteriorRoomIndex ? 1 : 0) - (b === exteriorRoomIndex ? 1 : 0));
+                for (const ri of roomOrder) {
                     const r = rooms[ri];
                     const mn = r?.bbMin;
                     const mx = r?.bbMax;
@@ -1171,14 +1827,51 @@ export class DrawableStreamer {
 
                     // XY must be within the room footprint; Z is allowed a tolerance so we can "snap up"
                     // when the spawn is slightly under the room floor.
-                    if (!(lx >= mn[0] && lx <= mx[0] && ly >= mn[1] && ly <= mx[1])) continue;
+                    let roomMinX = Math.min(Number(mn[0]), Number(mx[0]));
+                    let roomMaxX = Math.max(Number(mn[0]), Number(mx[0]));
+                    let roomMinY = Math.min(Number(mn[1]), Number(mx[1]));
+                    let roomMaxY = Math.max(Number(mn[1]), Number(mx[1]));
+                    let roomMinZ = Math.min(Number(mn[2]), Number(mx[2]));
+                    let roomMaxZ = Math.max(Number(mn[2]), Number(mx[2]));
 
-                    const inRoomStrict = (lz >= mn[2] && lz <= mx[2]);
-                    const inRoomPadded = (lz >= (mn[2] - zPadBelow) && lz <= (mx[2] + zPadAbove));
+                    // Some converted FiveM MLOs retain the archetype's giant
+                    // fallback bounds for every room. Those bounds put the
+                    // nominal floor tens of metres underground. For the active
+                    // room, recover a conservative footprint and threshold
+                    // height from its authored portals instead. This is still
+                    // source metadata: no destination coordinates or room names
+                    // are baked into gameplay code.
+                    const suspiciousBounds = (roomMaxX - roomMinX) > 200.0
+                        || (roomMaxY - roomMinY) > 200.0
+                        || (roomMaxZ - roomMinZ) > 50.0;
+                    const active = this._activeInterior;
+                    const isActiveRoom = suspiciousBounds
+                        && (Number(active?.parentGuid) >>> 0) === (Number(inst.parentGuid) >>> 0)
+                        && String(active?.archHash) === String(inst.archHash)
+                        && Number(active?.roomIndex) === Number(ri);
+                    if (isActiveRoom) {
+                        const portalCorners = (Array.isArray(def.portals) ? def.portals : [])
+                            .filter((portal) => Number(portal?.roomFrom) === Number(ri) || Number(portal?.roomTo) === Number(ri))
+                            .flatMap((portal) => Array.isArray(portal?.corners) ? portal.corners : [])
+                            .filter((corner) => Array.isArray(corner) && corner.length >= 3 && corner.slice(0, 3).every(Number.isFinite));
+                        if (portalCorners.length >= 4) {
+                            const portalPad = 6.0;
+                            roomMinX = Math.min(...portalCorners.map((corner) => Number(corner[0]))) - portalPad;
+                            roomMaxX = Math.max(...portalCorners.map((corner) => Number(corner[0]))) + portalPad;
+                            roomMinY = Math.min(...portalCorners.map((corner) => Number(corner[1]))) - portalPad;
+                            roomMaxY = Math.max(...portalCorners.map((corner) => Number(corner[1]))) + portalPad;
+                            roomMinZ = Math.min(...portalCorners.map((corner) => Number(corner[2])));
+                            roomMaxZ = Math.max(...portalCorners.map((corner) => Number(corner[2]))) + 2.0;
+                        }
+                    }
+                    if (!(lx >= roomMinX && lx <= roomMaxX && ly >= roomMinY && ly <= roomMaxY)) continue;
+
+                    const inRoomStrict = (lz >= roomMinZ && lz <= roomMaxZ);
+                    const inRoomPadded = (lz >= (roomMinZ - zPadBelow) && lz <= (roomMaxZ + zPadAbove));
                     if (!inRoomStrict && !inRoomPadded) continue;
 
                     // Compute world/data-space floor Z at the same local XY.
-                    const floorLocal = glMatrix.vec4.fromValues(lx, ly, mn[2], 1.0);
+                    const floorLocal = glMatrix.vec4.fromValues(lx, ly, roomMinZ, 1.0);
                     const floorOut = glMatrix.vec4.create();
                     glMatrix.vec4.transformMat4(floorOut, floorLocal, inst.mat16);
                     const floorZ = Number(floorOut[2]);
@@ -1227,10 +1920,66 @@ export class DrawableStreamer {
     setMloEntitySetEnabled(parentGuid, setHash, enabled) {
         const pg = (Number(parentGuid) >>> 0);
         const sh = (Number(setHash) >>> 0);
-        if (!pg || !sh) return;
+        if (!pg || !sh) return false;
         const key = `${pg}:${sh}`;
         this._mloSetOverrides.set(key, !!enabled);
         this._dirty = true;
+        try {
+            window.dispatchEvent(new CustomEvent('webglgta:mlo-entity-set-changed', {
+                detail: { parentGuid: pg, setHash: sh, enabled: !!enabled },
+            }));
+        } catch { /* non-browser tests */ }
+        return true;
+    }
+
+    _resolveMloEntitySetHash(def, setIdentifier) {
+        const numeric = Number(setIdentifier);
+        if (Number.isFinite(numeric) && numeric > 0) return numeric >>> 0;
+        const wanted = String(setIdentifier ?? '').trim().toLowerCase();
+        if (!wanted) return 0;
+        const match = (def?.entitySets || []).find((set) => String(set?.name || '').trim().toLowerCase() === wanted);
+        return Number(match?.hash) >>> 0;
+    }
+
+    getMloEntitySets(parentGuid = null) {
+        const wantedParent = parentGuid === null || parentGuid === undefined ? null : (Number(parentGuid) >>> 0);
+        const result = [];
+        for (const instance of this._mloInstancesLast || []) {
+            const pg = Number(instance.parentGuid) >>> 0;
+            if (wantedParent !== null && pg !== wantedParent) continue;
+            const def = this._mloDefs.get(String(instance.archHash));
+            for (const set of (def?.entitySets || [])) {
+                const setHash = Number(set?.hash) >>> 0;
+                const key = `${pg}:${setHash}`;
+                const override = this._mloSetOverrides.get(key);
+                const authoredDefault = this._mloSetDefaults.get(key);
+                result.push({
+                    parentGuid: pg,
+                    archetypeHash: String(instance.archHash),
+                    setHash,
+                    name: String(set?.name || ''),
+                    enabled: override !== undefined ? !!override : authoredDefault !== false,
+                    overridden: override !== undefined,
+                });
+            }
+        }
+        return result;
+    }
+
+    setMloEntitySetEnabledForInterior(interiorIdentifier, setIdentifier, enabled) {
+        const wanted = String(interiorIdentifier ?? '').trim();
+        const numeric = Number(interiorIdentifier);
+        let changed = 0;
+        for (const instance of this._mloInstancesLast || []) {
+            const pg = Number(instance.parentGuid) >>> 0;
+            const parentMatch = Number.isFinite(numeric) && numeric > 0 && pg === (numeric >>> 0);
+            const archetypeMatch = wanted && String(instance.archHash) === wanted;
+            if (!parentMatch && !archetypeMatch) continue;
+            const def = this._mloDefs.get(String(instance.archHash));
+            const setHash = this._resolveMloEntitySetHash(def, setIdentifier);
+            if (setHash && this.setMloEntitySetEnabled(pg, setHash, enabled)) changed++;
+        }
+        return changed;
     }
 
     clearMloEntitySetOverrides(parentGuid = null) {
@@ -1262,6 +2011,77 @@ export class DrawableStreamer {
         const dy = ay - by;
         const dz = az - bz;
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    _updateFrustumPlanesData(camera) {
+        if (!this.enableFrustumCulling || !this.enableWorkerFrustumCulling || !camera?.viewProjectionMatrix) {
+            this._lastFrustumPlanesData = null;
+            return null;
+        }
+        try {
+            // Extract planes in data space: clip = VP * modelMatrix * dataPosition.
+            glMatrix.mat4.multiply(this._tmpVpData, camera.viewProjectionMatrix, this.modelMatrix);
+            const planes = extractFrustumPlanes(this._tmpVpData, this._tmpFrustumPlanes);
+            const flat = this._tmpFrustumPlanesFlat;
+            for (let i = 0; i < 6; i++) {
+                const p = planes[i];
+                flat[i * 4 + 0] = Number(p?.[0]) || 0;
+                flat[i * 4 + 1] = Number(p?.[1]) || 0;
+                flat[i * 4 + 2] = Number(p?.[2]) || 0;
+                flat[i * 4 + 3] = Number(p?.[3]) || 0;
+            }
+            this._lastFrustumPlanesData = flat.slice(0);
+            return this._lastFrustumPlanesData;
+        } catch {
+            this._lastFrustumPlanesData = null;
+            return null;
+        }
+    }
+
+    async loadInteriorDefinitions(archetypeHashes = [], revision = 'v1') {
+        const nextRevision = String(revision || 'v1');
+        if (nextRevision !== this._mloDefinitionRevision) {
+            this._mloDefinitionRevision = nextRevision;
+            this._mloDefs.clear();
+            this._mloDefsLoading.clear();
+        }
+        const hashes = Array.from(new Set((Array.isArray(archetypeHashes) ? archetypeHashes : [])
+            .map((value) => String(value ?? '').trim())
+            .filter(Boolean)));
+        await Promise.all(hashes.map((hash) => this._ensureMloDefLoaded(hash)));
+        this._dirty = true;
+        this._publishInteriorRuntimeStatus();
+        return this._mloDefs.size;
+    }
+
+    _sphereIntersectsDataFrustum(x, y, z, radius) {
+        const planes = this._lastFrustumPlanesData;
+        if (!planes || planes.length < 24) return true;
+        const r = Math.max(0.0, Number(radius) || 0.0);
+        for (let i = 0; i < 6; i++) {
+            const o = i * 4;
+            if ((planes[o] * x + planes[o + 1] * y + planes[o + 2] * z + planes[o + 3]) < -r) return false;
+        }
+        return true;
+    }
+
+    _instanceMaxScale(arr, offset) {
+        const sx = Math.hypot(Number(arr[offset + 0]) || 0, Number(arr[offset + 1]) || 0, Number(arr[offset + 2]) || 0);
+        const sy = Math.hypot(Number(arr[offset + 4]) || 0, Number(arr[offset + 5]) || 0, Number(arr[offset + 6]) || 0);
+        const sz = Math.hypot(Number(arr[offset + 8]) || 0, Number(arr[offset + 9]) || 0, Number(arr[offset + 10]) || 0);
+        const s = Math.max(sx, sy, sz);
+        return Number.isFinite(s) && s > 0 ? s : 1.0;
+    }
+
+    _buildFrustumCullRadiusEntries() {
+        if (!this.enableFrustumCulling || !this.enableWorkerFrustumCulling) return [];
+        const maxArch = Math.max(1, Math.floor(Number(this.maxArchetypes) || 512));
+        const limit = Math.max(1024, Math.min(12000, maxArch * 16));
+        try {
+            return this.modelManager?.getApproxRadiusEntries?.({ limit }) ?? [];
+        } catch {
+            return [];
+        }
     }
 
     _entityKeyFromObj(obj) {
@@ -1358,7 +2178,8 @@ export class DrawableStreamer {
 
     async _loadChunk(key, { priority = 'high' } = {}) {
         if (!this.index) return;
-        const meta = (this.index.chunks || {})[key];
+        const isDemoBootstrap = !!this.demoBootstrap && key === this.demoBootstrap.key;
+        const meta = isDemoBootstrap ? { file: this.demoBootstrap.instanceFile } : (this.index.chunks || {})[key];
         if (!meta) return;
 
         if (this.loaded.has(key) || this.loading.has(key)) return;
@@ -1369,12 +2190,13 @@ export class DrawableStreamer {
         const signal = controller.signal;
 
         try {
-            const bust = this._chunkCacheBust ? `?v=${encodeURIComponent(this._chunkCacheBust)}` : '';
-            const jsonlPath = `assets/${this.index.chunks_dir}/${meta.file}${bust}`;
+            const revision = [this._chunkCacheBust, this.index?.revision].filter(Boolean).join('-');
+            const bust = revision ? `?v=${encodeURIComponent(revision)}` : '';
+            const jsonlPath = isDemoBootstrap ? '' : `assets/${this.index.chunks_dir}/${meta.file}${bust}`;
 
             // Entity-level LOD traversal needs hierarchy fields (not present in ENT1 bins),
             // so we always parse JSONL in this mode.
-            if (this.enableEntityLodTraversal) {
+            if (this.enableEntityLodTraversal && !isDemoBootstrap) {
                 const camData = this._cameraToDataSpace(window.__appCameraPosForDrawableStreamer || [0, 0, 0]);
                 const cx = this._safeNum(camData?.[0], 0.0);
                 const cy = this._safeNum(camData?.[1], 0.0);
@@ -1397,6 +2219,8 @@ export class DrawableStreamer {
                         totalLines++;
                         if (!obj) return;
                         parsed++;
+                        const pos0 = obj?.position || obj?.pos || [0, 0, 0];
+                        if (!this._isDataPositionInWorldBounds(Number(pos0[0]), Number(pos0[1]))) return;
 
                         const a = obj?.archetype;
                         if (a === undefined || a === null) return;
@@ -1566,7 +2390,10 @@ export class DrawableStreamer {
 
                 this._chunkEntityKeys.set(key, chunkKeys);
                 this.loaded.add(key);
-                this._dirty = true;
+                if (this.chunkRebuildSettleMs <= 0 || this._lastCoreWantedSet.has(key)) {
+                    this._dirty = true;
+                    this._lastChunkSetChangeMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                }
                 this._dirtyEntityLod = true;
                 this.lastLoadStats = {
                     key,
@@ -1596,10 +2423,18 @@ export class DrawableStreamer {
             // - v2 <I3f4f3fI> adds u32 tintIndex after scale (stride=48).
             // - v3 <I3f4f3f5I> adds u32 tintIndex + guid + mloParentGuid + mloEntitySetHash + flags (stride=64).
             let usedBinary = false;
-            if (this.preferBinary) {
+            // An explicit binaryFile is authoritative. Demo-only indexes do not
+            // ship an NDJSON twin, so global feature probes (for example ymap
+            // time/weather gating) must not make us parse the .bin as text.
+            if (this.preferBinary || isDemoBootstrap || meta.binaryFile) {
                 try {
-                    const binFile = String(meta.file || '').replace(/\.jsonl$/i, '.bin');
-                    const binPath = `assets/entities_chunks_inst/${binFile}`;
+                    const binFile = String(meta.binaryFile || meta.file || '').replace(/\.jsonl$/i, '.bin');
+                    const binPathBase = isDemoBootstrap
+                        ? `assets/${binFile}`
+                        : (meta.binaryFile
+                            ? `assets/${binFile.replace(/^assets\//i, '').replace(/^\/+/, '')}`
+                            : `assets/entities_chunks_inst/${binFile}`);
+                    const binPath = `${binPathBase}${bust}`;
                     const buf = await fetchArrayBufferWithPriority(binPath, { priority, usePersistentCache: this.usePersistentCacheForChunks, signal });
                     const dv = new DataView(buf);
                     if (dv.byteLength >= 8) {
@@ -1616,6 +2451,7 @@ export class DrawableStreamer {
                             const need = start + count * stride;
                             if (count >= 0 && need <= dv.byteLength) {
                                 usedBinary = true;
+                                const dedupeExactRecords = isDemoBootstrap || !!this._demoChunkIndex;
 
                                 // Prefer worker path: parse + build matrices off-thread.
                                 try {
@@ -1625,6 +2461,8 @@ export class DrawableStreamer {
                                         {
                                             storeKey: key,
                                             storeOnly: !!this.enableWorkerRebuild,
+                                            worldBounds: this.worldBounds,
+                                            dedupeExactRecords,
                                             onReqId: (rid) => {
                                                 const live = this._chunkLoadReqs.get(key);
                                                 if (live && live.token === token) live.workerReqId = (Number(rid) >>> 0);
@@ -1642,9 +2480,16 @@ export class DrawableStreamer {
                                     const p = glMatrix.vec3.create();
                                     const s = glMatrix.vec3.create();
                                     const m = glMatrix.mat4.create();
+                                    const bytes = dedupeExactRecords ? new Uint8Array(buf) : null;
+                                    const exactRecords = dedupeExactRecords ? new Set() : null;
 
                                     for (let i = 0; i < count; i++) {
                                         const off = start + i * stride;
+                                        if (exactRecords) {
+                                            const recordKey = ent1RecordKey(bytes, off, stride);
+                                            if (exactRecords.has(recordKey)) continue;
+                                            exactRecords.add(recordKey);
+                                        }
                                         const h = dv.getUint32(off + 0, true) >>> 0;
                                         const hash = String(h);
 
@@ -1654,10 +2499,11 @@ export class DrawableStreamer {
                                         const px = dv.getFloat32(off + 4, true);
                                         const py = dv.getFloat32(off + 8, true);
                                         const pz = dv.getFloat32(off + 12, true);
+                                        if (!this._isDataPositionInWorldBounds(px, py)) continue;
 
-                                        const qx = dv.getFloat32(off + 16, true);
-                                        const qy = dv.getFloat32(off + 20, true);
-                                        const qz = dv.getFloat32(off + 24, true);
+                                        let qx = dv.getFloat32(off + 16, true);
+                                        let qy = dv.getFloat32(off + 20, true);
+                                        let qz = dv.getFloat32(off + 24, true);
                                         const qw = dv.getFloat32(off + 28, true);
 
                                         const sx = dv.getFloat32(off + 32, true);
@@ -1668,6 +2514,17 @@ export class DrawableStreamer {
                                         const mloParentGuid = (stride >= 64) ? (dv.getUint32(off + 52, true) >>> 0) : 0;
                                         const mloSetHash = (stride >= 64) ? (dv.getUint32(off + 56, true) >>> 0) : 0;
                                         const mloFlags = (stride >= 64) ? (dv.getUint32(off + 60, true) >>> 0) : 0;
+
+                                        // ENT1 carries raw CEntityDef rotations. Match the JSON/CodeWalker
+                                        // path by conjugating base YMAP entities only. MLO roots and
+                                        // interior children already carry their world-space orientation.
+                                        const isMloInstance = (mloFlags & 1) !== 0;
+                                        const hasMloParent = mloParentGuid !== 0;
+                                        if (!isMloInstance && !hasMloParent) {
+                                            qx = -qx;
+                                            qy = -qy;
+                                            qz = -qz;
+                                        }
 
                                         archetypeCounts.set(hash, (archetypeCounts.get(hash) ?? 0) + 1);
 
@@ -1706,6 +2563,7 @@ export class DrawableStreamer {
                         }
                     }
                 } catch (e) {
+                    if (isDemoBootstrap) throw e;
                     // If the directory isn't present, disable the binary fast-path to avoid spamming 404s.
                     const msg = String(e?.message || e || '');
                     if (msg.includes('status=404')) this.preferBinary = false;
@@ -1731,6 +2589,7 @@ export class DrawableStreamer {
                         {
                             storeKey: key,
                             storeOnly: !!this.enableWorkerRebuild,
+                            worldBounds: this.worldBounds,
                             signal,
                             onReqId: (rid) => {
                                 const live = this._chunkLoadReqs.get(key);
@@ -1780,6 +2639,8 @@ export class DrawableStreamer {
                                 obj?.archetypeHash32 ??
                                 null;
                             if (a === undefined || a === null) return;
+                            const pp = obj.position || obj.pos || [0, 0, 0];
+                            if (!this._isDataPositionInWorldBounds(Number(pp[0]), Number(pp[1]))) return;
                             withArchetype++;
                             const hash = this.modelManager.normalizeId(a);
                             if (!hash) {
@@ -1793,7 +2654,6 @@ export class DrawableStreamer {
                             archetypeCounts.set(hash, (archetypeCounts.get(hash) ?? 0) + 1);
 
                             // Distance (data-space) for prioritization / cutoff.
-                            const pp = obj.position || [0, 0, 0];
                             const dx = pp[0] - camData[0];
                             const dy = pp[1] - camData[1];
                             const dz = pp[2] - camData[2];
@@ -1890,10 +2750,7 @@ export class DrawableStreamer {
                                 // Validate worker-produced instance buffer shape + sanity.
                                 // If this is corrupted (wrong stride / NaNs), it can cause the whole frame to appear grey
                                 // because shader math can produce NaNs and some drivers propagate that.
-                                const stride =
-                                    ((mats.length % 22) === 0) ? 22 :
-                                    (((mats.length % 21) === 0) ? 21 :
-                                    (((mats.length % 17) === 0) ? 17 : 16));
+                                const stride = this._instanceStrideFloatsForLen(mats.length, it?.strideFloats);
                                 const instCount = Math.floor(mats.length / stride);
                                 if (!(instCount > 0) || (instCount * stride) !== mats.length) {
                                     console.warn(`DrawableStreamer: bad instance buffer shape for hash=${hash} (lenFloats=${mats.length}, stride=${stride}, inst=${instCount})`);
@@ -1910,6 +2767,7 @@ export class DrawableStreamer {
                                     console.warn(`DrawableStreamer: non-finite instance data for hash=${hash} (dropping this archetype for this chunk)`);
                                     continue;
                                 }
+                                mats.__webglgtaInstanceStride = stride;
                                 chunkMap.set(hash, mats);
                             } catch {
                                 // ignore bad slice
@@ -1938,7 +2796,9 @@ export class DrawableStreamer {
                 chunkMap = new Map();
                 chunkMin = new Map();
                 for (const [hash, mats] of byHash.entries()) {
-                    chunkMap.set(hash, new Float32Array(mats));
+                    const packed = new Float32Array(mats);
+                    packed.__webglgtaInstanceStride = 22;
+                    chunkMap.set(hash, packed);
                     chunkMin.set(hash, minDistByHash.get(hash) ?? 1e30);
                 }
             }
@@ -1954,7 +2814,10 @@ export class DrawableStreamer {
             this.chunkArchetypeCounts.set(key, archetypeCounts);
 
             this.loaded.add(key);
-            this._dirty = true;
+            if (this.chunkRebuildSettleMs <= 0 || this._lastCoreWantedSet.has(key)) {
+                this._dirty = true;
+                this._lastChunkSetChangeMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            }
 
             this.lastLoadStats = {
                 key,
@@ -1980,11 +2843,12 @@ export class DrawableStreamer {
         }
     }
 
-    _computeCoverageStats({ keptArchetypes = null, droppedArchetypes = null, totalMeshArchetypes = null, keptInstances = null, totalMeshInstances = null, keptRealArchetypes = null, keptPlaceholderArchetypes = null } = {}) {
+    _computeCoverageStats({ keptArchetypes = null, droppedArchetypes = null, totalMeshArchetypes = null, keptInstances = null, totalMeshInstances = null, keptRealArchetypes = null, keptPlaceholderArchetypes = null, duplicateInstancesDropped = 0, cappedInstances = 0 } = {}) {
         // Aggregate unexported archetypes + totals across loaded chunks.
         let entitiesWithArchetype = 0;
         const allArchetypes = new Set();
         const missingAgg = new Map(); // hash -> count (known missing)
+        const nonRenderableAgg = new Map(); // hash -> count (valid, intentionally drawable-less)
         const unknownAgg = new Map(); // hash -> count (manifest shard not loaded yet)
         for (const key of this.loaded) {
             const cmap = this.chunkArchetypeCounts.get(key);
@@ -1995,6 +2859,8 @@ export class DrawableStreamer {
                     const shardKnown = this.modelManager?.isShardLoadedForHash?.(hash) ?? true;
                     if (!shardKnown) {
                         unknownAgg.set(hash, (unknownAgg.get(hash) ?? 0) + (cnt ?? 0));
+                    } else if (this.modelManager?.isNonRenderable?.(hash)) {
+                        nonRenderableAgg.set(hash, (nonRenderableAgg.get(hash) ?? 0) + (cnt ?? 0));
                     } else if (!(this.modelManager?.hasRealMesh?.(hash) ?? true)) {
                         missingAgg.set(hash, (missingAgg.get(hash) ?? 0) + (cnt ?? 0));
                     }
@@ -2007,6 +2873,9 @@ export class DrawableStreamer {
             .map(([hash, count]) => ({ hash, count }))
             .sort((a, b) => (b.count - a.count) || (a.hash < b.hash ? -1 : 1));
         const unknownTop = Array.from(unknownAgg.entries())
+            .map(([hash, count]) => ({ hash, count }))
+            .sort((a, b) => (b.count - a.count) || (a.hash < b.hash ? -1 : 1));
+        const nonRenderableTop = Array.from(nonRenderableAgg.entries())
             .map(([hash, count]) => ({ hash, count }))
             .sort((a, b) => (b.count - a.count) || (a.hash < b.hash ? -1 : 1));
 
@@ -2025,6 +2894,9 @@ export class DrawableStreamer {
             unexportedEntities,
             unexportedArchetypes: missingAgg.size,
             unexportedTop,
+            nonRenderableEntities: nonRenderableTop.reduce((acc, e) => acc + (e.count ?? 0), 0),
+            nonRenderableArchetypes: nonRenderableAgg.size,
+            nonRenderableTop: nonRenderableTop.slice(0, 50),
             // Sharded-manifest visibility: how many entities are "unknown" because we haven't loaded their shard yet.
             unknownMetaEntities: unknownTop.reduce((acc, e) => acc + (e.count ?? 0), 0),
             unknownMetaArchetypes: unknownAgg.size,
@@ -2038,12 +2910,83 @@ export class DrawableStreamer {
             totalMeshInstances,
             keptInstances,
             droppedInstances: (Number.isFinite(totalMeshInstances) && Number.isFinite(keptInstances)) ? Math.max(0, totalMeshInstances - keptInstances) : null,
+            cappedInstances: Math.max(0, Math.floor(Number(cappedInstances) || 0)),
+            duplicateInstancesDropped: Math.max(0, Math.floor(Number(duplicateInstancesDropped) || 0)),
+            frustumCullingEnabled: !!this._lastFrustumStats?.enabled,
+            frustumTestedInstances: Math.max(0, Math.floor(Number(this._lastFrustumStats?.tested) || 0)),
+            frustumCulledInstances: Math.max(0, Math.floor(Number(this._lastFrustumStats?.culled) || 0)),
+            wasmCullingEnabled: !!this._lastWasmStats?.enabled,
+            wasmCullingTestedInstances: Math.max(0, Math.floor(Number(this._lastWasmStats?.tested) || 0)),
+            wasmCullingKeptInstances: Math.max(0, Math.floor(Number(this._lastWasmStats?.kept) || 0)),
+            wasmCullingRejectedInstances: Math.max(0, Math.floor(Number(this._lastWasmStats?.rejected) || 0)),
+            webGpuCullingEnabled: !!this._lastWebGpuStats?.enabled,
+            webGpuCullingRequested: !!this._lastWebGpuStats?.requested,
+            webGpuCullingReason: String(this._lastWebGpuStats?.reason || ''),
+            webGpuCullingTestedInstances: Math.max(0, Math.floor(Number(this._lastWebGpuStats?.tested) || 0)),
+            webGpuCullingKeptInstances: Math.max(0, Math.floor(Number(this._lastWebGpuStats?.kept) || 0)),
+            webGpuCullingRejectedInstances: Math.max(0, Math.floor(Number(this._lastWebGpuStats?.rejected) || 0)),
             entitiesWithMeshInManifest,
         };
+
     }
 
     getCoverageStats() {
         return this.coverageStats;
+    }
+
+    suppressInstance({ archetypeHash, x, y, z, radius = 0.2 } = {}) {
+        const hash = String(archetypeHash || '').trim();
+        const px = Number(x); const py = Number(y); const pz = Number(z);
+        if (!hash || ![px, py, pz].every(Number.isFinite)) return false;
+        const tolerance = Math.max(0.08, Math.min(1.0, Number(radius) * 0.12 || 0.2));
+        let records = this._suppressedInstancesByHash.get(hash);
+        if (!records) {
+            records = [];
+            this._suppressedInstancesByHash.set(hash, records);
+        }
+        if (records.some((record) => Math.hypot(record.x - px, record.y - py, record.z - pz) <= Math.min(record.tolerance, tolerance))) {
+            return false;
+        }
+        records.push({ x: px, y: py, z: pz, tolerance });
+        this._dirty = true;
+        return true;
+    }
+
+    setInstanceTransformOverride({ archetypeHash, source, position } = {}) {
+        const hash = String(archetypeHash || '').trim();
+        const from = Array.isArray(source) ? source.map(Number) : [];
+        const to = Array.isArray(position) ? position.map(Number) : [];
+        if (!hash || from.length < 3 || to.length < 3 || ![...from, ...to].every(Number.isFinite)) return false;
+        let records = this._instanceTransformOverridesByHash.get(hash);
+        if (!records) {
+            records = [];
+            this._instanceTransformOverridesByHash.set(hash, records);
+        }
+        let record = records.find((item) => Math.hypot(item.source[0] - from[0], item.source[1] - from[1], item.source[2] - from[2]) <= 0.12);
+        if (!record) {
+            record = { source: from.slice(0, 3), position: to.slice(0, 3) };
+            records.push(record);
+        } else {
+            record.position = to.slice(0, 3);
+        }
+        this._dirty = true;
+        return true;
+    }
+
+    _instanceTransformOverride(hash, x, y, z) {
+        for (const record of this._instanceTransformOverridesByHash.get(String(hash)) || []) {
+            if (Math.hypot(record.source[0] - x, record.source[1] - y, record.source[2] - z) <= 0.12) return record;
+        }
+        return null;
+    }
+
+    _isInstanceSuppressed(hash, x, y, z) {
+        const records = this._suppressedInstancesByHash.get(String(hash));
+        if (!records?.length) return false;
+        for (const record of records) {
+            if (Math.hypot(record.x - x, record.y - y, record.z - z) <= record.tolerance) return true;
+        }
+        return false;
     }
 
     getMissingArchetypesTop(n = 20) {
@@ -2056,15 +2999,23 @@ export class DrawableStreamer {
     _rebuildAllInstances() {
         // Aggregate matrices across all loaded chunks per archetype.
         const agg = new Map(); // hash -> number[]
+        const aggStrides = new Map(); // hash -> authoritative source stride
         const minD = new Map(); // hash -> number (from current camera)
         const bestDot = new Map(); // hash -> dot(camForward, toClosestInstance)
         const bestDist2 = new Map(); // hash -> number
+        const seenTransformsByHash = new Map(); // hash -> Set<quantized transform>
+        let sourceInstanceCount = 0;
+        let duplicateInstancesDropped = 0;
 
         const cam = this._lastCamDataPos || [0, 0, 0];
         const fwd0 = this._lastCamDataDir || [0, 0, -1];
         const fwdLen = Math.hypot(fwd0[0], fwd0[1], fwd0[2]) || 1.0;
         const fx = fwd0[0] / fwdLen, fy = fwd0[1] / fwdLen, fz = fwd0[2] / fwdLen;
         const behindPenalty = Number.isFinite(Number(this.cameraBehindPenalty)) ? Math.max(1.0, Number(this.cameraBehindPenalty)) : 1.6;
+        const useFrustum = !!(this.enableFrustumCulling && this.enableWorkerFrustumCulling && this._lastFrustumPlanesData);
+        const frustumPadding = Math.max(0.0, Number(this.workerFrustumPadding) || 0.0);
+        let frustumTested = 0;
+        let frustumCulled = 0;
 
         for (const key of this.loaded) {
             const cmap = this.chunkInstances.get(key);
@@ -2075,16 +3026,50 @@ export class DrawableStreamer {
                     arr = [];
                     agg.set(hash, arr);
                 }
-                const stride = this._instanceStrideFloatsForLen(mats.length ?? 0);
+                const stride = this._instanceStrideFloatsForLen(mats.length ?? 0, mats.__webglgtaInstanceStride);
+                const priorStride = aggStrides.get(hash);
+                if (priorStride === undefined) aggStrides.set(hash, stride);
+                else if (priorStride !== stride) {
+                    console.warn(`DrawableStreamer: mixed instance layouts for hash=${hash}; dropping incompatible chunk slice`);
+                    continue;
+                }
+                const radiusRaw = useFrustum ? Number(this.modelManager?.getApproxRadiusForHash?.(hash, null, null)) : NaN;
+                const hasFrustumRadius = Number.isFinite(radiusRaw) && radiusRaw > 0;
+                const baseRadius = hasFrustumRadius ? Math.max(0.5, radiusRaw) : 0.0;
                 for (let i = 0; i + (stride - 1) < mats.length; i += stride) {
                     // Time/weather ymap gating is evaluated per-instance (fail-open if unknown).
                     if (stride >= 22) {
                         const ymapHash = Number(mats[i + (stride - 1)] ?? 0) >>> 0;
                         if (!this._isYmapAvailableHash(ymapHash)) continue;
                     }
-                    const tx = Number(mats[i + 12] ?? 0);
-                    const ty = Number(mats[i + 13] ?? 0);
-                    const tz = Number(mats[i + 14] ?? 0);
+                    sourceInstanceCount++;
+                    const sourceTx = Number(mats[i + 12] ?? 0);
+                    const sourceTy = Number(mats[i + 13] ?? 0);
+                    const sourceTz = Number(mats[i + 14] ?? 0);
+                    const transformOverride = this._instanceTransformOverride(hash, sourceTx, sourceTy, sourceTz);
+                    const tx = transformOverride?.position[0] ?? sourceTx;
+                    const ty = transformOverride?.position[1] ?? sourceTy;
+                    const tz = transformOverride?.position[2] ?? sourceTz;
+                    if (this._isInstanceSuppressed(hash, tx, ty, tz)) continue;
+                    if (hasFrustumRadius) {
+                        frustumTested++;
+                        const radius = baseRadius * Math.max(1.0, this._instanceMaxScale(mats, i)) + frustumPadding;
+                        if (!this._sphereIntersectsDataFrustum(tx, ty, tz, radius)) {
+                            frustumCulled++;
+                            continue;
+                        }
+                    }
+                    let seenTransforms = seenTransformsByHash.get(hash);
+                    if (!seenTransforms) {
+                        seenTransforms = new Set();
+                        seenTransformsByHash.set(hash, seenTransforms);
+                    }
+                    const transformKey = this._instanceTransformSignature(mats, i, stride);
+                    if (seenTransforms.has(transformKey)) {
+                        duplicateInstancesDropped++;
+                        continue;
+                    }
+                    seenTransforms.add(transformKey);
                     const dx = tx - Number(cam[0] ?? 0);
                     const dy = ty - Number(cam[1] ?? 0);
                     const dz = tz - Number(cam[2] ?? 0);
@@ -2097,10 +3082,18 @@ export class DrawableStreamer {
                         bestDot.set(hash, dx * fx + dy * fy + dz * fz);
                     }
 
-                    for (let k = 0; k < stride; k++) arr.push(mats[i + k]);
+                    for (let k = 0; k < stride; k++) {
+                        if (k === 12) arr.push(tx);
+                        else if (k === 13) arr.push(ty);
+                        else if (k === 14) arr.push(tz);
+                        else arr.push(mats[i + k]);
+                    }
                 }
             }
         }
+        this._lastFrustumStats = { enabled: useFrustum, tested: frustumTested, culled: frustumCulled };
+        this._lastWasmStats = { enabled: false, tested: 0, kept: 0, rejected: 0 };
+        this._lastWebGpuStats = { enabled: false, requested: false, reason: '', tested: 0, kept: 0, rejected: 0 };
 
         // Distance-first selection (closest archetypes first), but prefer REAL meshes over placeholders
         // so placeholders don't crowd out real geometry under maxArchetypes.
@@ -2109,20 +3102,143 @@ export class DrawableStreamer {
             .map(([hash, mats]) => ({
             hash,
             mats,
+            instanceStrideFloats: aggStrides.get(hash) ?? 16,
             d: minD.get(hash) ?? 1e30,
             dot: bestDot.get(hash) ?? 0.0,
             isPlaceholder: !(this.modelManager?.hasRealMesh?.(hash) ?? true),
         }));
 
-        this._applyRebuiltEntries(entries, { behindPenalty });
+        this._applyRebuiltEntries(entries, { behindPenalty, sourceInstanceCount, duplicateInstancesDropped });
     }
 
-    _applyRebuiltEntries(entriesIn, { behindPenalty = 1.6 } = {}) {
+    _limitInstancesForRendering(entriesIn) {
+        const entries = Array.isArray(entriesIn) ? entriesIn : [];
+        const cam = this._lastCamDataPos || [0, 0, 0];
+        const fwd0 = this._lastCamDataDir || [0, 0, -1];
+        const fwdLen = Math.hypot(fwd0[0], fwd0[1], fwd0[2]) || 1.0;
+        const fx = fwd0[0] / fwdLen, fy = fwd0[1] / fwdLen, fz = fwd0[2] / fwdLen;
+        const maxDist = Number.isFinite(this.maxModelDistance) ? Math.max(0, this.maxModelDistance) : Infinity;
+        const maxVisible = Math.max(1, Math.floor(Number(this.maxVisibleInstances) || 12000));
+        const maxPerArch = Math.max(1, Math.floor(Number(this.maxInstancesPerArchetype) || 128));
+        const maxBehind = Math.min(maxDist, Math.max(24.0, Number(this.maxBehindModelDistance) || (maxDist * 0.55)));
+        let remaining = maxVisible;
+        const out = [];
+        let eligibleInstances = 0;
+        let keptInstances = 0;
+
+        for (const entry of entries) {
+            const mats = entry?.mats;
+            const stride = this._instanceStrideFloatsForLen(mats?.length ?? 0, entry?.instanceStrideFloats);
+            if (!mats || stride < 16) continue;
+            const desiredCount = Math.min(maxPerArch, remaining);
+            const nearest = []; // max-heap: farthest retained item at index 0
+            const isWorse = (a, b) => (a.dist > b.dist) || (a.dist === b.dist && a.offset > b.offset);
+            const pushNearest = (candidate) => {
+                if (desiredCount <= 0) return;
+                if (nearest.length < desiredCount) {
+                    let child = nearest.length;
+                    nearest.push(candidate);
+                    while (child > 0) {
+                        const parent = (child - 1) >> 1;
+                        if (!isWorse(nearest[child], nearest[parent])) break;
+                        [nearest[child], nearest[parent]] = [nearest[parent], nearest[child]];
+                        child = parent;
+                    }
+                    return;
+                }
+                if (!isWorse(nearest[0], candidate)) return;
+                nearest[0] = candidate;
+                let parent = 0;
+                while (true) {
+                    const left = parent * 2 + 1;
+                    const right = left + 1;
+                    let worst = parent;
+                    if (left < nearest.length && isWorse(nearest[left], nearest[worst])) worst = left;
+                    if (right < nearest.length && isWorse(nearest[right], nearest[worst])) worst = right;
+                    if (worst === parent) break;
+                    [nearest[parent], nearest[worst]] = [nearest[worst], nearest[parent]];
+                    parent = worst;
+                }
+            };
+            for (let i = 0; i + (stride - 1) < mats.length; i += stride) {
+                const dx = Number(mats[i + 12] ?? 0) - Number(cam[0] ?? 0);
+                const dy = Number(mats[i + 13] ?? 0) - Number(cam[1] ?? 0);
+                const dz = Number(mats[i + 14] ?? 0) - Number(cam[2] ?? 0);
+                const dist = Math.hypot(dx, dy, dz);
+                if (dist > maxDist) continue;
+                const dot = dx * fx + dy * fy + dz * fz;
+                if (dot < 0.0 && dist > maxBehind) continue;
+                eligibleInstances++;
+                pushNearest({ offset: i, dist });
+            }
+            nearest.sort((a, b) => (a.dist - b.dist) || (a.offset - b.offset));
+            const selected = [];
+            for (const candidate of nearest) {
+                for (let k = 0; k < stride; k++) selected.push(mats[candidate.offset + k]);
+            }
+            const selectedCount = nearest.length;
+            keptInstances += selectedCount;
+            remaining -= selectedCount;
+            if (selectedCount > 0) out.push({ ...entry, mats: new Float32Array(selected) });
+        }
+        this._lastInstanceLimitStats = {
+            eligible: eligibleInstances,
+            kept: keptInstances,
+            capped: Math.max(0, eligibleInstances - keptInstances),
+        };
+        return out;
+    }
+
+    _applyRebuiltEntries(entriesIn, { behindPenalty = 1.6, sourceInstanceCount = null, duplicateInstancesDropped = 0, preCappedInstances = 0, mloInstances = null } = {}) {
         let entries = Array.isArray(entriesIn) ? entriesIn : [];
 
         // Apply interior visibility gating (drops interior children unless camera is inside).
-        entries = this._filterEntriesForActiveInterior(entries);
+        entries = this._filterEntriesForActiveInterior(entries, mloInstances);
+        // A destination teleport can expose hundreds of surrounding exterior
+        // archetypes at once. Mark the active room's own MLO children so their
+        // mesh jobs outrank nearby streets instead of leaving the store/studio
+        // as placeholders while unrelated city packs drain first.
+        const activeParentGuid = Number(this._activeInterior?.parentGuid) >>> 0;
+        if (activeParentGuid) {
+            for (const entry of entries) {
+                const mats = entry?.mats;
+                const stride = this._instanceStrideFloatsForLen(mats?.length ?? 0, entry?.instanceStrideFloats);
+                let activeInteriorChild = false;
+                let activeInteriorPriority = 0;
+                if (stride >= 21 && mats) {
+                    for (let offset = 0; offset + stride <= mats.length; offset += stride) {
+                        if ((Number(mats[offset + 18]) >>> 0) === activeParentGuid) {
+                            activeInteriorChild = true;
+                            const ownership = this._decodeMloFlags(mats[offset + 20]);
+                            let priority = 5000;
+                            if (ownership.roomIndex === Number(this._activeInterior?.roomIndex)) {
+                                // Load the room containing the player before adjacent rooms and
+                                // the exterior/limbo shell. Large MLOs otherwise expose a random
+                                // fragment of hundreds of equally-prioritized child meshes.
+                                priority = 10000;
+                            } else if (ownership.portalIndex >= 0) {
+                                const def = this._mloDefs.get(String(this._activeInterior?.archHash));
+                                const portal = (def?.portals || [])[ownership.portalIndex];
+                                if (Number(portal?.roomFrom) === Number(this._activeInterior?.roomIndex)
+                                    || Number(portal?.roomTo) === Number(this._activeInterior?.roomIndex)) {
+                                    priority = 9000;
+                                }
+                            }
+                            activeInteriorPriority = Math.max(activeInteriorPriority, priority);
+                        }
+                    }
+                }
+                entry.activeInteriorChild = activeInteriorChild;
+                entry.activeInteriorPriority = activeInteriorPriority;
+            }
+        }
+        // Some valid YTYP archetypes intentionally have no drawable (collision/metadata/LOD helpers).
+        // They are classified by the exporter and must not consume a placeholder or a render budget.
+        entries = entries.filter((e) => !this.modelManager?.isNonRenderable?.(e?.hash));
         entries.sort((a, b) => {
+            const ia = Number(a.activeInteriorPriority) || 0;
+            const ib = Number(b.activeInteriorPriority) || 0;
+            if (ia !== ib) return ib - ia;
             const pa = a.isPlaceholder ? 1 : 0;
             const pb = b.isPlaceholder ? 1 : 0;
             if (pa !== pb) return pa - pb;
@@ -2138,17 +3254,24 @@ export class DrawableStreamer {
         const maxD = Number.isFinite(this.maxModelDistance) ? Math.max(0, this.maxModelDistance) : 1e30;
         const within = entries.filter(e => Number(e.d) <= maxD);
         const maxArch = (this.maxArchetypes | 0);
-        const keep = (maxArch > 0) ? within.slice(0, maxArch) : within;
+        const archetypeKeep = (maxArch > 0) ? within.slice(0, maxArch) : within;
+        const keep = this._limitInstancesForRendering(archetypeKeep);
+        const cappedInstances = Math.max(0, Math.floor(Number(preCappedInstances) || 0))
+            + Math.max(0, Math.floor(Number(this._lastInstanceLimitStats?.capped) || 0));
 
         // Stats (helps distinguish "missing meshes" vs "capped by maxArchetypes").
-        let totalMeshInstances = 0;
-        for (const e of entries) {
-            const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
-            totalMeshInstances += Math.floor((e.mats.length ?? 0) / stride);
+        let totalMeshInstances = Number.isFinite(sourceInstanceCount) && sourceInstanceCount >= 0
+            ? Math.floor(sourceInstanceCount)
+            : 0;
+        if (!Number.isFinite(sourceInstanceCount) || sourceInstanceCount < 0) {
+            for (const e of entries) {
+                const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0, e.instanceStrideFloats);
+                totalMeshInstances += Math.floor((e.mats.length ?? 0) / stride);
+            }
         }
         let keptInstances = 0;
         for (const e of keep) {
-            const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0);
+            const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0, e.instanceStrideFloats);
             keptInstances += Math.floor((e.mats.length ?? 0) / stride);
         }
         const keptReal = keep.reduce((acc, e) => acc + (e.isPlaceholder ? 0 : 1), 0);
@@ -2160,7 +3283,11 @@ export class DrawableStreamer {
             const buckets = new Map();
 
             for (const e of keep) {
-                const lod = this._chooseLod(e.hash, e.d);
+                // The active MLO is gameplay space, not a distant city prop.
+                // Destination warmup budgets and waits for these high-detail
+                // children before exposing the destination to gameplay.
+                const lod = e.activeInteriorChild ? 'high' : this._chooseLod(e.hash, e.d);
+                const interiorPriority = Number(e.activeInteriorPriority) || (e.activeInteriorChild ? 5000 : 0);
                 const metaEntry = this.modelManager?.manifest?.meshes?.[String(e.hash)];
                 const entryMat = metaEntry?.material ?? null;
                 const subs = this.modelManager.getLodSubmeshes(e.hash, lod) || [];
@@ -2170,16 +3297,29 @@ export class DrawableStreamer {
                     const file = String(sm?.file || '').trim();
                     if (!file) continue;
                     const { sig, material } = this.modelManager.getEffectiveMaterialAndSignature(entryMat, sm?.material ?? null);
-                    const bucketId = `${String(lod)}:${file}:${sig}`;
+                    const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0, e.instanceStrideFloats);
+                    // LOD selection frequently resolves to the same fallback mesh file.
+                    // Key by the actual render payload so changing quality can reuse the
+                    // resident bucket instead of deleting and reloading identical data.
+                    const bucketId = `${file}:${sig}:${stride}`;
                     let b = buckets.get(bucketId);
                     if (!b) {
-                        b = { lod: String(lod), file, material, mats: [], minDist: e.d };
+                        b = {
+                            lod: String(lod),
+                            file,
+                            material,
+                            mats: [],
+                            minDist: e.d,
+                            stride,
+                            loadPriority: interiorPriority,
+                        };
                         buckets.set(bucketId, b);
                     } else {
                         // Track the closest contributing archetype so texture tiering can be distance-based.
                         const prevD = Number(b.minDist);
                         const nextD = Number(e.d);
                         if (!Number.isFinite(prevD) || (Number.isFinite(nextD) && nextD < prevD)) b.minDist = nextD;
+                        if (e.activeInteriorChild) b.loadPriority = Math.max(interiorPriority, Number(b.loadPriority) || 0);
                     }
                     // Append this archetype's instance matrices into this bucket.
                     for (let i = 0; i < e.mats.length; i++) b.mats.push(e.mats[i]);
@@ -2204,7 +3344,10 @@ export class DrawableStreamer {
                 }
             }
             for (const [bid, b] of buckets.entries()) {
-                void this.modelRenderer.setInstancesForBucket(bid, b.lod, b.file, b.material, new Float32Array(b.mats), b.minDist);
+                void this.modelRenderer.setInstancesForBucket(
+                    bid, b.lod, b.file, b.material, new Float32Array(b.mats), b.minDist, b.stride,
+                    { loadPriority: Number(b.loadPriority) || 0 },
+                );
             }
             this._prevDesiredBucketIds = desiredBucketIds;
 
@@ -2212,11 +3355,13 @@ export class DrawableStreamer {
             this._computeCoverageStats({
                 totalMeshArchetypes: entries.length,
                 keptArchetypes: keep.length,
-                droppedArchetypes: Math.max(0, entries.length - keep.length),
+                droppedArchetypes: Math.max(0, within.length - archetypeKeep.length),
                 keptRealArchetypes: keptReal,
                 keptPlaceholderArchetypes: keptPlaceholder,
                 totalMeshInstances,
                 keptInstances,
+                duplicateInstancesDropped,
+                cappedInstances,
             });
             return;
         }
@@ -2224,10 +3369,13 @@ export class DrawableStreamer {
         // Remove stale instance entries (hash:lod) that are no longer desired.
         const desiredKeys = new Set();
         for (const e of keep) {
-            const lod = this._chooseLod(e.hash, e.d);
+            const lod = e.activeInteriorChild ? 'high' : this._chooseLod(e.hash, e.d);
             desiredKeys.add(`${String(e.hash)}:${String(lod)}`);
             const mats = (e.mats instanceof Float32Array) ? e.mats : new Float32Array(e.mats);
-            void this.modelRenderer.setInstancesForArchetype(e.hash, lod, mats, e.d);
+            void this.modelRenderer.setInstancesForArchetype(e.hash, lod, mats, e.d, {
+                instanceStrideFloats: e.instanceStrideFloats,
+                loadPriority: Number(e.activeInteriorPriority) || (e.activeInteriorChild ? 5000 : 0),
+            });
         }
         for (const k of this._prevDesiredInstanceKeys) {
             if (!desiredKeys.has(k)) {
@@ -2248,11 +3396,13 @@ export class DrawableStreamer {
         this._computeCoverageStats({
             totalMeshArchetypes: entries.length,
             keptArchetypes: keep.length,
-            droppedArchetypes: Math.max(0, entries.length - keep.length),
+            droppedArchetypes: Math.max(0, within.length - archetypeKeep.length),
             keptRealArchetypes: keptReal,
             keptPlaceholderArchetypes: keptPlaceholder,
             totalMeshInstances,
             keptInstances,
+            duplicateInstancesDropped,
+            cappedInstances,
         });
     }
 
@@ -2407,6 +3557,7 @@ export class DrawableStreamer {
         let entries = Array.from(byHash.entries()).map(([hash, mats]) => ({
             hash,
             mats,
+            instanceStrideFloats: 17,
             d: minD.get(hash) ?? 1e30,
             dot: bestDot.get(hash) ?? 0.0,
             isPlaceholder: !(this.modelManager?.hasRealMesh?.(hash) ?? true),
@@ -2441,7 +3592,9 @@ export class DrawableStreamer {
         for (const e of keep) {
             const lod = this._chooseLod(e.hash, e.d);
             desiredKeys.add(`${String(e.hash)}:${String(lod)}`);
-            void this.modelRenderer.setInstancesForArchetype(e.hash, lod, new Float32Array(e.mats), e.d);
+            void this.modelRenderer.setInstancesForArchetype(e.hash, lod, new Float32Array(e.mats), e.d, {
+                instanceStrideFloats: 17,
+            });
         }
         for (const k of this._prevDesiredInstanceKeys) {
             if (!desiredKeys.has(k)) {
@@ -2461,62 +3614,113 @@ export class DrawableStreamer {
     }
 
     _trim(wantedSet, wantedOrdered = null) {
+        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        for (const key of wantedSet) this._chunkLastWantedMs.set(key, now);
+        const wantedCap = Math.max(1, Math.floor(Number(this.maxLoadedChunks) || 1));
+        const residentCap = Math.max(wantedCap, Math.floor(Number(this.maxResidentChunks) || wantedCap));
+        const graceMs = Math.max(0, Number(this.staleChunkGraceMs) || 0);
         let changed = false;
-        for (const key of Array.from(this.loaded)) {
-            if (!wantedSet.has(key)) {
-                // If a load is still in-flight for this chunk, cancel it.
-                if (this.loading.has(key) || this._chunkLoadReqs.has(key)) this._cancelChunkLoad(key, 'fell_out_of_wanted_set');
-                if (this.enableEntityLodTraversal) this._removeChunkEntities(key);
-                this.loaded.delete(key);
-                this.chunkInstances.delete(key);
-                this.chunkMinDist.delete(key);
-                this.chunkArchetypeCounts.delete(key);
-                if (this._workerStoredChunks && this._workerStoredChunks.has(key)) {
-                    this._workerStoredChunks.delete(key);
-                    try {
-                        const w = this._getChunkWorker();
-                        if (w) w.postMessage({ type: 'drop_stored', reqId: (this._chunkWorkerNextReqId++ >>> 0), keys: [key] });
-                    } catch { /* ignore */ }
-                }
-                changed = true;
-            }
-        }
-        if (this.loaded.size <= this.maxLoadedChunks) return;
-        const extra = this.loaded.size - this.maxLoadedChunks;
 
-        // Drop farthest chunks first for stability when turning/moving.
+        // Rank stale chunks by age, then distance. Wanted chunks are never
+        // evicted to make room; replacements can load while the prior street
+        // remains visible inside the bounded overlap cache.
         const centerKey = (wantedOrdered && wantedOrdered.length > 0) ? wantedOrdered[0] : null;
         const centerCoord = centerKey ? centerKey.split('_').map(v => parseInt(v, 10)) : null;
         const cx = (centerCoord && Number.isFinite(centerCoord[0])) ? centerCoord[0] : null;
         const cy = (centerCoord && Number.isFinite(centerCoord[1])) ? centerCoord[1] : null;
-
-        const loadedSorted = Array.from(this.loaded).map((k) => {
-            if (cx === null || cy === null) return { k, d2: 1e30 };
-            const [sx, sy] = k.split('_').map(v => parseInt(v, 10));
-            const dx = (Number.isFinite(sx) ? (sx - cx) : 1e9);
-            const dy = (Number.isFinite(sy) ? (sy - cy) : 1e9);
-            return { k, d2: dx * dx + dy * dy };
+        const stale = Array.from(this.loaded).filter((key) => !wantedSet.has(key)).map((key) => {
+            const lastWanted = Number(this._chunkLastWantedMs.get(key)) || 0;
+            const [sx, sy] = key.split('_').map(v => parseInt(v, 10));
+            const dx = cx === null || !Number.isFinite(sx) ? 1e9 : sx - cx;
+            const dy = cy === null || !Number.isFinite(sy) ? 1e9 : sy - cy;
+            return { key, lastWanted, age: now - lastWanted, d2: dx * dx + dy * dy };
         });
-        loadedSorted.sort((a, b) => b.d2 - a.d2);
-        const toDrop = loadedSorted.slice(0, extra).map(e => e.k);
+        stale.sort((a, b) => b.age - a.age || b.d2 - a.d2 || (a.key < b.key ? -1 : 1));
+        const drop = new Set(stale.filter((entry) => graceMs <= 0 || entry.age >= graceMs).map((entry) => entry.key));
+        let projectedSize = this.loaded.size - drop.size;
+        if (projectedSize > residentCap) {
+            for (const entry of stale) {
+                if (projectedSize <= residentCap) break;
+                if (drop.has(entry.key)) continue;
+                drop.add(entry.key);
+                projectedSize--;
+            }
+        }
 
-        for (const key of toDrop) {
-            if (this.loading.has(key) || this._chunkLoadReqs.has(key)) this._cancelChunkLoad(key, 'dropped_for_maxLoadedChunks');
+        for (const key of drop) {
+            if (this.loading.has(key) || this._chunkLoadReqs.has(key)) this._cancelChunkLoad(key, 'retired_from_overlap_cache');
             if (this.enableEntityLodTraversal) this._removeChunkEntities(key);
             this.loaded.delete(key);
             this.chunkInstances.delete(key);
             this.chunkMinDist.delete(key);
             this.chunkArchetypeCounts.delete(key);
+            if (this._workerStoredChunks?.delete(key)) {
+                try {
+                    const w = this._getChunkWorker();
+                    if (w) w.postMessage({ type: 'drop_stored', reqId: (this._chunkWorkerNextReqId++ >>> 0), keys: [key] });
+                } catch { /* ignore */ }
+            }
+            this._chunkLastWantedMs.delete(key);
             changed = true;
         }
-        if (changed) this._dirty = true;
+        if (changed) {
+            this._lastChunkSetChangeMs = now;
+            if (this.chunkRebuildSettleMs <= 0) this._dirty = true;
+        }
 
-        // Cancel any in-flight loads that are no longer wanted.
+        // Let recently displaced prefetches finish, but do not allow obsolete
+        // requests to occupy the fetch lanes after their overlap window ends.
         for (const k of Array.from(this.loading)) {
             if (!wantedSet.has(k)) {
-                this._cancelChunkLoad(k, 'stale_inflight_not_wanted');
+                const age = now - (Number(this._chunkLastWantedMs.get(k)) || 0);
+                if (graceMs <= 0 || age >= Math.min(graceMs, 2000) || this.loaded.size + this.loading.size > residentCap + 4) {
+                    this._cancelChunkLoad(k, 'stale_inflight_not_wanted');
+                    this._chunkLastWantedMs.delete(k);
+                }
             }
         }
+    }
+
+    clear() {
+        for (const key of Array.from(this.loading)) {
+            this._cancelChunkLoad(key, 'clear');
+        }
+        for (const key of Array.from(this._chunkLoadReqs.keys())) {
+            this._cancelChunkLoad(key, 'clear');
+        }
+        this.loading.clear();
+        this.loaded.clear();
+        this.chunkInstances.clear();
+        this.chunkMinDist.clear();
+        this.chunkArchetypeCounts.clear();
+        this.coverageStats = null;
+        this.lastLoadStats = null;
+        this._prevDesiredInstanceKeys.clear();
+        this._residentCenterChunk = null;
+        this._prefetchFocusSample = null;
+        this._prefetchMoveDir = null;
+        this._prefetchMoveDirMs = 0;
+        this._prefetchMoveSpeed = 0;
+        this._lastResidentCoreCount = 0;
+        this._lastPrefetchStats = { speed: 0, leadChunks: 0, core: 0, forward: 0 };
+        this._chunkLastWantedMs.clear();
+        this._lastChunkSetChangeMs = 0;
+        this._lastWantedKeys = [];
+        this._lastCoreWantedSet.clear();
+        this._lastCoreSignature = '';
+        this._entityNodesByKey.clear();
+        this._chunkEntityKeys.clear();
+        this._pendingChildrenByParentKey.clear();
+        const workerKeys = Array.from(this._workerStoredChunks || []);
+        this._workerStoredChunks.clear();
+        try {
+            if (workerKeys.length) {
+                const w = this._getChunkWorker?.();
+                if (w) w.postMessage({ type: 'drop_stored', reqId: (this._chunkWorkerNextReqId++ >>> 0), keys: workerKeys });
+            }
+        } catch { /* ignore */ }
+        this._dirty = true;
+        this._dirtyEntityLod = true;
     }
 
     update(camera, centerDataPos = null) {
@@ -2525,7 +3729,7 @@ export class DrawableStreamer {
         // (We avoid capturing camera object into async closures.)
         window.__appCameraPosForDrawableStreamer = [camera.position[0], camera.position[1], camera.position[2]];
         try {
-            const c = this._cameraToDataSpace(camera.position, this._tmpVec4Out);
+            const c = centerDataPos || this._cameraToDataSpace(camera.position, this._tmpVec4Out);
             this._lastCamDataPos[0] = c[0]; this._lastCamDataPos[1] = c[1]; this._lastCamDataPos[2] = c[2];
         } catch {
             this._lastCamDataPos[0] = 0; this._lastCamDataPos[1] = 0; this._lastCamDataPos[2] = 0;
@@ -2537,8 +3741,18 @@ export class DrawableStreamer {
         } catch {
             this._lastCamDataDir[0] = 0; this._lastCamDataDir[1] = 0; this._lastCamDataDir[2] = -1;
         }
+        this._updateFrustumPlanesData(camera);
 
         const wanted = this._wantedKeysForCamera(camera, centerDataPos);
+        this._lastWantedKeys = wanted.slice();
+        const coreKeys = wanted.slice(0, Math.min(this._lastResidentCoreCount, wanted.length));
+        const coreSignature = coreKeys.join('|');
+        if (coreSignature !== this._lastCoreSignature) {
+            this._lastCoreSignature = coreSignature;
+            this._lastCoreWantedSet = new Set(coreKeys);
+            this._dirty = true;
+            this._lastChunkSetChangeMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        }
         const wantedSet = this._tmpWantedSet;
         wantedSet.clear();
         for (let i = 0; i < wanted.length; i++) wantedSet.add(wanted[i]);
@@ -2566,7 +3780,8 @@ export class DrawableStreamer {
                 this._rebuildInstancesFromEntityLeaves(leaves);
             }
         } else {
-            // Keep instance selection responsive even when chunk set is stable (throttled).
+            // An optional diagnostic path can rebuild from resident chunks as the focus moves.  It is
+            // deliberately disabled for gameplay: the static city must not churn GPU buffers on walking.
             try {
                 const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
                 const cam = this._lastCamDataPos || [0, 0, 0];
@@ -2574,7 +3789,24 @@ export class DrawableStreamer {
                 const moved = last ? this._dist3(cam[0], cam[1], cam[2], last[0], last[1], last[2]) : 1e30;
                 const moveOk = moved >= (Number(this.instanceRebuildMinMove) || 0.0);
                 const timeOk = (now - (Number(this._lastInstanceRebuildMs) || 0)) >= (Number(this.instanceRebuildMinMs) || 0);
-                if (moveOk && timeOk) this._dirty = true;
+                // Direction changes alter front-vs-rear prioritization even
+                // without worker frustum culling. Otherwise a turn can retain
+                // stale off-screen archetypes until the next chunk boundary.
+                let dirOk = false;
+                const dir = this._lastCamDataDir || [0, 0, -1];
+                const lastDir = this._lastInstanceRebuildDir;
+                if (!lastDir) {
+                    dirOk = true;
+                } else {
+                    const dot = (Number(dir[0]) || 0) * (Number(lastDir[0]) || 0)
+                        + (Number(dir[1]) || 0) * (Number(lastDir[1]) || 0)
+                        + (Number(dir[2]) || 0) * (Number(lastDir[2]) || 0);
+                    const minDot = Number.isFinite(Number(this.instanceRebuildMinDirDot))
+                        ? Math.max(-1.0, Math.min(1.0, Number(this.instanceRebuildMinDirDot)))
+                        : 0.985;
+                    dirOk = dot < minDot;
+                }
+                if (this.rebuildInstancesOnMove && timeOk && (moveOk || dirOk)) this._dirty = true;
             } catch { /* ignore */ }
 
             // Interior visibility can change as the camera moves (enter/exit rooms), even when chunk set is stable.
@@ -2586,20 +3818,41 @@ export class DrawableStreamer {
             if (this._dirty) {
                 // If we have worker-stored chunk data, rebuild off-main-thread for smoother frames.
                 const didWorker = (this.enableWorkerRebuild && this._workerStoredChunks && this._workerStoredChunks.size > 0);
-                if (didWorker) {
-                    // keep dirty flag until the async worker rebuild applies results
-                    void this._rebuildAllInstancesInWorker().then((ok) => {
-                        if (ok) this._dirty = false;
-                    });
-                } else {
+                const rebuildNow = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                const settleMs = Math.max(0, Number(this.chunkRebuildSettleMs) || 0);
+                const coreCount = Math.min(this._lastResidentCoreCount, wanted.length);
+                const requiredCoreReady = coreCount <= 0 || wanted.slice(0, coreCount).every((key) => this.loaded.has(key));
+                const waitingForRequiredCore = didWorker && settleMs > 0 && !requiredCoreReady;
+                const waitingForChunkBatch = didWorker
+                    && this._prevDesiredInstanceKeys.size > 0
+                    && this._lastChunkSetChangeMs > this._lastInstanceRebuildMs
+                    && rebuildNow - this._lastChunkSetChangeMs < settleMs;
+                const waitingForResidency = waitingForRequiredCore || waitingForChunkBatch;
+                let rebuildStarted = false;
+                if (didWorker && !waitingForResidency) {
+                    // Keep drawing the last complete buffer set while one structural rebuild is in flight.
+                    // Chunk loads/drops that happen meanwhile set `_dirty` again and schedule one follow-up.
+                    if (!this._rebuildWorkerReqInFlight) {
+                        this._dirty = false;
+                        rebuildStarted = true;
+                        void this._rebuildAllInstancesInWorker().then((ok) => {
+                            if (!ok) this._dirty = true;
+                            else this._lastInstanceRebuildCompletedMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                        });
+                    }
+                } else if (!didWorker) {
                     this._dirty = false;
                     this._rebuildAllInstances();
+                    rebuildStarted = true;
+                    this._lastInstanceRebuildCompletedMs = rebuildNow;
                 }
-                try {
-                    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                if (rebuildStarted) try {
                     const cam = this._lastCamDataPos || [0, 0, 0];
+                    const dir = this._lastCamDataDir || [0, 0, -1];
                     this._lastInstanceRebuildCam = [cam[0], cam[1], cam[2]];
-                    this._lastInstanceRebuildMs = now;
+                    this._lastInstanceRebuildDir = [dir[0], dir[1], dir[2]];
+                    this._lastInstanceRebuildMs = rebuildNow;
+                    this._instanceRebuildCount++;
                 } catch { /* ignore */ }
             }
         }
@@ -2623,7 +3876,8 @@ export class DrawableStreamer {
             const key = wanted[i];
             if (this.loaded.has(key) || this.loading.has(key)) continue;
 
-            const priority = (i < Math.max(9, this.radiusChunks * 2 + 1)) ? 'high' : 'low';
+            const forwardWarmCount = (Number(this._prefetchMoveSpeed) || 0) >= 8.0 ? 4 : 0;
+            const priority = i < (this._lastResidentCoreCount + forwardWarmCount) ? 'high' : 'low';
             started++;
             void this._loadChunk(key, { priority });
         }

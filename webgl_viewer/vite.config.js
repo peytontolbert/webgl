@@ -2,6 +2,389 @@ import { defineConfig } from 'vite';
 import path from 'node:path';
 import fs from 'node:fs';
 import sirv from 'sirv';
+import { spawn } from 'node:child_process';
+import { installMultiplayerServer } from './multiplayer_server.js';
+
+function readDotEnvFile(file) {
+  const out = {};
+  try {
+    const txt = fs.readFileSync(file, 'utf8');
+    for (const raw of txt.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!m) continue;
+      let v = m[2].trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+        v = v.slice(1, -1);
+      }
+      out[m[1]] = v;
+    }
+  } catch {
+    // optional
+  }
+  return out;
+}
+
+function sendJson(res, status, obj) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(obj));
+}
+
+function readRequestJson(req, maxBytes = 256 * 1024) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > maxBytes) {
+        reject(new Error('request body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (!body.trim()) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+let liveExportChain = Promise.resolve();
+
+function runProcess(cmd, args, { cwd, timeoutMs = 15 * 60 * 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const trim = (s) => (s.length > 24000 ? s.slice(s.length - 24000) : s);
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* ignore */ }
+      reject(new Error(`process timed out after ${timeoutMs}ms: ${cmd}`));
+    }, timeoutMs);
+    child.stdout.on('data', (b) => { stdout = trim(stdout + String(b)); });
+    child.stderr.on('data', (b) => { stderr = trim(stderr + String(b)); });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        const err = new Error(`process exited ${code}: ${cmd}`);
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+      }
+    });
+  });
+}
+
+function cleanHashes(input, max = 24) {
+  const src = Array.isArray(input) ? input : [];
+  const seen = new Set();
+  const out = [];
+  for (const v of src) {
+    const s = String(v?.hash ?? v ?? '').trim();
+    if (!/^-?\d+$/.test(s)) continue;
+    const n = Number.parseInt(s, 10);
+    if (!Number.isFinite(n)) continue;
+    const h = String(n >>> 0);
+    if (seen.has(h)) continue;
+    seen.add(h);
+    out.push(h);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function installLiveExportEndpoint(server, root) {
+  const repoRoot = path.resolve(root, '..');
+  const env = { ...readDotEnvFile(path.join(repoRoot, '.env')), ...process.env };
+  const gamePath = String(env.gta_location || env.gta5_path || '').replace(/^['"]|['"]$/g, '');
+  const python = String(env.PYTHON || env.PYTHON_EXE || 'python');
+  const outDir = path.join(root, 'tools', 'out', 'live_export');
+  const assetsDir = path.join(root, 'assets');
+
+  server.middlewares.use('/__live_export', async (req, res) => {
+    try {
+      if (req.method === 'OPTIONS') {
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+
+      if (req.method === 'GET') {
+        sendJson(res, 200, {
+          ok: true,
+          gamePathConfigured: !!gamePath,
+          gamePathExists: !!(gamePath && fs.existsSync(gamePath)),
+          mode: 'archetype-export',
+        });
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        return;
+      }
+      if (!gamePath || !fs.existsSync(gamePath)) {
+        sendJson(res, 500, { ok: false, error: 'Missing GTA path. Set gta_location or gta5_path in .env.' });
+        return;
+      }
+
+      const body = await readRequestJson(req);
+      const hashes = cleanHashes(body.hashes, Math.max(1, Math.min(64, Number(body.top || body.limit || 24) || 24)));
+      if (!hashes.length) {
+        sendJson(res, 400, { ok: false, error: 'No numeric hashes provided.' });
+        return;
+      }
+
+      const exportTextures = !!body.exportTextures;
+      fs.mkdirSync(outDir, { recursive: true });
+      const inputPath = path.join(outDir, `live_hashes_${Date.now()}_${Math.floor(Math.random() * 100000)}.json`);
+      fs.writeFileSync(inputPath, JSON.stringify({ hashes }, null, 2), 'utf8');
+
+      const started = Date.now();
+      const task = async () => {
+        const args = [
+          path.join(repoRoot, 'export_drawables_from_list.py'),
+          '--game-path',
+          gamePath,
+          '--assets-dir',
+          assetsDir,
+          '--input',
+          inputPath,
+          '--top',
+          String(hashes.length),
+          '--skip-existing',
+          '--write-report',
+        ];
+        if (exportTextures) args.push('--export-textures');
+        const result = await runProcess(python, args, { cwd: repoRoot });
+        return {
+          ok: true,
+          hashes,
+          exportTextures,
+          durationMs: Date.now() - started,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        };
+      };
+
+      liveExportChain = liveExportChain.catch(() => undefined).then(task);
+      const result = await liveExportChain;
+      sendJson(res, 200, result);
+    } catch (e) {
+      sendJson(res, 500, {
+        ok: false,
+        error: String(e?.message || e || 'live export failed'),
+        stdout: e?.stdout || '',
+        stderr: e?.stderr || '',
+      });
+    }
+  });
+}
+
+function installSpawnEndpoint(server, root) {
+  const repoRoot = path.resolve(root, '..');
+  const env = { ...readDotEnvFile(path.join(repoRoot, '.env')), ...process.env };
+  const python = String(env.PYTHON || env.PYTHON_EXE || 'python');
+  const assetsDir = path.join(root, 'assets');
+
+  server.middlewares.use('/__spawn', async (req, res) => {
+    try {
+      if (req.method === 'OPTIONS') {
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        return;
+      }
+
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      const pathname = url.pathname.replace(/^\/+/, '');
+      if (pathname === 'scripts') {
+        const body = req.method === 'POST' ? await readRequestJson(req, 64 * 1024) : {};
+        const refresh =
+          body.refresh === true ||
+          url.searchParams.get('refresh') === '1' ||
+          url.searchParams.get('refresh') === 'true';
+        const indexPath = path.join(assetsDir, 'runtime_script_index.json');
+        if (!refresh && fs.existsSync(indexPath)) {
+          try {
+            sendJson(res, 200, JSON.parse(fs.readFileSync(indexPath, 'utf8')));
+            return;
+          } catch {
+            // Fall through and rebuild below.
+          }
+        }
+
+        const args = [
+          path.join(repoRoot, 'inspect_gta_scripts.py'),
+          '--assets-dir',
+          assetsDir,
+        ];
+        if (body.gamePath || url.searchParams.get('gamePath')) {
+          args.push('--game-path', String(body.gamePath || url.searchParams.get('gamePath')));
+        }
+        const result = await runProcess(python, args, { cwd: repoRoot, timeoutMs: 2 * 60 * 1000 });
+        const summary = String(result.stdout || '').trim();
+        const payload = fs.existsSync(indexPath)
+          ? JSON.parse(fs.readFileSync(indexPath, 'utf8'))
+          : { ok: false, error: 'script indexer did not write runtime_script_index.json' };
+        payload.indexer = summary ? JSON.parse(summary) : null;
+        sendJson(res, payload?.ok ? 200 : 500, payload);
+        return;
+      }
+
+      if (pathname && pathname !== 'resolve') {
+        sendJson(res, 404, { ok: false, error: 'unknown spawn endpoint' });
+        return;
+      }
+
+      const body = req.method === 'POST' ? await readRequestJson(req, 64 * 1024) : {};
+      const args = [
+        path.join(repoRoot, 'resolve_gta_spawn.py'),
+        '--assets-dir',
+        assetsDir,
+      ];
+      const addMany = (name, values) => {
+        const src = Array.isArray(values) ? values : (values ? [values] : []);
+        for (const v of src) {
+          const s = String(v || '').trim();
+          if (!s) continue;
+          args.push(name, s);
+        }
+      };
+      addMany('--resources-root', body.resourcesRoot || url.searchParams.getAll('resourcesRoot'));
+      addMany('--save-dir', body.saveDir || url.searchParams.getAll('saveDir'));
+
+      const allowSaveHeuristic =
+        body.allowSaveHeuristic === true ||
+        url.searchParams.get('allowSaveHeuristic') === '1' ||
+        String(env.GTA_SPAWN_ALLOW_SAVE_HEURISTIC || '').trim() === '1';
+      if (allowSaveHeuristic) args.push('--allow-save-heuristic');
+
+      const result = await runProcess(python, args, { cwd: repoRoot, timeoutMs: 60 * 1000 });
+      const text = String(result.stdout || '').trim();
+      const data = text ? JSON.parse(text) : { ok: false, error: 'empty spawn resolver output' };
+      sendJson(res, data?.ok ? 200 : 500, data);
+    } catch (e) {
+      sendJson(res, 500, {
+        ok: false,
+        error: String(e?.message || e || 'spawn resolve failed'),
+        stdout: e?.stdout || '',
+        stderr: e?.stderr || '',
+      });
+    }
+  });
+}
+
+function installGameplayEndpoint(server, root) {
+  const repoRoot = path.resolve(root, '..');
+  const env = { ...readDotEnvFile(path.join(repoRoot, '.env')), ...process.env };
+  const python = String(env.PYTHON || env.PYTHON_EXE || 'python');
+  const assetsDir = path.join(root, 'assets');
+  const manifestPath = path.join(assetsDir, 'runtime_gameplay_manifest.json');
+
+  server.middlewares.use('/__gameplay', async (req, res) => {
+    try {
+      if (req.method === 'OPTIONS') {
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        return;
+      }
+
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      const pathname = url.pathname.replace(/^\/+/, '');
+      if (pathname && pathname !== 'manifest') {
+        sendJson(res, 404, { ok: false, error: 'unknown gameplay endpoint' });
+        return;
+      }
+
+      const body = req.method === 'POST' ? await readRequestJson(req, 128 * 1024) : {};
+      const refresh =
+        body.refresh === true ||
+        url.searchParams.get('refresh') === '1' ||
+        url.searchParams.get('refresh') === 'true';
+
+      if (!refresh && fs.existsSync(manifestPath)) {
+        try {
+          sendJson(res, 200, JSON.parse(fs.readFileSync(manifestPath, 'utf8')));
+          return;
+        } catch {
+          // Fall through and rebuild below.
+        }
+      }
+
+      const host = String(body.host || url.searchParams.get('host') || env.FIVEM_REMOTE_HOST || 'peyton@192.168.0.85');
+      const serverRoot = String(body.serverRoot || url.searchParams.get('serverRoot') || env.FIVEM_SERVER_ROOT || '/data/NexusAI/fivem_server');
+      const args = [
+        path.join(repoRoot, 'import_remote_fivem_gameplay.py'),
+        '--host',
+        host,
+        '--server-root',
+        serverRoot,
+        '--assets-dir',
+        assetsDir,
+        '--pretty',
+      ];
+      if (body.noDb === true || url.searchParams.get('noDb') === '1') args.push('--no-db');
+      const maxFiles = Number(body.maxFiles || url.searchParams.get('maxFiles') || 180);
+      if (Number.isFinite(maxFiles)) args.push('--max-files', String(Math.max(1, Math.min(1000, Math.floor(maxFiles)))));
+
+      let result = null;
+      try {
+        result = await runProcess(python, args, { cwd: repoRoot, timeoutMs: 3 * 60 * 1000 });
+      } catch (e) {
+        if (fs.existsSync(manifestPath)) {
+          const payload = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          payload.endpointWarning = String(e?.message || e || 'gameplay manifest refresh failed');
+          payload.endpointStdout = e?.stdout || '';
+          payload.endpointStderr = e?.stderr || '';
+          sendJson(res, 200, payload);
+          return;
+        }
+        throw e;
+      }
+
+      const payload = fs.existsSync(manifestPath)
+        ? JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+        : { ok: false, error: 'gameplay importer did not write runtime_gameplay_manifest.json' };
+      const summary = String(result?.stdout || '').trim();
+      payload.importer = summary ? JSON.parse(summary) : null;
+      sendJson(res, payload?.ok ? 200 : 500, payload);
+    } catch (e) {
+      sendJson(res, 500, {
+        ok: false,
+        error: String(e?.message || e || 'gameplay manifest failed'),
+        stdout: e?.stdout || '',
+        stderr: e?.stderr || '',
+      });
+    }
+  });
+}
 
 // IMPORTANT:
 // - We keep `dist/assets/` for large runtime/exported GTA assets (terrain_info.json, textures, models, etc.)
@@ -11,6 +394,23 @@ export default defineConfig({
   // under a subpath without breaking absolute "/bundled/..." references.
   base: './',
   plugins: [
+    {
+      name: 'webglgta-live-export',
+      configureServer(server) {
+        const root = path.resolve(__dirname);
+        installLiveExportEndpoint(server, root);
+        installSpawnEndpoint(server, root);
+        installGameplayEndpoint(server, root);
+        installMultiplayerServer(server.httpServer);
+      },
+      configurePreviewServer(server) {
+        const root = path.resolve(__dirname);
+        installLiveExportEndpoint(server, root);
+        installSpawnEndpoint(server, root);
+        installGameplayEndpoint(server, root);
+        installMultiplayerServer(server.httpServer);
+      },
+    },
     {
       name: 'webglgta-runtime-assets',
       /**
@@ -166,6 +566,7 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, 'index.html'),
         earth: path.resolve(__dirname, 'earth.html'),
+        clothing: path.resolve(__dirname, 'clothing.html'),
       },
     },
   },

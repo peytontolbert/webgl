@@ -11,7 +11,10 @@
 
 // Bump this whenever we change asset generation or want to invalidate stale cached assets.
 // This fixes issues like "terrain_info.json still shows num_textures=0" after re-export.
-const CACHE_NAME = 'webglgta-assets-v3';
+// v5 invalidates heightmap assets exported before the row-order and coverage-mask fix.
+// v8 invalidates corrupt/zero texture responses replaced during the source restore.
+// Cache Storage is origin-scoped, so an older local port can otherwise keep rendering a stale raster.
+const CACHE_NAME = 'webglgta-assets-v9';
 const DEFAULT_CONCURRENCY = 24;
 const DEFAULT_HIGH_SHARE = 0.7; // reserve ~70% capacity for high-priority work when there is backlog
 
@@ -30,6 +33,52 @@ const _inflight = new Map(); // key = `${as}:${url}`
 
 /** @type {Map<string, any>} */
 const _memJson = new Map(); // url -> parsed json
+
+export function getAssetFetchStats() {
+  return {
+    concurrency: _concurrency,
+    highShare: _highShare,
+    activeHigh: _activeHigh,
+    activeLow: _activeLow,
+    queuedHigh: _queueHigh.length,
+    queuedLow: _queueLow.length,
+    inflight: _inflight.size,
+  };
+}
+try { globalThis.__webglgtaAssetFetchStats = getAssetFetchStats; } catch { /* diagnostics only */ }
+
+function _pickNextScheduledRequest() {
+  const hasHigh = _queueHigh.length > 0;
+  const hasLow = _queueLow.length > 0;
+  if (!hasHigh && !hasLow) return null;
+  if (!hasHigh) return _queueLow.shift();
+  if (!hasLow) return _queueHigh.shift();
+
+  // Both lanes have backlog. Reserve capacity for high-priority work while
+  // letting low-priority texture/background work make deterministic progress.
+  if (_concurrency <= 1) {
+    const period = 100;
+    const highCutoff = Math.max(1, Math.min(period - 1, Math.round(period * _highShare)));
+    _laneCounter = (_laneCounter + 1) % period;
+    return _laneCounter < highCutoff ? _queueHigh.shift() : _queueLow.shift();
+  }
+
+  const maxLow = Math.max(1, Math.floor(_concurrency * (1.0 - _highShare)));
+  const minHigh = Math.max(1, _concurrency - maxLow);
+  if (_activeHigh < minHigh) return _queueHigh.shift();
+  if (_activeLow < maxLow) return _queueLow.shift();
+  return _queueHigh.shift();
+}
+
+function _drainScheduledRequests() {
+  // Do not refill a queue while the active count is already above a newly
+  // lowered cap. Existing fetches finish naturally; new work waits.
+  while ((_activeHigh + _activeLow) < _concurrency) {
+    const next = _pickNextScheduledRequest();
+    if (!next) break;
+    next();
+  }
+}
 
 function _supportsDecompressionStream(kind) {
   try {
@@ -95,41 +144,7 @@ function _scheduleWithPriority(fn, priority) {
         .finally(() => {
           if (priority === 'low') _activeLow--;
           else _activeHigh--;
-
-          // Drain queued work while ensuring LOW priority can still make progress.
-          // Previously we always drained high first, which could starve low forever
-          // when streaming keeps a continuous high backlog (textures would stay "loading" indefinitely).
-          const pickNext = () => {
-            const hasHigh = _queueHigh.length > 0;
-            const hasLow = _queueLow.length > 0;
-            if (!hasHigh && !hasLow) return null;
-            if (!hasHigh) return _queueLow.shift();
-            if (!hasLow) return _queueHigh.shift();
-
-            // Both lanes have backlog:
-            // - Ensure high-priority can always claim its reserved share (avoid "high never starts" if low arrived first).
-            // - Still allow low-priority to make progress.
-            //
-            // With very small concurrency (e.g. 1), a pure "maxLow" gate can accidentally starve high (or low).
-            // Use deterministic weighted selection in that case.
-            if (_concurrency <= 1) {
-              const period = 100;
-              const highCutoff = Math.max(1, Math.min(period - 1, Math.round(period * _highShare)));
-              _laneCounter = (_laneCounter + 1) % period;
-              if (_laneCounter < highCutoff) return _queueHigh.shift();
-              return _queueLow.shift();
-            }
-
-            // Reserve some capacity for high, but allow low to run up to maxLow concurrent tasks.
-            const maxLow = Math.max(1, Math.floor(_concurrency * (1.0 - _highShare)));
-            const minHigh = Math.max(1, _concurrency - maxLow);
-            if (_activeHigh < minHigh) return _queueHigh.shift();
-            if (_activeLow < maxLow) return _queueLow.shift();
-            return _queueHigh.shift();
-          };
-
-          const next = pickNext();
-          if (next) next();
+          _drainScheduledRequests();
         });
     };
 
@@ -182,7 +197,12 @@ async function _getCache() {
   }
 }
 
-async function _fetchResponse(url, { usePersistentCache = true, priority = 'high', signal = undefined } = {}) {
+async function _fetchResponse(url, {
+  usePersistentCache = true,
+  priority = 'high',
+  signal = undefined,
+  bypassScheduler = false,
+} = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchResponse: empty url');
 
@@ -202,7 +222,19 @@ async function _fetchResponse(url, { usePersistentCache = true, priority = 'high
     // Match fetch() AbortError shape as closely as possible.
     throw new DOMException('Aborted', 'AbortError');
   }
-  const resp = await _scheduleWithPriority(() => fetch(u, signal ? { signal } : undefined), priority);
+  const fetchOptions = {};
+  if (signal) fetchOptions.signal = signal;
+  // When callers opt out of persistent CacheStorage, also bypass the browser's
+  // HTTP cache. This matters for regenerated local demo bundles: JSON metadata
+  // can be fresh while an older binary tile is still served from the browser.
+  if (!usePersistentCache) fetchOptions.cache = 'no-store';
+  // Some callers already enforce a strict, smaller concurrency cap of their
+  // own. Let those callers avoid being queued a second time behind unrelated
+  // mesh/chunk requests. Direct fetch is opt-in; the shared scheduler remains
+  // the default for every existing asset path.
+  const resp = bypassScheduler
+    ? await fetch(u, fetchOptions)
+    : await _scheduleWithPriority(() => fetch(u, fetchOptions), priority);
   if (!resp.ok) return resp;
 
   if (cache) {
@@ -226,6 +258,9 @@ export function setAssetFetchConcurrency(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return;
   _concurrency = Math.max(1, Math.min(128, Math.floor(v)));
+  // Raising the cap should make queued requests eligible immediately. Lowering
+  // it is handled by _drainScheduledRequests after in-flight work settles.
+  _drainScheduledRequests();
 }
 
 export function setAssetFetchPriorityConfig({ highShare } = {}) {
@@ -297,7 +332,7 @@ export async function fetchJSON(url, { usePersistentCache = true, useMemoryCache
   try {
     return await p;
   } finally {
-    if (!callerOwned) _inflight.delete(inflightKey);
+    if (!callerOwned && _inflight.get(inflightKey) === p) _inflight.delete(inflightKey);
   }
 }
 
@@ -318,7 +353,7 @@ export async function fetchJSONPreferredCompressed(url, { usePersistentCache = t
   const canGzip = _supportsDecompressionStream('gzip');
   if (canGzip) {
     try {
-      const gzUrl = `${u}.gz`;
+      const gzUrl = appendUrlPathSuffix(u, '.gz');
       const ab = await _fetchAndDecompressToArrayBuffer(gzUrl, { usePersistentCache, priority, compression: 'gzip', signal });
       // If _fetchAndDecompressToArrayBuffer returned a Response (non-ok), it'll throw above; keep defensive.
       if (ab && ab.byteLength !== undefined) {
@@ -356,7 +391,7 @@ export async function fetchText(url, { usePersistentCache = true, priority = 'hi
   try {
     return await p;
   } finally {
-    if (!callerOwned) _inflight.delete(inflightKey);
+    if (!callerOwned && _inflight.get(inflightKey) === p) _inflight.delete(inflightKey);
   }
 }
 
@@ -457,7 +492,7 @@ export async function fetchNDJSON(url, { usePersistentCache = true, priority = '
   try {
     return await p;
   } finally {
-    if (!callerOwned) _inflight.delete(inflightKey);
+    if (!callerOwned && _inflight.get(inflightKey) === p) _inflight.delete(inflightKey);
   }
 }
 
@@ -522,7 +557,7 @@ export async function fetchArrayBuffer(url, { usePersistentCache = true, signal 
   try {
     return await p;
   } finally {
-    if (!callerOwned) _inflight.delete(inflightKey);
+    if (!callerOwned && _inflight.get(inflightKey) === p) _inflight.delete(inflightKey);
   }
 }
 
@@ -547,8 +582,17 @@ export async function fetchArrayBufferWithPriority(url, { usePersistentCache = t
   try {
     return await p;
   } finally {
-    if (!callerOwned) _inflight.delete(inflightKey);
+    if (!callerOwned && _inflight.get(inflightKey) === p) _inflight.delete(inflightKey);
   }
+}
+
+export function appendUrlPathSuffix(url, suffix) {
+  const value = String(url || '');
+  const addition = String(suffix || '');
+  const queryIndex = value.search(/[?#]/);
+  return queryIndex < 0
+    ? `${value}${addition}`
+    : `${value.slice(0, queryIndex)}${addition}${value.slice(queryIndex)}`;
 }
 
 /**
@@ -562,7 +606,12 @@ export async function fetchArrayBufferPreferredCompressed(url, { usePersistentCa
   const canGzip = _supportsDecompressionStream('gzip');
   if (canGzip) {
     try {
-      const gzUrl = `${u}.gz`;
+      // Some authored manifests already name a gzip payload (for example
+      // custom vehicle `.msh9.gz` files).  Treat that as the sidecar itself:
+      // requesting `.gz.gz` both creates a noisy 404 and would otherwise
+      // return compressed bytes through the raw fallback.
+      const pathWithoutQuery = u.split(/[?#]/, 1)[0].toLowerCase();
+      const gzUrl = pathWithoutQuery.endsWith('.gz') ? u : appendUrlPathSuffix(u, '.gz');
       const ab = await _fetchAndDecompressToArrayBuffer(gzUrl, { usePersistentCache, priority, compression: 'gzip', signal });
       if (ab && ab.byteLength !== undefined) return ab;
     } catch {
@@ -573,19 +622,29 @@ export async function fetchArrayBufferPreferredCompressed(url, { usePersistentCa
   return await fetchArrayBufferWithPriority(u, { usePersistentCache, priority, signal });
 }
 
-export async function fetchBlob(url, { usePersistentCache = true, priority = 'high', signal = undefined } = {}) {
+export async function fetchBlob(url, {
+  usePersistentCache = true,
+  priority = 'high',
+  signal = undefined,
+  bypassScheduler = false,
+} = {}) {
   const u = String(url || '');
   if (!u) throw new Error('fetchBlob: empty url');
 
   const callerOwned = !!signal;
-  const inflightKey = `blob:${u}`;
+  const inflightKey = `blob:${bypassScheduler ? 'direct' : 'scheduled'}:${u}`;
   if (!callerOwned) {
     const existing = _inflight.get(inflightKey);
     if (existing) return await existing;
   }
 
   const p = (async () => {
-    const resp = await _fetchResponse(u, { usePersistentCache, priority, signal });
+    const resp = await _fetchResponse(u, {
+      usePersistentCache,
+      priority,
+      signal,
+      bypassScheduler,
+    });
     if (!resp.ok) throw new Error(`Failed to fetch ${u} (status=${resp.status})`);
     return await resp.blob();
   })();
@@ -594,7 +653,7 @@ export async function fetchBlob(url, { usePersistentCache = true, priority = 'hi
   try {
     return await p;
   } finally {
-    if (!callerOwned) _inflight.delete(inflightKey);
+    if (!callerOwned && _inflight.get(inflightKey) === p) _inflight.delete(inflightKey);
   }
 }
 

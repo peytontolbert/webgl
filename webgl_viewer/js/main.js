@@ -227,7 +227,7 @@ const SPAWN_DEMO_LOD_LEVEL = '1';
 // Keep /demo at a stable internal resolution. Reallocating the WebGL canvas
 // and post-process targets while the player turns is much more noticeable than
 // the small quality gain from dynamic resolution in this dense world.
-const SPAWN_DEMO_RENDER_SCALE = 0.50;
+const SPAWN_DEMO_RENDER_SCALE = 0.66;
 const SPAWN_DEMO_SECONDARY_MAP_DISTANCE = 90.0;
 const SPAWN_DEMO_MED_SECONDARY_MAP_DISTANCE = 56.0;
 const SPAWN_DEMO_LOW_SECONDARY_MAP_DISTANCE = 32.0;
@@ -239,24 +239,27 @@ const SPAWN_DEMO_LOW_ALPHA_DISTANCE = 96.0;
 const SPAWN_DEMO_LOW_DECAL_DISTANCE = 56.0;
 const SPAWN_DEMO_LOW_ADDITIVE_DISTANCE = 72.0;
 const SPAWN_DEMO_MIN_PROJECTED_PROP_RADIUS_PX = 2.0;
-const SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS = 850;
-const SPAWN_DEMO_GROUP_BUDGET_MIN_DISTANCE = 120.0;
-// Keep the live gameplay neighborhood bounded. A 3x3 core covers every
-// adjacent tile while movement-directed look-ahead warms up to three tiles.
-// The previous 5x5 + 12-forward configuration settled at more than 2,000
-// material submissions per frame even while the player was stationary.
-const SPAWN_DEMO_STREAM_RADIUS_CHUNKS = 1;
+// The demo uses packed supermesh cells plus conservative GPU frustum culling,
+// so it can afford a complete local streetscape. The previous 640-command
+// cap discarded whole, valid prop/facade groups before they reached the GPU.
+const SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS = 1400;
+const SPAWN_DEMO_MIN_SAFE_DRAW_ITEMS = 900;
+const SPAWN_DEMO_GROUP_BUDGET_MIN_DISTANCE = 280.0;
+// A 5x5 resident core gives a 512 m tile buffer around the player. This
+// avoids crossing into an unloaded block and leaves the forward slots to warm
+// streets that a fast vehicle will reach next.
+const SPAWN_DEMO_STREAM_RADIUS_CHUNKS = 2;
 const SPAWN_DEMO_STREAM_CORE_CHUNKS = (SPAWN_DEMO_STREAM_RADIUS_CHUNKS * 2 + 1) ** 2;
-const SPAWN_DEMO_STREAM_FORWARD_SLOTS = 3;
+const SPAWN_DEMO_STREAM_FORWARD_SLOTS = 7;
 const SPAWN_DEMO_STREAM_MAX_CHUNKS = SPAWN_DEMO_STREAM_CORE_CHUNKS + SPAWN_DEMO_STREAM_FORWARD_SLOTS;
-const SPAWN_DEMO_STREAM_RESIDENT_CHUNKS = SPAWN_DEMO_STREAM_MAX_CHUNKS + 3;
-const SPAWN_DEMO_STREAM_FORWARD_CHUNKS = 3;
-const SPAWN_DEMO_STREAM_HORIZON_SECONDS = 10.0;
-const SPAWN_DEMO_STREAM_STALE_GRACE_MS = 3_000;
-const SPAWN_DEMO_STREAM_REBUILD_SETTLE_MS = 750;
-const SPAWN_DEMO_MAX_MODEL_DISTANCE = 760;
-const SPAWN_DEMO_MAX_VISIBLE_INSTANCES = 18_000;
-const SPAWN_DEMO_MAX_INSTANCES_PER_ARCHETYPE = 2_048;
+const SPAWN_DEMO_STREAM_RESIDENT_CHUNKS = SPAWN_DEMO_STREAM_MAX_CHUNKS + 12;
+const SPAWN_DEMO_STREAM_FORWARD_CHUNKS = 7;
+const SPAWN_DEMO_STREAM_HORIZON_SECONDS = 14.0;
+const SPAWN_DEMO_STREAM_STALE_GRACE_MS = 8_000;
+const SPAWN_DEMO_STREAM_REBUILD_SETTLE_MS = 1_000;
+const SPAWN_DEMO_MAX_MODEL_DISTANCE = 1_100;
+const SPAWN_DEMO_MAX_VISIBLE_INSTANCES = 24_000;
+const SPAWN_DEMO_MAX_INSTANCES_PER_ARCHETYPE = 1_024;
 
 class GpuTimer {
     constructor(gl) {
@@ -482,6 +485,8 @@ export class App {
         this._worldReady = false;
         this._loadingSkipped = false;
         this._animationStarted = false;
+        this._animationFrameId = 0;
+        this._destroyed = false;
         this._loadingResolve = null;
         this._loadingPromise = new Promise((resolve) => {
             this._loadingResolve = resolve;
@@ -616,6 +621,7 @@ export class App {
         this._npcCombatActiveMeshKeys = new Set();
         this._policeNpcActiveMeshKeys = new Set();
         this._ambientNpcActiveMeshKeys = new Map();
+        this._nativePedFootLocalZByRenderer = new WeakMap();
         this._remotePlayerActiveMeshKeys = new Set();
         this._remotePlayers = [];
         this._remotePlayerAnimationHashes = [];
@@ -853,6 +859,10 @@ export class App {
         // into the normal full-world viewer through persisted control state.
         this.spawnDistrictDemo = isSpawnDistrictDemoRoute();
         this.spawnDistrictBounds = null;
+        // An expansion owns a separate playable region. It must never inherit
+        // the city stream, clamp, or resident geometry after activation.
+        this._activeWorldExpansion = null;
+        this._derivedTrackRegionActive = false;
         this._spawnDistrictDescriptor = null;
         this.interactionSystem = new InteractionSystem();
         this.doorController = new DoorController(this);
@@ -1048,6 +1058,7 @@ export class App {
             try { await this.trackSceneRenderer.init(this._dataToViewMatrix); } catch (e) {
                 console.warn('Track scene renderer init failed:', e);
             }
+            this.trackSceneRenderer.onProgress = (stats) => this._updateNurburgringStatus(stats);
             this.entityReady = this.entityRenderer.ready && this.entityStreamer.ready;
             if (this.entityReady) {
                 const chunkCount = this.entityStreamer?.index?.chunks ? Object.keys(this.entityStreamer.index.chunks).length : 0;
@@ -1055,33 +1066,44 @@ export class App {
                 console.log(`Entity streaming enabled: chunks=${chunkCount} total_entities=${total ?? 'n/a'}`);
             }
 
-            // Load the currently active legacy tile during bootstrap. A future
-            // descriptor that explicitly opts into compiled collision replaces
-            // this world below; descriptors without that field must retain the
-            // authored YBNC ground instead of falling through to terrain.
-            await this.collisionWorld?.loadYbnGround?.();
+            // Read the compact descriptor before collision bootstrap. A compiled
+            // deployment must never download the legacy 1.3 GB YBNC blob just to
+            // replace it with the selected streaming collision layer moments
+            // later. Invalid/missing descriptors retain the safe legacy path.
+            const demoDescriptor = this.spawnDistrictDemo
+                ? await this._loadSpawnDistrictDescriptor()
+                : null;
+            const usesCompiledCollision = !!String(demoDescriptor?.compiledCollisionManifestFile || '').trim();
+            if (!usesCompiledCollision) {
+                await this.collisionWorld?.loadYbnGround?.();
+                const spawn = demoDescriptor?.spawn;
+                const spawnX = Number(spawn?.x);
+                const spawnY = Number(spawn?.y);
+                const spawnPedZ = Number(spawn?.pedZ ?? spawn?.groundZ ?? spawn?.z);
+                if ([spawnX, spawnY, spawnPedZ].every(Number.isFinite)) {
+                    this._demoYbnAlignment = this.collisionWorld?.alignYbnToKnownSurface?.(
+                        spawnX,
+                        spawnY,
+                        spawnPedZ,
+                    ) || null;
+                }
+            }
+            const authoredTrackGround = await this.collisionWorld?.loadDerivedTrackGround?.();
             const derivedRoad = await this.collisionWorld?.loadDerivedRoad?.();
-            if (derivedRoad) {
+            if (authoredTrackGround || derivedRoad) {
                 try { await this.trackRoadRenderer?.load?.(); } catch (e) { console.warn('Track road render load failed:', e); }
-                // The full visual circuit is intentionally asynchronous.  The
-                // compact sectors stream after the road/collision package so a
-                // playable demo never waits on the large scene import.
-                void this.trackSceneRenderer?.load?.();
-                // The district bounds may have been installed before this optional
-                // package finished loading. Recompute them now so the track is a
-                // playable extension, not a teleport target that is clamped back
-                // into the city by the next movement update.
-                if (this.spawnDistrictDemo) this._setSpawnDistrictDemo(true, { dropResident: false });
+                // The circuit scenery is expansion-only. Do not parse/upload it
+                // during city boot: it was consuming frame time and GPU memory
+                // even when the player never visited the track.
             }
             globalThis.__viewerNurburgring = {
                 available: () => !!this.collisionWorld?.getDerivedRoadSpawn?.(),
                 teleport: () => this.teleportToDerivedRoad(),
                 bounds: () => this.collisionWorld?.getDerivedRoadBounds?.() || null,
             };
-            // The demo descriptor carries the authoritative FiveM spawn. Load that
-            // small JSON before the normal boot spawn, while the full model subset
-            // remains deferred until after the first playable frame.
-            if (this.spawnDistrictDemo) await this._loadSpawnDistrictDescriptor();
+            // The descriptor is now available for the authoritative FiveM spawn,
+            // while the full model subset remains deferred until after the first
+            // playable frame.
             this._setSpawnDistrictDemo(this.spawnDistrictDemo, { dropResident: false });
 
             // Init ped renderer
@@ -1156,7 +1178,10 @@ export class App {
                 if (modelsReady) {
                     await this._warmupStreaming({
                         showOverlay: true,
-                        timeoutMs: this.spawnDistrictDemo ? 90000 : 30000,
+                        // Demo warmup is intentionally bounded. The live frame loop
+                        // continues refinement; holding it behind the loading shell
+                        // for a complete queue drain can otherwise take 90 seconds.
+                        timeoutMs: this.spawnDistrictDemo ? 12000 : 30000,
                         // Source residency can enqueue thousands of unrelated
                         // submeshes.  Waiting eight seconds here kept the renderer
                         // stopped even after the spawn chunks were usable, which made
@@ -1349,7 +1374,7 @@ export class App {
         let effectiveManifest = manifest;
         if (this.spawnDistrictDemo) {
             try {
-                const interactables = await fetchJSON('assets/demo/interactables.json?rev=parking-gates-v1', {
+                const interactables = await fetchJSON('assets/demo/interactables.json?rev=mlo-doors-v2', {
                     priority: 'high',
                     usePersistentCache: false,
                 });
@@ -1469,6 +1494,39 @@ export class App {
         }
         if (!Number.isFinite(savedVersion) || savedVersion < 25) data.vehiclePhysicsMode = 'gta';
         if (!Number.isFinite(savedVersion) || savedVersion < 26) data.vehicleCameraMode = 'chase';
+
+        // A saved high-detail profile is useful in the full-world viewer, but
+        // restoring it while /demo is booting turns the first playable frame
+        // into a large mesh/texture burst. Start the bounded demo at its known
+        // baseline; users can still raise quality explicitly after it loads.
+        if (isSpawnDistrictDemoRoute()) {
+            const p = PERF_PROFILES.gameplay;
+            Object.assign(data, {
+                showTerrain: false,
+                showBuildings: false,
+                showModels: true,
+                showNpcs: true,
+                objectsTextured: true,
+                terrainTextured: false,
+                buildingsTextured: false,
+                crossArchetypeInstancing: false,
+                cacheStreamedChunks: false,
+                streamRadius: p.streamRadius,
+                maxLoadedChunks: p.maxLoadedChunks,
+                maxArchetypes: p.maxArchetypes,
+                maxModelDistance: p.maxModelDistance,
+                maxVisibleInstances: p.maxVisibleInstances,
+                maxInstancesPerArchetype: p.maxInstancesPerArchetype,
+                maxMeshLoadsInFlight: p.maxMeshLoadsInFlight,
+                textureQuality: SPAWN_DEMO_TEXTURE_QUALITY,
+                lodLevel: SPAWN_DEMO_LOD_LEVEL,
+                enableWebGpuCulling: false,
+                enableOcclusionCulling: false,
+                enableShadows: false,
+                enablePostFx: false,
+                enableBloom: false,
+            });
+        }
 
         // Toggles + numeric/select knobs
         [
@@ -1677,7 +1735,24 @@ export class App {
         return null;
     }
 
+    _isCityWorldStreamingActive() {
+        return !this._activeWorldExpansion?.isolateCityWorld;
+    }
+
     _getSpawnDistrictBounds() {
+        if (this._activeWorldExpansion) {
+            const expansionBounds = this._activeWorldExpansion.bounds || this.collisionWorld?.getDerivedRoadBounds?.();
+            const values = [expansionBounds?.minX, expansionBounds?.minY, expansionBounds?.maxX, expansionBounds?.maxY].map(Number);
+            if (values.every(Number.isFinite) && values[2] > values[0] && values[3] > values[1]) {
+                // Expansion bounds are explicit and authoritative. This is
+                // intentionally separate from the city descriptor, allowing
+                // future bounded worlds to use the same activation path.
+                return {
+                    minX: Math.floor(values[0]), minY: Math.floor(values[1]),
+                    maxX: Math.ceil(values[2]), maxY: Math.ceil(values[3]),
+                };
+            }
+        }
         const authored = this._spawnDistrictDescriptor?.bounds;
         const authoredBounds = {
             minX: Number(authored?.minX),
@@ -1717,17 +1792,66 @@ export class App {
         };
     }
 
-    _clampDataPositionToSpawnDistrict(posData) {
+    _getSpawnDistrictPositionConstraint(posData) {
         const x = Number(posData?.[0]);
         const y = Number(posData?.[1]);
         const z = Number(posData?.[2]);
         const b = this.spawnDistrictDemo ? this.spawnDistrictBounds : null;
-        if (!b || !Number.isFinite(x) || !Number.isFinite(y)) return [x, y, z];
-        return [
-            Math.max(b.minX, Math.min(b.maxX, x)),
-            Math.max(b.minY, Math.min(b.maxY, y)),
-            z,
-        ];
+        if (!b) return {
+            position: [x, y, z],
+            recovered: false,
+            recoveredToConfiguredSpawn: false,
+            recoveryPedZ: NaN,
+        };
+        const minX = Number(b.minX);
+        const minY = Number(b.minY);
+        const maxX = Number(b.maxX);
+        const maxY = Number(b.maxY);
+        if (![minX, minY, maxX, maxY].every(Number.isFinite) || maxX <= minX || maxY <= minY) {
+            return {
+                position: [x, y, z],
+                recovered: false,
+                recoveredToConfiguredSpawn: false,
+                recoveryPedZ: NaN,
+            };
+        }
+        const outsideDistance = Number.isFinite(x) && Number.isFinite(y)
+            ? Math.hypot(
+                x < minX ? minX - x : (x > maxX ? x - maxX : 0.0),
+                y < minY ? minY - y : (y > maxY ? y - maxY : 0.0),
+            )
+            : Infinity;
+        const recoveryDistance = Math.max(64.0, Math.min(250.0, Math.max(maxX - minX, maxY - minY) * 0.1));
+        const recovered = outsideDistance > recoveryDistance;
+        const configured = this._activeWorldExpansion ? null : this._spawnDistrictDescriptor?.spawn;
+        const configuredX = Number(configured?.x);
+        const configuredY = Number(configured?.y);
+        const configuredPedZ = Number(configured?.pedZ);
+        const configuredInBounds = Number.isFinite(configuredX)
+            && Number.isFinite(configuredY)
+            && configuredX >= minX && configuredX <= maxX
+            && configuredY >= minY && configuredY <= maxY;
+        const position = recovered
+            ? [
+                configuredInBounds ? configuredX : (minX + maxX) * 0.5,
+                configuredInBounds ? configuredY : (minY + maxY) * 0.5,
+                z,
+            ]
+            : [
+                Math.max(minX, Math.min(maxX, x)),
+                Math.max(minY, Math.min(maxY, y)),
+                z,
+            ];
+        return {
+            position,
+            recovered,
+            recoveredToConfiguredSpawn: recovered && configuredInBounds && Number.isFinite(configuredPedZ),
+            recoveryPedZ: configuredPedZ,
+        };
+    }
+
+    _clampDataPositionToSpawnDistrict(posData) {
+        return this._getSpawnDistrictPositionConstraint(posData).position;
     }
 
     activateDemoDestination(destination = {}) {
@@ -1744,6 +1868,8 @@ export class App {
             maxX: x + halfSize,
             maxY: y + halfSize,
         };
+        this._activeWorldExpansion = null;
+        this._derivedTrackRegionActive = false;
         this.spawnDistrictDemo = true;
         this.spawnDistrictBounds = bounds;
         this.collisionWorld?.setMovementBounds?.(bounds);
@@ -1761,6 +1887,45 @@ export class App {
             source: String(destination.label || destination.destination || 'destination'),
             ped: [x, y, Number(destination.z) || 0, 0],
         };
+        this._startDestinationTextureWarmup();
+        return true;
+    }
+
+    _startDestinationTextureWarmup(durationMs = 12_000) {
+        const streamer = this.textureStreamer;
+        if (!this.spawnDistrictDemo || !streamer?.setStreamingConfig) return false;
+
+        const active = this._destinationTextureWarmup;
+        if (active?.timer) clearTimeout(active.timer);
+
+        const stats = streamer.getStats?.() || null;
+        const baseline = active?.baseline || {
+            maxLoadsInFlight: Number(stats?.maxLoadsInFlight),
+            maxNewLoadsPerFrame: Number(stats?.maxNewLoadsPerFrame),
+        };
+        if (!Number.isFinite(baseline.maxLoadsInFlight) || !Number.isFinite(baseline.maxNewLoadsPerFrame)) {
+            this._destinationTextureWarmup = null;
+            return false;
+        }
+
+        const burst = {
+            maxLoadsInFlight: Math.max(16, baseline.maxLoadsInFlight),
+            maxNewLoadsPerFrame: Math.max(32, baseline.maxNewLoadsPerFrame),
+        };
+        streamer.setStreamingConfig(burst);
+
+        const token = Symbol('destination-texture-warmup');
+        const timer = setTimeout(() => {
+            if (this._destinationTextureWarmup?.token !== token) return;
+            const current = streamer.getStats?.() || null;
+            // A quality/profile change owns the new limits and must not be undone.
+            if (Number(current?.maxLoadsInFlight) === burst.maxLoadsInFlight
+                && Number(current?.maxNewLoadsPerFrame) === burst.maxNewLoadsPerFrame) {
+                streamer.setStreamingConfig(baseline);
+            }
+            this._destinationTextureWarmup = null;
+        }, Math.max(1_000, Number(durationMs) || 12_000));
+        this._destinationTextureWarmup = { token, timer, baseline, burst };
         return true;
     }
 
@@ -1844,13 +2009,67 @@ export class App {
 
         if (bounds && this.ped) {
             const current = this.ped.posData;
-            const clamped = this._clampDataPositionToSpawnDistrict(current);
+            const constrained = this._getSpawnDistrictPositionConstraint(current);
+            const clamped = constrained.position;
             if (clamped[0] !== current[0] || clamped[1] !== current[1]) {
-                this.spawnPedAt(clamped, { groundSource: this._pedGroundSource });
+                // Preserve the original input so spawnPedAt() can also repair a stale
+                // eye height when this is a true out-of-district recovery.
+                this.spawnPedAt(current, { groundSource: this._pedGroundSource });
             }
         }
         if (dropResident) this._dropStreamedResidency({ dropEntities: true });
         this._scheduleSaveSettings();
+    }
+
+    _activateWorldExpansion(expansion = {}) {
+        const id = String(expansion.id || '').trim().toLowerCase();
+        if (!id) return false;
+        const bounds = expansion.bounds || this.collisionWorld?.getDerivedRoadBounds?.();
+        const values = [bounds?.minX, bounds?.minY, bounds?.maxX, bounds?.maxY].map(Number);
+        if (!values.every(Number.isFinite) || values[2] <= values[0] || values[3] <= values[1]) return false;
+        this._activeWorldExpansion = {
+            id,
+            label: String(expansion.label || id),
+            isolateCityWorld: expansion.isolateCityWorld !== false,
+            bounds: { minX: values[0], minY: values[1], maxX: values[2], maxY: values[3] },
+        };
+        this._derivedTrackRegionActive = id === 'nordschleife';
+        // Reuse the common district wiring for movement/network stream bounds,
+        // but clear city residency before the first expansion frame.
+        this._setSpawnDistrictDemo(true, { dropResident: true });
+        // The city demo intentionally uses half resolution; the isolated
+        // circuit needs the native canvas resolution.
+        this.resize();
+        if (id === 'nordschleife') {
+            // `_setSpawnDistrictDemo()` applies the generic gameplay Medium
+            // LOD while wiring the expanded bounds. That made `/track` start
+            // on the compact visual package even on a system expressly using
+            // the full circuit. The track scene is isolated from city
+            // streaming, so select its complete authored package directly.
+            this._setControlValue('lodLevel', '0');
+            this._applyLodFromUI?.();
+            void this._syncTrackSceneQuality?.();
+        }
+        return true;
+    }
+
+    _deactivateWorldExpansion() {
+        if (!this._activeWorldExpansion && !this._derivedTrackRegionActive) return;
+        this._activeWorldExpansion = null;
+        this._derivedTrackRegionActive = false;
+        this._setSpawnDistrictDemo(true, { dropResident: true });
+        this.resize();
+    }
+
+    _syncTrackSceneQuality() {
+        if (this._activeWorldExpansion?.id !== 'nordschleife') return;
+        const lodLevel = String(document.getElementById('lodLevel')?.value || '2');
+        // “Full Detail” must mean the full circuit on its own. Requiring a
+        // second texture setting silently kept the compact scene active and
+        // made the quality control appear broken. Texture Quality remains a
+        // city-streaming preference; this choice selects track geometry.
+        const quality = lodLevel === '0' ? 'full' : 'balanced';
+        void this.trackSceneRenderer?.setQuality?.(quality);
     }
 
     _configureSpawnDistrictDemoOcclusion() {
@@ -1889,18 +2108,22 @@ export class App {
             demoRenderableInstances,
             Math.floor(Number(this.drawableStreamer?.index?.total_entities) || 0),
         );
-        // Keep a complete player-centered 3x3 neighborhood eligible and use
-        // movement-directed look-ahead for driving.
+        // Keep a complete player-centered 5x5 neighborhood eligible and use
+        // movement-directed look-ahead for driving. The tile index is 256 m,
+        // so a 3x3 core let a car reach a missing street before its chunk was
+        // even eligible to load.
         const budget = {
             radius: expandedChunkedDemo ? SPAWN_DEMO_STREAM_RADIUS_CHUNKS : (chunkedDemo ? 1 : 0),
-            // The 3x3 core consumes nine slots. Expanded demos reserve three
-            // more for movement-directed look-ahead.
+            // The 5x5 core remains resident; additional slots are directional
+            // prefetch, never replacements for the local gameplay bubble.
             maxLoaded: expandedChunkedDemo ? SPAWN_DEMO_STREAM_MAX_CHUNKS : (chunkedDemo ? 9 : 1),
-            // The compact supermesh manifest has more definitions than the source
-            // descriptor because it includes MLO children and generated material
-            // draws. A fixed 420-archetype cap silently removed most of the city.
+            // The live 2 km export has 11,688 renderable archetypes. A 4,096
+            // cap rejected nearby, valid native geometry before instance/draw
+            // budgeting ran, which appeared as whole missing city blocks.
+            // Keep the complete local archetype set eligible; later stages still
+            // bound instances and only yield safe, distant draw groups.
             maxArch: runtimeArchetypes > 0
-                ? Math.max(512, Math.min(4096, runtimeArchetypes + 16))
+                ? Math.max(512, Math.min(12_000, runtimeArchetypes + 16))
                 : 2048,
             maxDist: expandedChunkedDemo
                 ? SPAWN_DEMO_MAX_MODEL_DISTANCE
@@ -1928,7 +2151,10 @@ export class App {
             this.entityStreamer.extraFrontChunks = 0;
         }
         if (this.drawableStreamer) {
-            this.drawableStreamer.maxNewLoadsPerUpdate = expandedChunkedDemo ? 2 : 1;
+            // Start enough independent tile requests to fill the expanded
+            // bubble during a drive. Asset fetch priority still protects the
+            // closest core tiles from being starved by look-ahead work.
+            this.drawableStreamer.maxNewLoadsPerUpdate = expandedChunkedDemo ? 5 : 2;
             this.drawableStreamer.extraFrontChunks = expandedChunkedDemo ? SPAWN_DEMO_STREAM_FORWARD_CHUNKS : 0;
             this.drawableStreamer.prefetchHorizonSeconds = expandedChunkedDemo ? SPAWN_DEMO_STREAM_HORIZON_SECONDS : 6.0;
             this.drawableStreamer.maxResidentChunks = expandedChunkedDemo
@@ -1953,14 +2179,21 @@ export class App {
             this.drawableStreamer.webGpuCullingMinSliceInstances = 1;
             this.drawableStreamer.enableCrossArchetypeInstancing = false;
             this.drawableStreamer.forcedLod = this.forcedModelLod;
-            this.drawableStreamer.maxBehindModelDistance = budget.maxDist;
+            this.drawableStreamer.maxBehindModelDistance = Math.min(budget.maxDist, 520.0);
             if (typeof this.drawableStreamer.setEntityLodTraversalEnabled === 'function') {
                 this.drawableStreamer.setEntityLodTraversalEnabled(false);
             } else {
                 this.drawableStreamer.enableEntityLodTraversal = false;
             }
             this.drawableStreamer.workerFrustumPadding = 28.0;
+            // Chunk residency, interior transitions, and explicit world changes are
+            // the only valid reasons to replace static city instance buffers. A
+            // camera turn must never make an otherwise resident street disappear
+            // and lose its texture warmup progress.
             this.drawableStreamer.rebuildInstancesOnMove = false;
+            this.drawableStreamer.instanceRebuildMinMove = 96.0;
+            this.drawableStreamer.instanceRebuildMinMs = 350;
+            this.drawableStreamer.instanceRebuildMinDirDot = 0.92;
             this.drawableStreamer._dirty = true;
         }
         this._configureSpawnDistrictDemoOcclusion();
@@ -1982,20 +2215,20 @@ export class App {
             const deviceMemoryGb = Number(this._defaultRuntimeCaps?.deviceMemoryGb);
             const constrainedDevice = Number.isFinite(deviceMemoryGb) && deviceMemoryGb <= 4;
             this.textureStreamer?.setCacheCaps?.({
-                // The demo contains many small material maps. A low entry cap can
-                // churn while the byte cache is still mostly empty, causing visible
-                // real-texture/placeholder flicker as the camera moves.
-                maxTextures: constrainedDevice ? 2048 : 3072,
-                maxBytes: constrainedDevice ? (256 * 1024 * 1024) : (384 * 1024 * 1024),
+                // The compressed district contains thousands of small maps. Count
+                // limits evict visible city textures before the GPU byte budget is
+                // actually full, so /demo is byte-bounded only.
+                maxTextures: 0,
+                maxBytes: constrainedDevice ? (384 * 1024 * 1024) : (512 * 1024 * 1024),
             });
             this.textureStreamer?.setStreamingConfig?.({
-                maxLoadsInFlight: constrainedDevice ? 4 : 8,
-                maxNewLoadsPerFrame: constrainedDevice ? 8 : 16,
+                maxLoadsInFlight: constrainedDevice ? 5 : 8,
+                maxNewLoadsPerFrame: constrainedDevice ? 10 : 16,
             });
             this.textureStreamer?.setDistanceTierConfig?.({
                 highDist: constrainedDevice ? 28 : 45,
                 mediumDist: constrainedDevice ? 170 : 260,
-                minResidentMs: constrainedDevice ? 6000 : 12000,
+                minResidentMs: constrainedDevice ? 12000 : 18000,
             });
             this.textureStreamer?.setQuality?.(SPAWN_DEMO_TEXTURE_QUALITY);
         } catch { /* ignore */ }
@@ -2046,6 +2279,27 @@ export class App {
                 minX: Number(bounds.minX), minY: Number(bounds.minY),
                 maxX: Number(bounds.maxX), maxY: Number(bounds.maxY),
             };
+
+            // GTA/FiveM stores the ped root against the rendered world. The
+            // packed YBN export can carry a constant local Z offset, especially
+            // after a district is regenerated. Calibrate it once from the
+            // descriptor's authored Legion spawn before any player/NPC movement
+            // queries the tile; otherwise the first movement tick can pull the
+            // ped through the visible road.
+            const spawn = descriptor?.spawn;
+            const spawnX = Number(spawn?.x);
+            const spawnY = Number(spawn?.y);
+            const spawnPedZ = Number(spawn?.pedZ ?? spawn?.groundZ ?? spawn?.z);
+            if ([spawnX, spawnY, spawnPedZ].every(Number.isFinite)) {
+                this._demoYbnAlignment = this.collisionWorld?.alignYbnToKnownSurface?.(
+                    spawnX,
+                    spawnY,
+                    spawnPedZ,
+                ) || null;
+                if (this._demoYbnAlignment) {
+                    console.info(`[demo] Aligned YBN ground by ${this._demoYbnAlignment.offset.toFixed(4)} m at the authored spawn.`);
+                }
+            }
             return descriptor;
         } catch (e) {
             console.warn('[demo] Spawn district descriptor unavailable; using generic city spawn.', e);
@@ -2350,7 +2604,7 @@ export class App {
             const geometryFloor = {
                 radius: expandedChunkedDemo ? SPAWN_DEMO_STREAM_RADIUS_CHUNKS : 1,
                 maxLoaded: expandedChunkedDemo ? SPAWN_DEMO_STREAM_MAX_CHUNKS : 12,
-                maxArch: Math.max(512, Math.min(4096, runtimeArchetypes + 16)),
+                maxArch: Math.max(512, Math.min(12_000, runtimeArchetypes + 16)),
                 maxDist: expandedChunkedDemo
                     ? SPAWN_DEMO_MAX_MODEL_DISTANCE
                     : Math.max(340, Math.min(760, Math.ceil(districtRadius + 120))),
@@ -2524,10 +2778,10 @@ export class App {
         else this._startStreamingFastRamp();
 
         // Kick streaming once to populate wanted keys and begin async loads.
-        if (this.entityReady && this.showEntityDots) this.entityStreamer.update(this.camera, this.entityRenderer, center);
+        if (this._isCityWorldStreamingActive() && this.entityReady && this.showEntityDots) this.entityStreamer.update(this.camera, this.entityRenderer, center);
         try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
         try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
-        if (this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
+        if (this._isCityWorldStreamingActive() && this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
 
         // Wait briefly for initial chunk bubble to load (bounded; don't hang forever).
         const start = performance.now();
@@ -2540,32 +2794,29 @@ export class App {
         const initialMaxMeshPackCacheBytes = this.modelManager?.maxMeshPackCacheBytes;
         const initialMaxPackedMeshUploadsPerFrame = this.modelManager?.maxPackedMeshUploadsPerFrame;
         const initialMaxPackedMeshUploadMsPerFrame = this.modelManager?.maxPackedMeshUploadMsPerFrame;
-        const demoWarmupFetchConcurrency = this.spawnDistrictDemo ? 24 : null;
+        const demoWarmupFetchConcurrency = this.spawnDistrictDemo ? 8 : null;
         if (demoWarmupFetchConcurrency) {
-            // The bounded demo has four local entity chunks and a fixed mesh
-            // cache budget. Keeping its fetch lane at the initial 24 requests
-            // avoids releasing a ped-only scene then halving throughput while
-            // the immediate street still has more than a thousand meshes queued.
+            // Keep cold boot responsive. The old 24-request burst saturated the
+            // main thread with decode/upload work before the first playable frame.
             try { setAssetFetchConcurrency(demoWarmupFetchConcurrency); } catch { /* ignore */ }
         }
         if (this.spawnDistrictDemo && this.textureStreamer?.setStreamingConfig) {
             this.textureStreamer.setStreamingConfig({
-                maxLoadsInFlight: Math.max(16, Number(initialMaxLoadsInFlight) || 0),
-                maxNewLoadsPerFrame: Math.max(32, Number(initialMaxNewLoadsPerFrame) || 0),
+                maxLoadsInFlight: Math.max(6, Number(initialMaxLoadsInFlight) || 0),
+                maxNewLoadsPerFrame: Math.max(8, Number(initialMaxNewLoadsPerFrame) || 0),
             });
         }
         if (this.spawnDistrictDemo && this.instancedModelRenderer) {
-            // The first playable scene is staged before the animation loop starts,
-            // so use a short, bounded burst here. The normal per-frame limit is
-            // restored immediately afterward.
-            this.instancedModelRenderer.maxMeshLoadsInFlight = Math.max(24, Number(initialMaxMeshLoadsInFlight) || 0);
+            // Only load the immediate street before first input. A large preload
+            // burst leaves camera and networking starved once the loop begins.
+            this.instancedModelRenderer.maxMeshLoadsInFlight = Math.max(6, Number(initialMaxMeshLoadsInFlight) || 0);
         }
         if (this.spawnDistrictDemo && this.modelManager) {
             // Demo mesh references are slices of a small number of shared packs. Retaining the
             // complete starter set during boot avoids repeatedly downloading an evicted pack.
             this.modelManager.maxMeshPackCacheBytes = Math.max(192 * 1024 * 1024, Number(initialMaxMeshPackCacheBytes) || 0);
-            this.modelManager.maxPackedMeshUploadsPerFrame = Math.max(32, Number(initialMaxPackedMeshUploadsPerFrame) || 0);
-            this.modelManager.maxPackedMeshUploadMsPerFrame = Math.max(14, Number(initialMaxPackedMeshUploadMsPerFrame) || 0);
+            this.modelManager.maxPackedMeshUploadsPerFrame = Math.max(6, Number(initialMaxPackedMeshUploadsPerFrame) || 0);
+            this.modelManager.maxPackedMeshUploadMsPerFrame = Math.max(4, Number(initialMaxPackedMeshUploadMsPerFrame) || 0);
         }
         const restoreTextureConfig = () => {
             if (demoWarmupFetchConcurrency) {
@@ -2627,6 +2878,9 @@ export class App {
             : [];
         let diffuseOutstanding = 0;
         let secondaryOutstanding = 0;
+        // Destination teleports may already own a texture-streaming frame.
+        // Avoid double begin/end calls only while that explicit burst is live.
+        const destinationBoost = !!this._destinationTextureWarmup;
 
         while (performance.now() - start < timeoutMs) {
             if (this._loadingSkipped) {
@@ -2635,21 +2889,24 @@ export class App {
             }
 
             // Keep requesting wanted chunks (async loads are fire-and-forget).
-            if (this.entityReady && this.showEntityDots) this.entityStreamer.update(this.camera, this.entityRenderer, center);
+            if (this._isCityWorldStreamingActive() && this.entityReady && this.showEntityDots) this.entityStreamer.update(this.camera, this.entityRenderer, center);
             try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
-            if (this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
+            if (this._isCityWorldStreamingActive() && this.showModels && this.modelsInitialized) this.drawableStreamer.update(this.camera, center);
 
             // Drive mesh queue without drawing.
             if (this.showModels && this.modelsInitialized) {
-                try { this.textureStreamer?.beginFrame?.(); } catch { /* ignore */ }
+                const manualTextureWarmup = !destinationBoost || !this._animationStarted;
+                if (manualTextureWarmup) {
+                    try { this.textureStreamer?.beginFrame?.(); } catch { /* ignore */ }
+                }
                 this.instancedModelRenderer?.pumpMeshLoadsOnce?.(this.camera?.position, this.gpuFrustumCulling);
                 const textureQuality = String(this.textureStreamer?.quality || 'medium').toLowerCase();
                 const demoPrefetchLimit = textureQuality === 'high' ? 1536 : (textureQuality === 'medium' ? 1024 : 512);
                 const prefetchLimit = this.spawnDistrictDemo ? demoPrefetchLimit : 48;
                 diffuseOutstanding = 0;
                 secondaryOutstanding = 0;
-                if (!this.objectsWireframeMode) {
+                if (manualTextureWarmup && !this.objectsWireframeMode) {
                     diffuseOutstanding = this.instancedModelRenderer?.prefetchDiffuseTextures?.(prefetchLimit, {
                         includeSecondary: false,
                         skipSettled: this.spawnDistrictDemo,
@@ -2663,7 +2920,7 @@ export class App {
                         ) || 0;
                     }
                 }
-                if (!this.playerWireframeMode) {
+                if (manualTextureWarmup && !this.playerWireframeMode) {
                     // Character components can originate from a locally installed clothing
                     // manifest. Their generated WebP textures intentionally are not part of
                     // the world texture index, so this isolated renderer must be allowed to
@@ -2674,7 +2931,9 @@ export class App {
                         skipSettled: this.spawnDistrictDemo,
                     });
                 }
-                try { this.textureStreamer?.endFrame?.(); } catch { /* ignore */ }
+                if (manualTextureWarmup) {
+                    try { this.textureStreamer?.endFrame?.(); } catch { /* ignore */ }
+                }
             }
 
             const eDone = wantedEntity.every((k) => this.entityStreamer.loaded.has(k));
@@ -2690,7 +2949,7 @@ export class App {
             // through the stable local scene, without requiring every distant
             // source submesh to decode before input becomes available.
             const demoSize = Math.max(0, Number(this._spawnDistrictDescriptor?.size) || 0);
-            const demoInitialMeshTarget = this.spawnDistrictDemo ? (demoSize >= 900 ? 900 : 640) : 0;
+            const demoInitialMeshTarget = this.spawnDistrictDemo ? (demoSize >= 900 ? 360 : 260) : 0;
             const texStats = this.textureStreamer?.getStats?.() || null;
             const texLoading = texStats?.loading ?? 0;
             const texInFlight = texStats?.loadsInFlight ?? 0;
@@ -2736,7 +2995,7 @@ export class App {
             // Draining the whole source-resident queue here blocked rendering behind a
             // full-screen loader despite thousands of remaining distant submeshes.
             const demoInitialWorldReady = !this.spawnDistrictDemo || completedMeshes >= demoInitialMeshTarget;
-            const demoWorldGateExpired = this.spawnDistrictDemo && performance.now() - start >= 24000;
+            const demoWorldGateExpired = this.spawnDistrictDemo && performance.now() - start >= 12000;
             const meshOk = meshDrainComplete || (
                 playableDemoWindowElapsed && (demoInitialWorldReady || demoWorldGateExpired)
             );
@@ -2763,9 +3022,9 @@ export class App {
     }
 
     _startAnimationLoop() {
-        if (this._animationStarted) return;
+        if (this._animationStarted || this._destroyed) return;
         this._animationStarted = true;
-        this.animate();
+        this._animationFrameId = requestAnimationFrame(() => this.animate());
     }
 
     async ensureModelsInitialized() {
@@ -3236,8 +3495,10 @@ export class App {
         const peers = this.multiplayer?.peers?.size || 0;
         const voice = this.audioSystem?.getNetworkState?.();
         const voiceState = voice?.voiceTalking ? 'TALKING' : voice?.voiceEnabled ? 'MIC' : 'MUTED';
-        hud.textContent = `${status === 'online' ? 'ONLINE' : status.toUpperCase()}  ${peers + 1}  ROOM ${this.multiplayer?.room || 'demo'}  ${voiceState}`;
-        hud.style.color = status === 'online' ? '#9ff0ba' : '#ffd28a';
+        const text = `${status === 'online' ? 'ONLINE' : status.toUpperCase()}  ${peers + 1}  ROOM ${this.multiplayer?.room || 'demo'}  ${voiceState}`;
+        const color = status === 'online' ? '#9ff0ba' : '#ffd28a';
+        if (hud.textContent !== text) hud.textContent = text;
+        if (hud.style.color !== color) hud.style.color = color;
     }
 
     _clearNpcEntityMeshes() {
@@ -3345,6 +3606,7 @@ export class App {
         const matrices = scratch.matrices;
         const q = scratch.q;
         const mat = scratch.mat;
+        const meshFootLocalZ = this._getNativePedMeshFootLocalZData(renderer, specs);
         for (let i = 0; i < npcs.length; i++) {
             const npc = npcs[i];
             const heading = Number.isFinite(Number(npc.heading)) ? Number(npc.heading) : 0.0;
@@ -3356,7 +3618,10 @@ export class App {
             glMatrix.mat4.fromRotationTranslation(mat, q, [
                 npc.x,
                 npc.y,
-                npc.feetZ + (Number(npc.ragdollOffsetZ) || 0.0) + (Number(npc.ragdollGroundOffsetZ) || 0.0),
+                // NPC state is collision-foot space. Native ped drawables have
+                // the same bind-root-above-the-shoe convention as the local
+                // freemode ped, so convert it at render time only.
+                npc.feetZ - meshFootLocalZ + (Number(npc.ragdollOffsetZ) || 0.0) + (Number(npc.ragdollGroundOffsetZ) || 0.0),
             ]);
             const offset = i * 16;
             for (let column = 0; column < 16; column++) {
@@ -4245,13 +4510,69 @@ export class App {
         return true;
     }
 
-    teleportToDerivedRoad() {
-        const spawn = this.collisionWorld?.getDerivedRoadSpawn?.();
+    _updateNurburgringStatus(stats = this.trackSceneRenderer?.stats) {
+        const status = document.getElementById('nurburgringStatus');
+        if (!status) return;
+        if (!this.collisionWorld?.getDerivedRoadSpawn?.()) {
+            status.textContent = 'Local derived track package not loaded.';
+            return;
+        }
+        if (this.trackSceneRenderer?.error) {
+            status.textContent = `Road collision is ready, but the full circuit could not load: ${this.trackSceneRenderer.error}`;
+            return;
+        }
+        const loaded = Math.max(0, Number(stats?.sectors) || 0);
+        const total = Math.max(0, Number(stats?.totalSectors) || 0);
+        const packageLabel = this.trackSceneRenderer?.sceneQuality === 'full'
+            ? 'full-detail authored-precision package'
+            : 'compact 1 m package';
+        if (stats?.primaryLoaded) {
+            status.textContent = total > loaded
+                ? `Nordschleife ${packageLabel}; streaming scenery (${loaded}/${total} sectors).`
+                : `Nordschleife ${packageLabel} loaded (${loaded} visual sectors) with matching road contact.`;
+            return;
+        }
+        if (total > 0) {
+            status.textContent = `Road collision is ready; loading Nordschleife ${packageLabel} (${loaded}/${total} sectors).`;
+            return;
+        }
+        status.textContent = 'Derived Nordschleife road is loaded with matching road contact.';
+    }
+
+    _syncVehiclePhysicsModeStatus() {
+        const select = document.getElementById('vehiclePhysicsMode');
+        const status = document.getElementById('vehiclePhysicsModeStatus');
+        if (!status) return;
+        const mode = this.vehicleController?.getPhysicsMode?.() || select?.value || 'gta';
+        const vehicle = this.vehicleController?.vehicle;
+        const profileStatus = String(vehicle?.assettoProfileStatus || 'none');
+        const profileError = String(vehicle?.assettoProfileError || '');
+        const model = String(vehicle?.model || 'vehicle');
+        let text = 'GTA handling is active.';
+        if (mode === 'assetto') {
+            if (profileStatus === 'loaded') text = `Calibrated Assetto Corsa profile active: ${model}.`;
+            else if (profileStatus === 'loading') text = `Loading calibrated Assetto Corsa profile: ${model}…`;
+            else if (profileError) text = `Assetto baseline active for ${model}; calibrated profile failed (${profileError}).`;
+            else text = `Assetto baseline active for ${model}; no calibrated profile is available.`;
+        }
+        if (status.textContent !== text) status.textContent = text;
+    }
+
+    teleportToDerivedRoad(expansion = null, serverState = null) {
+        const spawnFrame = this.collisionWorld?.getDerivedRoadSpawnFrame?.();
+        const derivedSpawn = spawnFrame?.position || this.collisionWorld?.getDerivedRoadSpawn?.();
+        const serverSpawn = [Number(serverState?.x), Number(serverState?.y), Number(serverState?.feetZ)];
+        const spawn = serverSpawn.every(Number.isFinite) ? serverSpawn : derivedSpawn;
         if (!Array.isArray(spawn) || spawn.length < 3) return false;
         // Both spawnPedAt() and CollisionWorld movement sweeps clamp to the
-        // district bounds. Refresh them from the now-loaded derived road before
-        // placing an on-foot player or a seated vehicle at the circuit.
-        if (this.spawnDistrictDemo) this._setSpawnDistrictDemo(true, { dropResident: false });
+        // active region. The track is an isolated extension, rather than a
+        // very distant city coordinate that still drives city streaming.
+        if (!this._activateWorldExpansion({
+            id: String(expansion?.id || 'nordschleife'),
+            label: String(expansion?.label || 'Nürburgring'),
+            bounds: expansion?.bounds || this.collisionWorld?.getDerivedRoadBounds?.(),
+            isolateCityWorld: expansion?.isolateCityWorld !== false,
+        })) return false;
         const [x, y, z] = spawn;
         const vehicle = this.vehicleController?.vehicle;
         if (vehicle && this.vehicleController?.inVehicle) {
@@ -4260,7 +4581,9 @@ export class App {
             vehicle.velocityLocal = [0, 0];
             vehicle.speed = 0;
             vehicle.yawRate = 0;
-            vehicle.headingRad = 0;
+            vehicle.headingRad = Number.isFinite(Number(serverState?.heading))
+                ? Number(serverState.heading)
+                : (Number(spawnFrame?.headingRad) || 0);
             // Clear wheel/drivetrain state too.  Resetting only the rendered
             // vehicle left the dedicated Assetto solver carrying its old speed
             // into the first circuit frame after /track.
@@ -4269,8 +4592,33 @@ export class App {
             try { this.vehicleController?._syncOccupantPed?.(); } catch { /* next fixed step will sync */ }
         } else {
             this.spawnPedAt([x, y, z + (Number(this.pedEyeHeightData) || 1.65)], { groundSource: 'derived_track_road' });
+            if (this.player && Number.isFinite(Number(serverState?.heading))) this.player.headingRad = Number(serverState.heading);
+            else if (this.player && Number.isFinite(Number(spawnFrame?.headingRad))) this.player.headingRad = Number(spawnFrame.headingRad);
         }
         this._setGtaThirdPersonRigForPed?.({ distanceData: 7.5, heightData: 2.0, sideData: 0.7 });
+        return true;
+    }
+
+    returnToLegionSquare({ serverPosition = null } = {}) {
+        const x = Number(serverPosition?.x);
+        const y = Number(serverPosition?.y);
+        const feetZ = Number(serverPosition?.z);
+        const legion = [
+            Number.isFinite(x) ? x : 186.94,
+            Number.isFinite(y) ? y : -850.84,
+            Number.isFinite(feetZ) ? feetZ : 31.17,
+        ];
+        // Restore the descriptor-owned city layer before changing actor
+        // position. A recovery path cannot retain extension residency.
+        const wasExpansion = !!this._activeWorldExpansion || !!this._derivedTrackRegionActive;
+        this._deactivateWorldExpansion();
+        if (!wasExpansion && this.spawnDistrictDemo) this._setSpawnDistrictDemo(true, { dropResident: true });
+        this.vehicleController?.exitVehicle?.('Legion recovery');
+        this.spawnPedAt([
+            legion[0], legion[1], legion[2] + (Number(this.pedEyeHeightData) || 1.2),
+        ], { groundSource: 'legion_recovery' });
+        this._setGtaThirdPersonRigForPed?.({ distanceData: 6.0, heightData: 1.7, sideData: 0.6 });
+        this._runtimeSpawnInfo = { kind: 'legion_recovery', source: 'recovery', ped: [...legion, 0] };
         return true;
     }
 
@@ -5207,10 +5555,13 @@ export class App {
     }
 
     spawnPedAt(posDataXYZ, { groundSource = null } = {}) {
-        const constrained = this._clampDataPositionToSpawnDistrict(posDataXYZ);
+        const constraint = this._getSpawnDistrictPositionConstraint(posDataXYZ);
+        const constrained = constraint.position;
         const x = constrained[0];
         const y = constrained[1];
-        const z = constrained[2];
+        const z = constraint.recoveredToConfiguredSpawn
+            ? constraint.recoveryPedZ + this.pedEyeHeightData
+            : constrained[2];
         const posData = [x, y, z];
         const posView = this._dataToViewer(posData);
 
@@ -5219,10 +5570,22 @@ export class App {
         glMatrix.vec3.subtract(camOffset, this.camera.position, this.camera.target);
 
         this.ped = { posData, posView, camOffset: [camOffset[0], camOffset[1], camOffset[2]] };
-        if (groundSource) this._pedGroundSource = String(groundSource);
+        if (constraint.recovered) this._pedGroundSource = 'demo_boundary_recovery';
+        else if (groundSource) this._pedGroundSource = String(groundSource);
         this._resetPedMotion();
         if (this.pedRenderer?.setPosition) this.pedRenderer.setPosition(posData);
         else this.pedRenderer?.setPositions?.([posData]);
+        if (constraint.recovered) {
+            this._pedGroundingDebug = {
+                desiredZ: Number(posDataXYZ?.[2]),
+                groundZ: constraint.recoveredToConfiguredSpawn ? constraint.recoveryPedZ : null,
+                recovery: true,
+                recoverySource: constraint.recoveredToConfiguredSpawn ? 'descriptor_spawn' : 'district_center',
+                groundSource: this._pedGroundSource,
+                finalZ: z,
+            };
+            this._setGtaThirdPersonRigForPed?.(this._getSpawnDistrictCameraRig?.());
+        }
     }
 
     _setGtaThirdPersonRigForPed({ distanceData = 6.0, heightData = 1.7, sideData = 0.6 } = {}) {
@@ -5428,9 +5791,19 @@ export class App {
 
         // FiveM stores a ped root Z while YBN/interior collision describes floors.
         // heightmap.dat is deliberately excluded: it contains bounds envelopes.
-        const constrainedPed = this._clampDataPositionToSpawnDistrict(pedV4);
+        const constraint = this._getSpawnDistrictPositionConstraint(pedV4);
+        const constrainedPed = constraint.position;
         const x = Number(constrainedPed[0]);
         const y = Number(constrainedPed[1]);
+        if (constraint.recoveredToConfiguredSpawn) {
+            this.spawnPedAt([
+                x,
+                y,
+                constraint.recoveryPedZ + this.pedEyeHeightData,
+            ], { groundSource: 'demo_boundary_recovery' });
+            this._setGtaThirdPersonRigForPed?.(this._getSpawnDistrictCameraRig?.());
+            return;
+        }
         const desiredZ = Number(constrainedPed[2]);
         const terrainEnvelopeZ = this.terrainRenderer.getHeightAtXY?.(x, y);
         const demoGroundZ = this._getSpawnDistrictDemoGroundZAtXY(x, y);
@@ -6197,16 +6570,41 @@ export class App {
         const status = this.meleeController?.getStatus?.();
         const hud = document.getElementById('meleeHud');
         if (!status || !hud) return;
+        // This runs with the gameplay update loop. Keep DOM state event-driven
+        // instead of reassigning the same attributes, text, and CSS classes
+        // every frame (the old skin-pose diagnostic made that problem obvious).
+        const target = status.target || null;
+        const healthPct = Math.max(0, Math.min(100, (status.health / Math.max(1, status.maxHealth)) * 100));
+        const targetPct = target
+            ? Math.max(0, Math.min(100, (target.health / Math.max(1, target.maxHealth)) * 100))
+            : 0;
+        const dead = status.lifeState === 'dead';
+        const uiKey = [
+            this.spawnDistrictDemo ? 1 : 0,
+            status.attacking ? 1 : 0, status.guarding ? 1 : 0, status.combo || 0,
+            target?.id || '', Math.round(target?.health || 0), Math.round(target?.maxHealth || 0), targetPct.toFixed(1),
+            String(this.playerModelRenderer?.characterLocomotion?.combat?.phase || ''),
+            String(this.playerModelRenderer?.characterLocomotion?.combat?.clip || ''),
+            this._meleeAnimationsLoaded ? 'loaded' : (this._meleeAnimationsUnavailable ? 'unavailable' : 'loading'),
+            status.lifeState || 'alive', Math.round(status.health || 0), Math.round(status.maxHealth || 0), healthPct.toFixed(1),
+            dead ? 1 : 0, Math.max(0, Math.ceil(Number(status.respawnRemaining) || 0)),
+        ].join('|');
+        if (uiKey === this._meleeUiKey) return;
+        this._meleeUiKey = uiKey;
         hud.dataset.combatState = status.attacking ? 'attacking' : (status.guarding ? 'guarding' : 'idle');
         hud.dataset.combo = String(status.combo || 0);
         hud.dataset.target = String(status.target?.id || '');
         hud.dataset.renderCombatState = String(this.playerModelRenderer?.characterLocomotion?.combat?.phase || '');
-        hud.dataset.skinPoseVersion = String(this.playerModelRenderer?._skinPoseVersion || 0);
+        // `_skinPoseVersion` is an internal GPU-palette cache generation. It
+        // advances for every sampled animation pose (often 30 Hz) and is not
+        // gameplay/UI state. Publishing it as a data attribute caused a
+        // needless stream of DOM mutations and made it look like a runaway
+        // counter in DevTools.
+        delete hud.dataset.skinPoseVersion;
         hud.dataset.renderClip = String(this.playerModelRenderer?.characterLocomotion?.combat?.clip || '');
         hud.dataset.meleeAnimations = this._meleeAnimationsLoaded ? 'loaded' : (this._meleeAnimationsUnavailable ? 'unavailable' : 'loading');
         hud.dataset.lifeState = String(status.lifeState || 'alive');
         hud.hidden = !this.spawnDistrictDemo;
-        const healthPct = Math.max(0, Math.min(100, (status.health / Math.max(1, status.maxHealth)) * 100));
         const playerFill = document.getElementById('meleePlayerHealth');
         const playerText = document.getElementById('meleePlayerHealthText');
         if (playerFill) playerFill.style.width = `${healthPct.toFixed(1)}%`;
@@ -6215,14 +6613,12 @@ export class App {
         const targetFill = document.getElementById('meleeTargetHealth');
         const targetText = document.getElementById('meleeTargetHealthText');
         if (targetRow) targetRow.hidden = !status.target;
-        if (status.target) {
-            const targetPct = Math.max(0, Math.min(100, (status.target.health / Math.max(1, status.target.maxHealth)) * 100));
+        if (target) {
             if (targetFill) targetFill.style.width = `${targetPct.toFixed(1)}%`;
-            if (targetText) targetText.textContent = String(Math.round(status.target.health));
+            if (targetText) targetText.textContent = String(Math.round(target.health));
         }
         const deathOverlay = document.getElementById('deathOverlay');
         const deathCountdown = document.getElementById('deathCountdown');
-        const dead = status.lifeState === 'dead';
         if (dead !== !!this._deathUiActive) {
             this._deathUiActive = dead;
             this._weaponUiKey = '';
@@ -6814,6 +7210,41 @@ export class App {
             && height <= 2.6;
     }
 
+    _getNativePedMeshFootLocalZData(renderer, specs = []) {
+        if (!renderer?.instances || !Array.isArray(specs) || !specs.length) return 0.0;
+        const cached = this._nativePedFootLocalZByRenderer?.get(renderer);
+        if (cached?.ready && Number.isFinite(Number(cached.value))) return Number(cached.value);
+
+        let minZ = Number.POSITIVE_INFINITY;
+        let maxZ = Number.NEGATIVE_INFINITY;
+        let loaded = 0;
+        for (const spec of specs) {
+            const hash = String(spec?.hash || '');
+            const lod = String(spec?.lod || 'high').toLowerCase();
+            if (!hash) continue;
+            const entry = renderer.instances.get(`${hash}:${lod}`);
+            for (const submesh of entry?.submeshes?.values?.() || []) {
+                const mesh = submesh?.mesh;
+                if (!mesh || this.modelManager?.isMeshDisposed?.(mesh)) continue;
+                const low = Number(mesh.bounds?.min?.[2]);
+                const high = Number(mesh.bounds?.max?.[2]);
+                if (!Number.isFinite(low) || !Number.isFinite(high)) continue;
+                minZ = Math.min(minZ, low);
+                maxZ = Math.max(maxZ, high);
+                loaded++;
+            }
+        }
+        const bounds = loaded > 0 && Number.isFinite(minZ) && Number.isFinite(maxZ)
+            ? { minZ, maxZ, height: maxZ - minZ }
+            : null;
+        const plausible = this._isPlausiblePlayerFootBounds(bounds);
+        const value = plausible ? Number(bounds.minZ) : 0.0;
+        // Cache only a real loaded result. Before mesh residency, retry on the
+        // next sync so a later native mesh can contribute its shoe contact.
+        if (loaded > 0 && plausible) this._nativePedFootLocalZByRenderer?.set(renderer, { ready: true, value });
+        return value;
+    }
+
     _getPlayerMeshFootLocalZData(status = null) {
         try {
             const render = this.runtimeCharacterProfile?.render || null;
@@ -7110,6 +7541,12 @@ export class App {
 
     _setAssetPickerEnabled(enabled) {
         this.assetPickerEnabled = !!enabled;
+        // Preserve CPU triangle data for assets loaded while inspection is active.
+        // Without it the picker can only report a bounds hit and triangle fields
+        // are necessarily unavailable.
+        if (this.modelManager) {
+            this.modelManager.retainCpuPickData = this.assetPickerEnabled || isAssetPickDiagnosticEnabled();
+        }
         if (this.assetPickerEnabled) {
             // Asset inspection is an explicit mouse mode. It must not inherit a
             // captured combat pointer or pointer lock from normal gameplay.
@@ -7122,12 +7559,20 @@ export class App {
 
     _inspectDemoAssetAtClientPoint(clientX, clientY) {
         if (!this.assetPickerEnabled || !this.spawnDistrictDemo) return;
-        if (!this.canvas || !this.instancedModelRenderer?.pickAssetAtScreen) return;
+        if (!this.canvas) return;
         const rect = this.canvas.getBoundingClientRect();
         if (!rect || !(rect.width > 0) || !(rect.height > 0)) return;
         const x = (Number(clientX) - rect.left) * (this.canvas.width / rect.width);
         const y = (Number(clientY) - rect.top) * (this.canvas.height / rect.height);
-        const report = this.instancedModelRenderer.pickAssetAtScreen({
+        // Track sectors are currently owned by TrackSceneRenderer, not the
+        // city instance renderer.  Query the renderer that produced the
+        // visible pixel so /track does not return a false null hit and a set
+        // of unrelated zero city statistics.
+        const trackActive = (this._nordschleifeActive || this._activeWorldExpansion?.id === 'nordschleife')
+            && !!this.trackSceneRenderer?.models?.length;
+        const pickerRenderer = trackActive ? this.trackSceneRenderer : this.instancedModelRenderer;
+        if (!pickerRenderer?.pickAssetAtScreen) return;
+        const report = pickerRenderer.pickAssetAtScreen({
             x,
             y,
             viewportWidth: this.canvas.width,
@@ -7149,7 +7594,10 @@ export class App {
         const cov = (() => { try { return this.drawableStreamer?.getCoverageStats?.() || null; } catch { return null; } })();
         const tex = (() => { try { return this.textureStreamer?.getStats?.() || null; } catch { return null; } })();
         const occ = (() => { try { return this.occlusionCuller?.getStats?.() || null; } catch { return null; } })();
-        const renderStats = (() => { try { return this.instancedModelRenderer?.getRenderStats?.() || null; } catch { return null; } })();
+        const trackActive = (this._nordschleifeActive || this._activeWorldExpansion?.id === 'nordschleife')
+            && !!this.trackSceneRenderer?.models?.length;
+        const activeRenderer = trackActive ? this.trackSceneRenderer : this.instancedModelRenderer;
+        const renderStats = (() => { try { return activeRenderer?.getRenderStats?.() || null; } catch { return null; } })();
         return {
             page: (() => { try { return window.location.href; } catch { return null; } })(),
             route: this.spawnDistrictDemo ? '/demo' : '/',
@@ -7197,6 +7645,15 @@ export class App {
                 workerFrustumPadding: this.drawableStreamer?.workerFrustumPadding ?? null,
             },
             coverage: cov,
+            activeRenderer: trackActive ? 'TrackSceneRenderer' : 'InstancedModelRenderer',
+            trackCoverage: trackActive ? {
+                descriptorLoaded: !!this.trackSceneRenderer?.sceneUrl,
+                sceneUrl: this.trackSceneRenderer?.sceneUrl || null,
+                quality: this.trackSceneRenderer?.sceneQuality || null,
+                loading: !!this.trackSceneRenderer?.loading,
+                error: this.trackSceneRenderer?.error || null,
+                ...(this.trackSceneRenderer?.stats || {}),
+            } : null,
             renderStats,
             textureStats: tex,
             occlusionStats: occ,
@@ -7245,13 +7702,97 @@ export class App {
         ].join('\n');
     }
 
+    _buildAssetInspectorClipboardReport(report) {
+        const src = report || {};
+        const jsonSafe = (value) => {
+            try { return JSON.parse(JSON.stringify(value)); } catch { return null; }
+        };
+        const selected = src.selected ? jsonSafe(src.selected) : null;
+        if (selected?.identity) {
+            selected.identity.materialSignaturePresent = !!selected.identity.materialSig;
+            delete selected.identity.materialSig;
+        }
+        const selectedRaw = selected?.material?.raw;
+        if (selectedRaw && selectedRaw.submesh && selectedRaw.effective
+            && JSON.stringify(selectedRaw.submesh) === JSON.stringify(selectedRaw.effective)) {
+            selectedRaw.effectiveAlias = 'submesh';
+            delete selectedRaw.effective;
+        }
+        if (selectedRaw && selectedRaw.entry && selectedRaw.submesh
+            && JSON.stringify(selectedRaw.entry) === JSON.stringify(selectedRaw.submesh)) {
+            selectedRaw.entryAlias = 'submesh';
+            delete selectedRaw.entry;
+        }
+        const nearby = (Array.isArray(src.nearby) ? src.nearby : []).map((record) => {
+            const r = jsonSafe(record) || {};
+            if (r.identity) {
+                r.identity.materialSignaturePresent = !!r.identity.materialSig;
+                delete r.identity.materialSig;
+            }
+            const textureEntries = Object.entries(r.textures || {});
+            const slotsWhere = (predicate) => textureEntries.filter(([, value]) => predicate(value || {})).map(([slot]) => slot);
+            const textureStatus = {
+                declaredSlots: slotsWhere((value) => !!value.rel),
+                residentSlots: slotsWhere((value) => value.state === 'resident'),
+                pendingSlots: slotsWhere((value) => !!value.rel && !['resident', 'missing404', 'rejected'].includes(value.state)),
+                missingFromIndexSlots: slotsWhere((value) => !!value.missingFromIndex),
+                missing404Slots: slotsWhere((value) => !!value.missing404),
+                rejectedSlots: slotsWhere((value) => !!value.rejected),
+            };
+            return {
+                pick: r.pick || null,
+                identity: r.identity || null,
+                instance: r.instance ? {
+                    index: r.instance.index ?? null,
+                    count: r.instance.count ?? null,
+                    strideFloats: r.instance.strideFloats ?? null,
+                    metadataLayout: r.instance.metadataLayout || null,
+                    dataPosition: r.instance.dataPosition || null,
+                    centerData: r.instance.centerData || null,
+                } : null,
+                mesh: r.mesh || null,
+                material: r.material ? {
+                    shaderName: r.material.shaderName || null,
+                    shaderFamily: r.material.shaderFamily || null,
+                    renderBucket: r.material.renderBucket ?? null,
+                    alphaModeInt: r.material.alphaModeInt ?? null,
+                } : null,
+                textures: textureStatus,
+                culling: r.culling || null,
+            };
+        });
+        return {
+            schema: 'webglgta-demo-asset-pick-clipboard-v3',
+            timeIso: src.timeIso || new Date().toISOString(),
+            copyFormat: {
+                selected: 'complete',
+                nearby: 'compact-diagnostic-records',
+                omittedRedundantFields: [
+                    'selected.identity.materialSig (same material is expanded in selected.material.raw)',
+                    'selected.material.raw exact duplicates are represented by entryAlias/effectiveAlias',
+                    'nearby[*].identity.materialSig',
+                    'nearby[*].material.raw',
+                    'nearby[*] texture URLs/tier arrays/render-item parameters (slot status is retained)',
+                ],
+            },
+            click: jsonSafe(src.click),
+            selected,
+            nearby,
+            rendererStats: jsonSafe(src.rendererStats),
+            textureFrame: jsonSafe(src.textureFrame),
+            app: jsonSafe(src.app),
+        };
+    }
+
     async _copyAssetInspectorMetadata() {
-        const text = this._assetInspectorText || JSON.stringify(this._lastAssetInspectorReport || {}, null, 2);
+        const clipboardReport = this._buildAssetInspectorClipboardReport(this._lastAssetInspectorReport || {});
+        let text = JSON.stringify(clipboardReport, null, 2);
+        if (text.length > 40000) text = JSON.stringify(clipboardReport);
         if (!text) return false;
         try {
             await navigator.clipboard.writeText(text);
             if (this._assetInspectorCopyBtn) {
-                this._assetInspectorCopyBtn.textContent = 'Copied';
+                this._assetInspectorCopyBtn.textContent = `Copied ${text.length.toLocaleString()} chars`;
                 setTimeout(() => {
                     if (this._assetInspectorCopyBtn) this._assetInspectorCopyBtn.textContent = 'Copy metadata';
                 }, 900);
@@ -7292,6 +7833,7 @@ export class App {
         if (backdrop) backdrop.hidden = !nextOpen;
 
         if (nextOpen) {
+            this._syncVehiclePhysicsModeStatus();
             for (const key of Object.keys(this.keyState || {})) this.keyState[key] = false;
             if (Array.isArray(this._pedVelocityData)) {
                 this._pedVelocityData[0] = 0.0;
@@ -7673,27 +8215,21 @@ export class App {
             controlsRoot.addEventListener('input', () => this._scheduleSaveSettings());
         }
         const vehiclePhysicsMode = document.getElementById('vehiclePhysicsMode');
-        const vehiclePhysicsModeStatus = document.getElementById('vehiclePhysicsModeStatus');
-        const nurburgringStatus = document.getElementById('nurburgringStatus');
         const applyVehiclePhysicsMode = () => {
             const mode = this.vehicleController?.setPhysicsMode?.(vehiclePhysicsMode?.value) || 'gta';
             if (vehiclePhysicsMode) vehiclePhysicsMode.value = mode;
-            if (vehiclePhysicsModeStatus) {
-                const loaded = this.vehicleController?.vehicle?.assettoProfileStatus === 'loaded';
-                vehiclePhysicsModeStatus.textContent = mode === 'assetto'
-                    ? (loaded ? 'A local Assetto Corsa profile is active for this vehicle.' : 'Assetto Corsa profile baseline is active. A local profile is loaded automatically when available.')
-                    : 'GTA handling is active.';
-            }
+            this._syncVehiclePhysicsModeStatus();
             this._scheduleSaveSettings();
         };
         vehiclePhysicsMode?.addEventListener('change', applyVehiclePhysicsMode);
         applyVehiclePhysicsMode();
-        const trackLoaded = !!this.collisionWorld?.getDerivedRoadSpawn?.();
-        if (nurburgringStatus) nurburgringStatus.textContent = trackLoaded
-            ? 'Derived Nordschleife road is loaded with matching road contact.'
-            : 'Local derived track package not loaded.';
+        this._updateNurburgringStatus();
         document.getElementById('teleportNurburgring')?.addEventListener('click', () => {
+            if (this.multiplayer?.requestTrackTeleport?.()) return;
             if (!this.teleportToDerivedRoad()) console.warn('Nurburgring road package is not available. Generate it locally first.');
+        });
+        document.getElementById('returnToLegion')?.addEventListener('click', () => {
+            if (!this.multiplayer?.requestLegionRecovery?.()) this.returnToLegionSquare();
         });
         document.getElementById('closeSettings')?.addEventListener('click', () => this._setSettingsMenuOpen(false, { recapturePointer: true }));
         this._settingsBackdropEl?.addEventListener('click', () => this._setSettingsMenuOpen(false, { recapturePointer: true }));
@@ -8275,6 +8811,7 @@ export class App {
                 if (prev !== (this.forcedModelLod || null) && this.drawableStreamer) {
                     this.drawableStreamer._dirty = true;
                 }
+                this._syncTrackSceneQuality();
                 console.log(`Model LOD: ${this.forcedModelLod ?? 'auto'}`);
                 this._scheduleSaveSettings();
             };
@@ -8309,7 +8846,7 @@ export class App {
                     } else if (q === 'medium') {
                         this.textureStreamer.setCacheCaps({
                             maxTextures: constrainedDevice ? 2048 : 3072,
-                            maxBytes: constrainedDevice ? (256 * 1024 * 1024) : (384 * 1024 * 1024),
+                            maxBytes: constrainedDevice ? (384 * 1024 * 1024) : (512 * 1024 * 1024),
                         });
                         this.textureStreamer.setStreamingConfig({
                             maxLoadsInFlight: constrainedDevice ? 4 : 6,
@@ -8333,13 +8870,13 @@ export class App {
                             maxBytes: constrainedDevice ? (256 * 1024 * 1024) : (384 * 1024 * 1024),
                         });
                         this.textureStreamer.setStreamingConfig({
-                            maxLoadsInFlight: constrainedDevice ? 3 : 4,
-                            maxNewLoadsPerFrame: constrainedDevice ? 6 : 8,
+                            maxLoadsInFlight: constrainedDevice ? 5 : 6,
+                            maxNewLoadsPerFrame: constrainedDevice ? 10 : 12,
                         });
                         this.textureStreamer.setDistanceTierConfig({
                             highDist: 0,
                             mediumDist: constrainedDevice ? 80 : 120,
-                            minResidentMs: constrainedDevice ? 4000 : 8000,
+                            minResidentMs: constrainedDevice ? 12000 : 18000,
                         });
                     }
                 }
@@ -8359,6 +8896,7 @@ export class App {
                     }
                     this.textureStreamer?.endFrame?.();
                 } catch { /* ignore */ }
+                this._syncTrackSceneQuality();
                 console.log(`Texture quality: ${q}`);
                 this._scheduleSaveSettings();
             };
@@ -9073,7 +9611,9 @@ export class App {
     resize() {
         // Keep CSS at native size while reducing the demo's internal pixel count.
         // This cuts fragment shading and texture bandwidth without touching world geometry.
-        const scale = this.spawnDistrictDemo ? SPAWN_DEMO_RENDER_SCALE : 1.0;
+        const scale = this._activeWorldExpansion?.id === 'nordschleife'
+            ? 1.0
+            : (this.spawnDistrictDemo ? SPAWN_DEMO_RENDER_SCALE : 1.0);
         this.renderScale = scale;
         this.canvas.width = Math.max(1, Math.round(window.innerWidth * scale));
         this.canvas.height = Math.max(1, Math.round(window.innerHeight * scale));
@@ -9132,8 +9672,8 @@ export class App {
         try {
             const prompt = this.vehicleController?.getPrompt?.() || '';
             if (this._vehiclePromptEl) {
-                this._vehiclePromptEl.textContent = prompt;
-                this._vehiclePromptEl.hidden = !prompt;
+                if (this._vehiclePromptEl.textContent !== prompt) this._vehiclePromptEl.textContent = prompt;
+                if (this._vehiclePromptEl.hidden !== !prompt) this._vehiclePromptEl.hidden = !prompt;
             }
         } catch { /* ignore */ }
         try { this.weaponController?.update?.(dt); } catch { /* ignore */ }
@@ -9243,7 +9783,7 @@ export class App {
         // Pump its focused mesh queue here so that guard cannot stall loading.
         try { this.playerModelRenderer?.pumpMeshLoadsOnce?.(); } catch { /* ignore */ }
         try {
-            if (this.npcSystem) this.npcSystem.enabled = !!(this.showNpcs && this.spawnDistrictDemo);
+            if (this.npcSystem) this.npcSystem.enabled = !!(this.showNpcs && this.spawnDistrictDemo && this._isCityWorldStreamingActive());
             this._measureDrivingPhase('npcSimulation', () => this.npcSystem?.update?.(dt));
         } catch (error) { this._reportNpcPipelineError('simulation/network interpolation', error); }
         try { this._measureDrivingPhase('npcMeshSync', () => this._syncNpcEntityMeshes(false)); }
@@ -9273,13 +9813,13 @@ export class App {
         try { this.gameplayPersistence?.update?.(this, this.runtimeGameplayManifest); } catch { /* ignore */ }
 
         // Stream entities based on camera (client-like chunk loading)
-        if (this.entityReady && this.showEntityDots) {
+        if (this._isCityWorldStreamingActive() && this.entityReady && this.showEntityDots) {
             const center = this._getStreamingFocusDataPos();
             this.entityStreamer.update(this.camera, this.entityRenderer, center);
         }
 
         // Stream drawables based on camera (requires exported meshes manifest)
-        if (this.showModels && this.modelsInitialized) {
+        if (this._isCityWorldStreamingActive() && this.showModels && this.modelsInitialized) {
             const center = this._getStreamingFocusDataPos();
             try { this.entityStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
             try { this.drawableStreamer?.setTimeWeather?.({ hour: this.timeOfDayHours, weather: this.weatherType }); } catch { /* ignore */ }
@@ -9376,7 +9916,7 @@ export class App {
                 this.gameplayPersistence?.getStatusLine?.() || '',
             ].filter(Boolean).join('\n');
 
-            this._streamDebugEl.textContent =
+            const streamDebugText =
                 `${spawnLine}\n` +
                 `${districtLine}\n` +
                 `${charLine}\n` +
@@ -9391,6 +9931,7 @@ export class App {
                 `World meshes: ready=${worldMeshLoads?.completed ?? 0} queued=${worldMeshLoads?.queued ?? 0} deferred=${worldMeshLoads?.deferred ?? 0} inFlight=${worldMeshLoads?.inFlight ?? 0} failed=${worldMeshLoads?.failed ?? 0} ` +
                 `draws=${worldRenderStats?.drawCalls ?? 0} instances=${worldRenderStats?.instances ?? 0} items=${worldRenderStats?.drawItems ?? 0}\n` +
                 covLine;
+            if (this._streamDebugEl.textContent !== streamDebugText) this._streamDebugEl.textContent = streamDebugText;
         }
 
         // Live camera coords HUD (copy/paste friendly)
@@ -9432,9 +9973,10 @@ export class App {
             const meshBounds = footBounds
                 ? `${Number(footBounds.minZ).toFixed(3)}..${Number(footBounds.maxZ).toFixed(3)}`
                 : 'n/a';
-            this._pedDebugEl.textContent = `Z savedRoot=${dz} | heightmap raw=${hz} visual=${hvz} | YBN raw=${ryz} aligned=${yz} offset=${yoff} | selectedFloor=${gz} | demo=${dgz} | interiorFloor=${iz} | finalEye=${d.finalZ.toFixed(2)} | meshFoot=${meshFoot} bounds=${meshBounds} anchors=${playerMeshStatus?.footAnchorEntries || 0} | ${mode}${blocked}`;
+            const pedDebugText = `Z savedRoot=${dz} | heightmap raw=${hz} visual=${hvz} | YBN raw=${ryz} aligned=${yz} offset=${yoff} | selectedFloor=${gz} | demo=${dgz} | interiorFloor=${iz} | finalEye=${d.finalZ.toFixed(2)} | meshFoot=${meshFoot} bounds=${meshBounds} anchors=${playerMeshStatus?.footAnchorEntries || 0} | ${mode}${blocked}`;
+            if (this._pedDebugEl.textContent !== pedDebugText) this._pedDebugEl.textContent = pedDebugText;
         } else if (updateDebugHud && this._pedDebugEl) {
-            this._pedDebugEl.textContent = '';
+            if (this._pedDebugEl.textContent) this._pedDebugEl.textContent = '';
         }
 
         // Persist view state so refresh restores quickly.
@@ -9595,19 +10137,24 @@ export class App {
             });
         }
 
-        if (this.trackSceneRenderer?.ready && this.trackSceneRenderer.models?.length) {
+        if (this._activeWorldExpansion?.id === 'nordschleife' && this.trackSceneRenderer?.ready && this.trackSceneRenderer.models?.length) {
             try {
                 this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
                 this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-                this.trackSceneRenderer.render(this.camera.viewProjectionMatrix, { fastStateRestore: !!this.spawnDistrictDemo });
+                // Full-detail TNM v4 sectors carry their authored AABBs, so
+                // off-camera grandstands/forest sectors no longer consume the
+                // frame budget while driving the circuit.
+                this.trackSceneRenderer.render(this.camera.viewProjectionMatrix, { fastStateRestore: !!this.spawnDistrictDemo, frustumCulling: true });
             } catch (error) {
                 console.warn('Track scene render failed:', error);
             }
         }
 
-        // Draw the collision/drive ribbon last so it remains visible while
-        // visual-track sectors stream or contain coarser clustered geometry.
-        if (this.trackRoadRenderer?.ready && this.trackRoadRenderer.vertexCount > 0) {
+        // This opaque ribbon is collision/fallback geometry. Do not draw it
+        // over the imported road after the principal visual sector is ready.
+        const fullTrackPrimaryVisible = !!this.trackSceneRenderer?.stats?.primaryLoaded
+            && (this.trackSceneRenderer?.models?.length || 0) > 0;
+        if (this._activeWorldExpansion?.id === 'nordschleife' && !fullTrackPrimaryVisible && this.trackRoadRenderer?.ready && this.trackRoadRenderer.vertexCount > 0) {
             try {
                 this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
                 this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -9643,12 +10190,45 @@ export class App {
         }
 
         // Render real models
-        if (this.showModels && this.modelsInitialized && this.instancedModelRenderer?.ready) {
+        if (this._isCityWorldStreamingActive() && this.showModels && this.modelsInitialized && this.instancedModelRenderer?.ready) {
+            const vehicleSpeedForCulling = Math.abs(Number(this.vehicleController?.vehicle?.speed) || 0.0);
+            const activelyDriving = !!this.vehicleController?.inVehicle && vehicleSpeedForCulling > 1.0;
+            if (activelyDriving) this._drivingCullGraceUntilMs = performance.now() + 1400.0;
+            // The static-supermesh compiler preserves complete material groups,
+            // but dense city cells can still exceed a particular GPU's draw-call
+            // budget. Use the previous frame's wall time as a conservative
+            // governor: it only yields far, whole groups through the existing
+            // safe budget path and ramps detail back in once the frame recovers.
+            const previousFrameMs = Math.max(0, Number(this._cpuFrameMs || this._perfDtMs) || 0);
+            let adaptiveDrawBudget = Math.max(
+                360,
+                Math.min(SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS, Number(this._adaptiveDrawBudget) || SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS),
+            );
+            if (this.spawnDistrictDemo && activelyDriving) {
+                if (previousFrameMs > 30.0) adaptiveDrawBudget -= 96;
+                else if (previousFrameMs > 22.0) adaptiveDrawBudget -= 48;
+                else if (previousFrameMs < 17.0) adaptiveDrawBudget += 16;
+                adaptiveDrawBudget = Math.max(360, Math.min(SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS, adaptiveDrawBudget));
+                this._adaptiveDrawBudget = adaptiveDrawBudget;
+            } else if (this.spawnDistrictDemo) {
+                // At rest the local district is a fixed residency set. Holding a
+                // stable draw budget prevents whole material groups from pulsing
+                // in and out solely because the previous frame included an upload.
+                adaptiveDrawBudget = SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS;
+                this._adaptiveDrawBudget = adaptiveDrawBudget;
+            }
+            // Camera-relative cull decisions are prone to threshold chatter at
+            // speed. Keep a small hysteresis window after a vehicle settles so
+            // facades, prop groups, and alpha details do not pop in/out while
+            // the chase camera is still easing into its final position.
+            const drivingCullStabilityMode = this.spawnDistrictDemo
+                && performance.now() < (Number(this._drivingCullGraceUntilMs) || 0.0);
             // CPU HZB uses synchronous readPixels. Automatically enabling it
             // while driving introduced a GPU/CPU synchronization point every
             // other frame, exactly when stable frame pacing matters most.
             // Keep it available as an explicit diagnostic toggle only.
-            const useOcclusionCulling = !!this.enableOcclusionCulling
+            const useOcclusionCulling = !drivingCullStabilityMode
+                && !!this.enableOcclusionCulling
                 && !this._occlusionReadbackUnsupported;
             // Optional occlusion depth prepass into an offscreen depth buffer.
             // This MUST happen before we ask InstancedModelRenderer to cull by depth.
@@ -9729,13 +10309,19 @@ export class App {
                 // Only baked supermesh cells have trustworthy spatial bounds. Cull
                 // those commands before submission while source archetypes fail open;
                 // this avoids the historical disappearing-road regression.
+                // Safe baked-cell bounds can still be CPU-culled while driving.
+                // The enlarged stability envelope below turns that into a
+                // conservative submission reduction rather than edge popping.
                 coarseFrustumCulling: !!this.spawnDistrictDemo,
                 coarseFrustumSafeOnly: !!this.spawnDistrictDemo,
                 // Per-instance shader culling is independent of the unsafe
                 // aggregate CPU culler. It keeps GPU work proportional to the
                 // camera frustum without rebuilding stream residency.
+                // GPU culling does not rebuild buffers or discard draw groups.
+                // Retain it while driving, but enlarge the edge envelope enough
+                // that objects have already been rendered before they enter view.
                 gpuFrustumCulling: !!this.spawnDistrictDemo,
-                gpuFrustumPadding: this.spawnDistrictDemo ? 12.0 : 0.0,
+                gpuFrustumPadding: this.spawnDistrictDemo ? (drivingCullStabilityMode ? 52.0 : 36.0) : 0.0,
                 // CPU HZB is only allowed for compact instance aggregates.
                 // Large roads/facades fail open and remain visible.
                 occlusionMaxAggregateRadius: this.spawnDistrictDemo ? 26.0 : 0.0,
@@ -9751,7 +10337,8 @@ export class App {
                 // Nearby surfaces retain material depth; distant surfaces become a
                 // diffuse-only far field. Texture mipmaps provide the stable painted
                 // appearance without changing geometry or gameplay collision.
-                primaryDiffuseOnly: false,
+                primaryDiffuseOnly: this.spawnDistrictDemo
+                    && String(this.textureStreamer?.quality || 'low').toLowerCase() === 'low',
                 projectionScalePx: Math.abs(Number(this.camera?.projectionMatrix?.[5]) || 0) * this.canvas.height * 0.5,
                 // Cull only verified compact, low-instance meshes once they are
                 // sub-pixel. Roads, buildings, and aggregate bounds fail open.
@@ -9777,7 +10364,7 @@ export class App {
                     ? SPAWN_DEMO_GROUP_BUDGET_MIN_DISTANCE
                     : Number.POSITIVE_INFINITY,
                 maxDrawItems: this.spawnDistrictDemo && this.safeDrawBudgetEnabled
-                    ? SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS
+                    ? adaptiveDrawBudget
                     : 0,
                 restoreFramebuffer: sceneFbo || null,
                 restoreViewportWidth: this.canvas.width,
@@ -9806,7 +10393,13 @@ export class App {
                 const prefetchLimit = highDemoQuality ? 256 : (this.spawnDistrictDemo ? (driving ? 48 : 96) : 64);
                 if (!this.objectsWireframeMode && now - this._lastTexPrefetchMs > prefetchIntervalMs) {
                     this._lastTexPrefetchMs = now;
-                    this._measureDrivingPhase('textureStreaming', () => this.instancedModelRenderer.prefetchDiffuseTextures?.(prefetchLimit, { includeSecondary: highDemoQuality }));
+                    this._measureDrivingPhase('textureStreaming', () => this.instancedModelRenderer.prefetchDiffuseTextures?.(prefetchLimit, {
+                        includeSecondary: highDemoQuality,
+                        // Boot intentionally hands off before every district material
+                        // has decoded. Skip already resident/loading entries so this
+                        // background pass advances through the complete local set.
+                        skipSettled: this.spawnDistrictDemo,
+                    }));
                 }
             } catch { /* ignore */ }
         }
@@ -10494,10 +11087,18 @@ export class App {
         }
 
         if (mesh) {
+            lines.push(
+                `Mesh residency: over=${this._formatBytes(mesh.overBudgetBytes ?? 0)} ` +
+                `hotKeep=${mesh.hotEvictionDeferrals ?? 0}`
+            );
             lines.push(`Mesh cache: count=${mesh.count ?? 0}  bytes≈${this._formatBytes(mesh.approxBytes ?? 0)} / ${this._formatBytes(mesh.maxBytes ?? 0)}  evict=${mesh.evictions ?? 0}`);
         }
         const meshLoads = this.instancedModelRenderer?.getMeshLoadStats?.() || null;
         if (meshLoads) {
+            lines.push(
+                `Texture warmup: sources=${meshLoads.prefetchSources ?? 0} scanned=${meshLoads.prefetchScanned ?? 0} ` +
+                `requested=${meshLoads.prefetchTouched ?? 0}`
+            );
             lines.push(
                 `Mesh queue: ready=${meshLoads.completed ?? 0} queued=${meshLoads.queued ?? 0} deferred=${meshLoads.deferred ?? 0} ` +
                 `scan=${meshLoads.priorityScanned ?? 0}/${Number(meshLoads.priorityMs || 0).toFixed(2)}ms sort=${Number(meshLoads.sortMs || 0).toFixed(2)}ms`
@@ -10534,31 +11135,83 @@ export class App {
                 `overlap=${overlapsWall ? 'yes' : 'no'} blocked=${grounding?.blocked ? 'yes' : 'no'} ` +
                 `reason=${grounding?.blockReason || 'none'}`
             );
+            const vehicleHit = this.collisionWorld?.lastVehicleCollision || null;
+            if (vehicleHit) {
+                const coords = [vehicleHit.x, vehicleHit.y].every(Number.isFinite)
+                    ? ` @ ${vehicleHit.x.toFixed(2)},${vehicleHit.y.toFixed(2)}`
+                    : '';
+                lines.push(
+                    `Vehicle collision: ${vehicleHit.source || 'collision'}:${vehicleHit.label || 'unknown'}` +
+                    `${vehicleHit.id ? ` id=${vehicleHit.id}` : ''}` +
+                    `${Number.isFinite(vehicleHit.triangleOffset) ? ` tri=${vehicleHit.triangleOffset}` : ''}` +
+                    coords
+                );
+            }
         }
 
         el.textContent = lines.join('\n');
     }
     
+    _reportFrameFault(phase, error) {
+        const message = String(error?.message || error || 'Unknown frame error');
+        const key = `${String(phase || 'unknown')}:${message}`;
+        const now = performance.now();
+        const previous = this._lastFrameFault;
+        // A persistent bad asset should remain diagnosable without allocating
+        // an error entry and logging a stack on every display frame.
+        if (previous?.key === key && now - previous.at < 5_000) return;
+        this._lastFrameFault = { key, at: now };
+        try {
+            globalThis.__viewerReportError?.({
+                subsystem: `frame.${String(phase || 'unknown')}`,
+                level: 'error',
+                message,
+                stack: error?.stack,
+            });
+        } catch { /* reporting must never break the frame loop */ }
+        try { console.error(`WebGL GTA ${String(phase || 'frame')} failure:`, error); } catch { /* ignore */ }
+    }
+
     animate() {
+        if (this._destroyed) return;
+        this._animationFrameId = 0;
         const frameStart = performance.now();
         const vehicleAtFrameStart = this.vehicleController?.vehicle || null;
-        this.drivingPerformance?.beginFrame?.({ driving: !!this.vehicleController?.inVehicle });
-        this.update();
+        try {
+            this.drivingPerformance?.beginFrame?.({ driving: !!this.vehicleController?.inVehicle });
+        } catch (error) {
+            this._reportFrameFault('metrics.begin', error);
+        }
+        try {
+            this.update();
+        } catch (error) {
+            // Do not let one malformed streamed asset permanently stop all rendering.
+            this._reportFrameFault('update', error);
+        }
         const renderStart = performance.now();
         this._cpuUpdateMs = renderStart - frameStart;
-        this.render();
+        try {
+            this._measureDrivingPhase('frameRender', () => this.render());
+        } catch (error) {
+            // Keep the prior frame visible and retry on the next animation tick.
+            this._reportFrameFault('render', error);
+        }
         const frameEnd = performance.now();
         this._cpuRenderMs = frameEnd - renderStart;
         this._cpuFrameMs = frameEnd - frameStart;
         const vehicle = this.vehicleController?.vehicle || vehicleAtFrameStart;
-        this.drivingPerformance?.endFrame?.({
-            cpuMs: this._cpuFrameMs,
-            gpuMs: this._gpuTimer?.lastMs,
-            speedMps: Math.abs(Number(vehicle?.speed) || 0),
-            drawCalls: this.instancedModelRenderer?.getRenderStats?.()?.drawCalls || 0,
-        });
-        this.drivingPerformance?.advanceBenchmarkWallTime?.(Math.max(0.001, this._perfDtMs / 1000));
-        requestAnimationFrame(() => this.animate());
+        try {
+            this.drivingPerformance?.endFrame?.({
+                cpuMs: this._cpuFrameMs,
+                gpuMs: this._gpuTimer?.lastMs,
+                speedMps: Math.abs(Number(vehicle?.speed) || 0),
+                drawCalls: this.instancedModelRenderer?.getRenderStats?.()?.drawCalls || 0,
+            });
+            this.drivingPerformance?.advanceBenchmarkWallTime?.(Math.max(0.001, this._perfDtMs / 1000));
+        } catch (error) {
+            this._reportFrameFault('metrics.end', error);
+        }
+        if (!this._destroyed) this._animationFrameId = requestAnimationFrame(() => this.animate());
     }
 
     /**
@@ -10566,6 +11219,20 @@ export class App {
      * (Not all browsers guarantee this runs, but it's cheap and helps long dev sessions.)
      */
     destroy() {
+        if (this._destroyed) return;
+        this._destroyed = true;
+        this._animationStarted = false;
+        if (this._animationFrameId) {
+            try { cancelAnimationFrame(this._animationFrameId); } catch { /* ignore */ }
+            this._animationFrameId = 0;
+        }
+        this._cancelStreamingRamp();
+        if (this._settingsSaveTimer) {
+            clearTimeout(this._settingsSaveTimer);
+            this._settingsSaveTimer = null;
+        }
+        try { clearTimeout(this._destinationTextureWarmup?.timer); } catch { /* ignore */ }
+        this._destinationTextureWarmup = null;
         try { this.gameplayPersistence?.save?.(this, this.runtimeGameplayManifest); } catch { /* ignore */ }
         try { this.multiplayer?.destroy?.(); } catch { /* ignore */ }
         try { this.audioSystem?.destroy?.(); } catch { /* ignore */ }
@@ -10589,8 +11256,22 @@ export class App {
 
 // Start after document load, or immediately when a cached module arrives after it.
 const startApplication = () => {
+    const existing = window.__viewerApp;
+    if (existing && !existing._destroyed) return existing;
+    if (window.__webglgtaBootStarting) return null;
+    window.__webglgtaBootStarting = true;
     const canvas = document.getElementById('glCanvas');
-    const app = new App(canvas);
+    if (!canvas) {
+        window.__webglgtaBootStarting = false;
+        console.error('WebGL GTA boot failed: #glCanvas is missing.');
+        return null;
+    }
+    let app;
+    try {
+        app = new App(canvas);
+    } finally {
+        window.__webglgtaBootStarting = false;
+    }
     // Tear down background workers when leaving the page.
     try {
         window.addEventListener('beforeunload', () => {

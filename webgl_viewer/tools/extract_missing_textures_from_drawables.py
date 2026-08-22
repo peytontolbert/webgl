@@ -94,8 +94,10 @@ def main() -> int:
     from export_drawables_for_chunk import _export_texture_png  # type: ignore
 
     missing_rows = json.loads(Path(args.missing).read_text(encoding="utf-8", errors="ignore"))
+    if isinstance(missing_rows, dict):
+        missing_rows = missing_rows.get("textures")
     if not isinstance(missing_rows, list):
-        raise SystemExit("--missing must be a JSON array")
+        raise SystemExit("--missing must be a JSON array or an object with a textures array")
 
     # Build desired texture hash set + slug map.
     need: Set[int] = set()

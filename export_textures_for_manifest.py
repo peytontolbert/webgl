@@ -16,6 +16,12 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
+
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.rpf_reader import RpfReader
 from gta5_modules.script_paths import auto_assets_dir
@@ -283,7 +289,7 @@ def _shard_path_for_hash(models_dir: Path, idx: dict, h_u32: int) -> Path:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
+    ap.add_argument("--game-path", default=(os.getenv("gta_location") or os.getenv("gta5_path") or ""), help="GTA5 install folder (or set gta_location/gta5_path)")
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
     ap.add_argument(
         "--selected-dlc",
@@ -403,27 +409,28 @@ def main():
         except Exception:
             dump_obj = None
         wanted_hashes: set[str] = set()
-        if isinstance(dump_obj, dict):
-            rows = dump_obj.get("textures")
-            if isinstance(rows, list):
-                for r in rows:
-                    if not isinstance(r, dict):
+        # Older audit tools emit {"textures": [...]}; the demo audit writes the
+        # texture rows directly as a JSON array. Both represent the same refs.
+        rows = dump_obj.get("textures") if isinstance(dump_obj, dict) else dump_obj
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                # Only consider missing rows; we want to fix the gaps.
+                if str(r.get("reason") or "") == "ok":
+                    continue
+                refs = r.get("refs")
+                if not isinstance(refs, list):
+                    continue
+                for ref in refs:
+                    if not isinstance(ref, dict):
                         continue
-                    # Only consider missing rows; we want to fix the gaps.
-                    if str(r.get("reason") or "") == "ok":
+                    ah = ref.get("archetype_hash")
+                    if ah is None:
                         continue
-                    refs = r.get("refs")
-                    if not isinstance(refs, list):
-                        continue
-                    for ref in refs:
-                        if not isinstance(ref, dict):
-                            continue
-                        ah = ref.get("archetype_hash")
-                        if ah is None:
-                            continue
-                        s = str(ah).strip()
-                        if s:
-                            wanted_hashes.add(s)
+                    s = str(ah).strip()
+                    if s:
+                        wanted_hashes.add(s)
         if wanted_hashes:
             keys = [k for k in keys if str(k) in wanted_hashes]
             print(f"[target] --only-from-dump={dump_path} -> archetypes={len(wanted_hashes)} manifestKeysSelected={len(keys)}")

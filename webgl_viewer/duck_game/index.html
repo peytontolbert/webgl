@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Duck Game — Nexus Arcade</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <main class="arcade" aria-label="Duck Game arcade">
+      <header><span>NEXUS ARCADE</span><strong>DUCK GAME</strong><span id="status">ARROWS / WASD · SPACE TO FIRE</span></header>
+      <canvas id="game" width="960" height="540" aria-label="Duck Game arena"></canvas>
+      <section id="match-menu" class="match-menu" aria-label="Match setup">
+        <div class="menu-card">
+          <p class="eyebrow">NEXUS ARCADE</p>
+          <h1>DUCK GAME</h1>
+          <label>Deathmatch map <select id="map-select" aria-label="Deathmatch map"></select></label>
+          <p id="map-preview-label" class="map-preview-label">Loading map preview…</p>
+          <div class="menu-options">
+            <label>CPU opponents <select id="cpu-select" aria-label="CPU opponents"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
+            <label>Wins to take match <select id="wins-select" aria-label="Wins to take match"><option value="5">5</option><option value="8" selected>8</option><option value="10">10</option></select></label>
+          </div>
+          <button id="start-match" disabled>Loading maps…</button>
+          <p class="menu-help">WASD / arrows to move · Space to fire · Escape opens this menu.</p>
+        </div>
+      </section>
+      <footer><button id="restart">New round</button><button id="open-menu">Match setup</button><span id="match-note">Deathmatch · first duck to 8 wins.</span></footer>
+    </main>
+    <script type="module" src="./game.js"></script>
+  </body>
+</html>

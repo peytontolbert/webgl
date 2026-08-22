@@ -32,7 +32,17 @@ def _load_bounds_from_terrain_info(output_dir: Path) -> Optional[Tuple[float, fl
         return None
     try:
         info = json.loads(info_path.read_text(encoding="utf-8", errors="ignore"))
-        gb = info.get("global_bounds") or {}
+        # The viewer renders a single main-map terrain raster. `global_bounds` includes Cayo
+        # Perico as well, which shifts main-map collision samples into the wrong world area.
+        dimensions = info.get("dimensions") or {}
+        all_bounds = info.get("bounds") or {}
+        preferred = str(info.get("render_heightmap_key") or "")
+        if not preferred or preferred not in all_bounds:
+            for key in dimensions:
+                if "heistisland" not in str(key).lower() and key in all_bounds:
+                    preferred = str(key)
+                    break
+        gb = all_bounds.get(preferred) or {}
         return (
             float(gb["min_x"]),
             float(gb["min_y"]),
@@ -54,6 +64,8 @@ def main() -> int:
     ap.add_argument("--z-above", type=float, default=2500.0, help="Ray start height above max_z")
     ap.add_argument("--max-dist", type=float, default=15000.0, help="Ray max distance")
     ap.add_argument("--ybn-only", action="store_true", help="Ignore entity-only hits (recommended)")
+    ap.add_argument("--collision-load-passes", type=int, default=20, help="CodeWalker cache-drain retries for each newly visited collision area")
+    ap.add_argument("--min-hit-ratio", type=float, default=0.05, help="Reject a bake below this collision hit ratio")
     ap.add_argument("--upscale", type=int, default=2048, help="If >0, upscale output to this max dimension for nicer viewer rendering")
     args = ap.parse_args()
 
@@ -88,7 +100,14 @@ def main() -> int:
         y = min_y + (max_y - min_y) * (iy / float(h - 1))
         for ix in range(w):
             x = min_x + (max_x - min_x) * (ix / float(w - 1))
-            res = dll.raycast_down(x, y, z_start=z0, max_dist=max_dist, ybn_only=bool(args.ybn_only))
+            res = dll.raycast_down(
+                x,
+                y,
+                z_start=z0,
+                max_dist=max_dist,
+                ybn_only=bool(args.ybn_only),
+                collision_load_passes=int(args.collision_load_passes),
+            )
             if res and res.get("hit"):
                 out[iy, ix] = float(res["z"])
                 hits += 1
@@ -97,6 +116,13 @@ def main() -> int:
             done = (iy + 1) * w
             pct = 100.0 * done / float(total)
             print(f"[collision_heightmap] {iy+1}/{h} rows, hits={hits}/{done} ({pct:.1f}%)")
+
+    hit_ratio = hits / float(total)
+    if hit_ratio < max(0.0, float(args.min_hit_ratio)):
+        raise SystemExit(
+            f"Collision bake rejected: {hits}/{total} hits ({hit_ratio:.2%}) is below "
+            f"--min-hit-ratio={float(args.min_hit_ratio):.2%}. Existing viewer terrain was not changed."
+        )
 
     # Fill holes by simple nearest-neighbor along scanlines (cheap). If still NaN, clamp to min_z.
     # (Most misses happen over water/outside collision coverage.)
@@ -121,10 +147,27 @@ def main() -> int:
 
     out = np.nan_to_num(out, nan=float(min_z), posinf=float(max_z), neginf=float(min_z))
 
-    # Normalize to 0..255 based on global bounds.
+    # Normalize to the selected main-map range. Write U16 first because the viewer prefers
+    # that exact format over PNG and browser image decode is effectively 8-bit.
     denom = max(1e-6, float(max_z - min_z))
     hm01 = (out - float(min_z)) / denom
     hm01 = np.clip(hm01, 0.0, 1.0)
+    u16 = np.round(hm01 * 65535.0).astype("<u2")
+    u16_path = output_dir / "heightmap_collision_u16.bin"
+    u16_path.write_bytes(u16.tobytes(order="C"))
+    (output_dir / "heightmap_collision_u16.json").write_text(
+        json.dumps(
+            {
+                "width": int(w),
+                "height": int(h),
+                "file": u16_path.name,
+                "endian": "little",
+                "source": "codewalker_world_space_ybn_collision",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     img = np.round(hm01 * 255.0).astype(np.uint8)
 
     # Optional upscale for viewer quality.
@@ -146,6 +189,7 @@ def main() -> int:
         raise SystemExit(f"Failed to write PNG (need opencv-python): {e}")
 
     print(f"Wrote collision heightmap: {out_path} (base={w}x{h}, hits={hits}/{total})")
+    print(f"Wrote collision heightmap U16: {u16_path}")
     return 0
 
 

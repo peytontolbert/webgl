@@ -20,6 +20,12 @@ import json
 import os
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
+
 from gta5_modules.dll_manager import DllManager
 from gta5_modules.rpf_reader import RpfReader
 from gta5_modules.script_paths import auto_assets_dir
@@ -36,7 +42,7 @@ def _as_u32(s: str):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--game-path", default=os.getenv("gta_location", ""), help="GTA5 install folder (or set gta_location)")
+    ap.add_argument("--game-path", default=(os.getenv("gta_location") or os.getenv("gta5_path") or ""), help="GTA5 install folder (or set gta_location/gta5_path)")
     ap.add_argument("--assets-dir", default="", help="webgl_viewer/assets folder (auto if omitted)")
     ap.add_argument("--max-meshes", type=int, default=0, help="Limit number of meshes processed (0 = all)")
     ap.add_argument("--only-missing", action="store_true", help="Only write textures/material fields when material.diffuse is missing")

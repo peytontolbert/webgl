@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 import time
@@ -187,6 +188,7 @@ def main() -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    logging.disable(logging.CRITICAL)
     dm = DllManager(gta_path)
     if not getattr(dm, "initialized", False):
         raise SystemExit("DllManager failed to init.")

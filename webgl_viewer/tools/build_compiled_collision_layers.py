@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--ybn-manifest", type=Path, required=True)
     parser.add_argument("--asset-manifest", type=Path, required=True)
     parser.add_argument("--nurburgring-meta", type=Path, required=True)
+    parser.add_argument("--descriptor", type=Path)
     args = parser.parse_args()
     ybn = json.loads(args.ybn_manifest.read_text(encoding="utf-8"))
     assets = json.loads(args.asset_manifest.read_text(encoding="utf-8"))
@@ -55,6 +56,10 @@ def main() -> None:
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    if args.descriptor:
+        descriptor = json.loads(args.descriptor.read_text(encoding="utf-8"))
+        descriptor["compiledCollisionManifestFile"] = "collision/compiled/layers.json"
+        args.descriptor.write_text(json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"out": str(args.out), "static_chunks": ybn["chunk_count"], "asset_chunks": len(assets["chunks"]), "nurburgring_sha256": output["expansions"][0]["binary_sha256"]}, indent=2))
 
 

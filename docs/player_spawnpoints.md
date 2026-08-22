@@ -1,5 +1,9 @@
 # Player spawnpoints from CodeWalker (for FiveM-style spawning)
 
+For the browser runtime root/eye coordinate contract, YBN alignment, diagnostics,
+and the under-road regression runbook, see
+[Browser Spawn Grounding Regression](spawn_grounding_regression.md).
+
 GTA V base `.ymap` files **do not** contain a dedicated “player spawnpoint list” like FiveM’s `spawnpoint` map directive.
 
 So the practical approach is:

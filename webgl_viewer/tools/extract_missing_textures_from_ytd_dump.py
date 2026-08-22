@@ -147,7 +147,7 @@ def _pixels_to_image_rgba(pixels: bytes, width: int, height: int) -> Image.Image
     """
     Convert CodeWalker DDSIO.GetPixels output into a PIL Image.
 
-    DDSIO.GetPixels typically returns a tightly packed pixel buffer in RGB or RGBA.
+    DDSIO.GetPixels returns tightly packed Windows-style BGR/BGRA rows.
     """
     if not pixels:
         raise ValueError("empty pixels")
@@ -155,13 +155,13 @@ def _pixels_to_image_rgba(pixels: bytes, width: int, height: int) -> Image.Image
     exp_rgba = width * height * 4
     exp_rgb = width * height * 3
     if n == exp_rgba:
-        return Image.frombytes("RGBA", (width, height), pixels)
+        return Image.frombytes("RGBA", (width, height), pixels, "raw", "BGRA")
     if n == exp_rgb:
-        img = Image.frombytes("RGB", (width, height), pixels)
+        img = Image.frombytes("RGB", (width, height), pixels, "raw", "BGR")
         return img.convert("RGBA")
     # Best-effort: if buffer is larger, try truncating to expected RGBA.
     if n > exp_rgba:
-        return Image.frombytes("RGBA", (width, height), pixels[:exp_rgba])
+        return Image.frombytes("RGBA", (width, height), pixels[:exp_rgba], "raw", "BGRA")
     raise ValueError(f"unexpected pixel buffer size={n} (expected {exp_rgb} or {exp_rgba})")
 
 
@@ -252,11 +252,19 @@ def _regen_models_textures_index(models_textures_dir: Path) -> None:
     """
     Regenerate assets/models_textures/index.json (same schema as setup_assets.py).
     """
-    re_hash_only = re.compile(r"^(?P<hash>\d+)\.(png|dds)$", re.IGNORECASE)
-    re_hash_slug = re.compile(r"^(?P<hash>\d+)_(?P<slug>[^/]+)\.(png|dds)$", re.IGNORECASE)
+    # Keep this aligned with setup_assets._ensure_models_textures_index. The
+    # runtime can resolve every one of these formats, and omitting WebP/JPEG
+    # from a repair index makes valid preprocessed demo textures disappear.
+    texture_exts = ("png", "dds", "jpg", "jpeg", "webp")
+    ext_re = "|".join(texture_exts)
+    re_hash_only = re.compile(rf"^(?P<hash>\d+)\.({ext_re})$", re.IGNORECASE)
+    re_hash_slug = re.compile(rf"^(?P<hash>\d+)_(?P<slug>[^/]+)\.({ext_re})$", re.IGNORECASE)
     by_hash: Dict[str, dict] = {}
 
-    for p in sorted(list(models_textures_dir.glob("*.png")) + list(models_textures_dir.glob("*.dds"))):
+    paths = []
+    for ext in texture_exts:
+        paths.extend(models_textures_dir.glob(f"*.{ext}"))
+    for p in sorted(paths):
         name = p.name
         m1 = re_hash_only.match(name)
         m2 = re_hash_slug.match(name) if not m1 else None
@@ -286,7 +294,19 @@ def _regen_models_textures_index(models_textures_dir: Path) -> None:
     out_path = models_textures_dir / "index.json"
     tmp_path = models_textures_dir / "index.json.tmp"
     tmp_path.write_text(json.dumps(out, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(out_path)
+    # Windows can momentarily retain an open handle from the dev server after
+    # it served the old index. Retrying keeps the repair atomic and avoids
+    # leaving a partial index in the browser's hot-reload path.
+    last_error = None
+    for attempt in range(8):
+        try:
+            tmp_path.replace(out_path)
+            return
+        except PermissionError as error:
+            last_error = error
+            time.sleep(0.15 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
 
 def _u32_from_metahash(mh) -> int:
     """
@@ -312,39 +332,95 @@ def _try_find_texture_in_drawable(gfc, arche, texhash_u32: int):
     Try to find a texture via the drawable's embedded texture dictionaries:
       - drawable.TextureDictionary
       - drawable.ShaderGroup.TextureDictionary
+      - direct YDR/YFT/YDD assets when CodeWalker's TryGetDrawable has no
+        ready drawable for an archetype
     This mirrors CodeWalker paths in Drawable.cs where shadergroup dictionaries can override.
     """
     if gfc is None or arche is None:
         return None
-    drawable = None
+
+    def _load_game_file(game_file):
+        if game_file is None:
+            return None
+        try:
+            gfc.LoadFile(game_file)
+        except Exception:
+            pass
+        try:
+            _ensure_loaded(gfc, game_file, max_loops=160)
+        except Exception:
+            pass
+        return game_file
+
+    def _lookup_drawable(drawable):
+        if drawable is None:
+            return None
+        try:
+            shader_group = getattr(drawable, "ShaderGroup", None)
+            shader_textures = getattr(shader_group, "TextureDictionary", None) if shader_group is not None else None
+            texture = _try_lookup_texture_in_texture_dict(shader_textures, texhash_u32)
+            if texture is not None:
+                return texture
+        except Exception:
+            pass
+        try:
+            texture = _try_lookup_texture_in_texture_dict(getattr(drawable, "TextureDictionary", None), texhash_u32)
+            if texture is not None:
+                return texture
+        except Exception:
+            pass
+        return None
+
+    drawables = []
     try:
         drawable = gfc.TryGetDrawable(arche)
-    except Exception:
-        drawable = None
-    if drawable is None:
-        return None
-    # Ensure drawable is loaded by pumping content thread a bit.
-    try:
-        _ensure_loaded(gfc, drawable, max_loops=160)
+        if drawable is not None:
+            drawables.append(drawable)
     except Exception:
         pass
-    # 1) ShaderGroup.TextureDictionary
-    try:
-        sg = getattr(drawable, "ShaderGroup", None)
-        td = getattr(sg, "TextureDictionary", None) if sg is not None else None
-        tex = _try_lookup_texture_in_texture_dict(td, texhash_u32)
-        if tex is not None:
-            return tex
-    except Exception:
-        pass
-    # 2) Drawable.TextureDictionary
-    try:
-        td2 = getattr(drawable, "TextureDictionary", None)
-        tex2 = _try_lookup_texture_in_texture_dict(td2, texhash_u32)
-        if tex2 is not None:
-            return tex2
-    except Exception:
-        pass
+
+    # CodeWalker does not always materialize TryGetDrawable for an archetype,
+    # despite its authored asset being available in the game-file cache.
+    asset_hash = _u32_from_metahash(getattr(arche, "AssetName", None))
+    asset_name = str(getattr(arche, "AssetName", "") or "").strip().lower()
+    if asset_hash:
+        for getter, path in (("GetYdr", ("Drawable",)), ("GetYft", ("Fragment", "Drawable"))):
+            try:
+                value = _load_game_file(getattr(gfc, getter)(asset_hash))
+                for attribute in path:
+                    value = getattr(value, attribute, None) if value is not None else None
+                if value is not None:
+                    drawables.append(value)
+            except Exception:
+                pass
+
+    # Super-LOD and MLO archetypes name a YDD through DrawableDict.
+    drawable_dict_hash = _u32_from_metahash(getattr(arche, "DrawableDict", None))
+    if drawable_dict_hash:
+        try:
+            ydd = _load_game_file(gfc.GetYdd(drawable_dict_hash))
+            for candidate in list(getattr(ydd, "Drawables", None) or []):
+                if candidate is None:
+                    continue
+                candidate_name = str(getattr(candidate, "Name", "") or "").strip().lower()
+                if not asset_name or candidate_name == asset_name:
+                    drawables.append(candidate)
+        except Exception:
+            pass
+
+    seen = set()
+    for drawable in drawables:
+        key = id(drawable)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            _ensure_loaded(gfc, drawable, max_loops=160)
+        except Exception:
+            pass
+        texture = _lookup_drawable(drawable)
+        if texture is not None:
+            return texture
     return None
 
 
@@ -515,6 +591,10 @@ def main() -> int:
                     txdhash = _u32_from_metahash(getattr(arche, "TextureDict", None))
                 except Exception:
                     txdhash = 0
+            # Keep the owning TXD separate from the HD-parent lookup hash below.
+            # A number of GTA LOD materials intentionally live only in the base
+            # dictionary even when that dictionary has an HD sibling.
+            owner_txdhash = int(txdhash) & 0xFFFFFFFF
 
             ytd = None
             # CodeWalker parity: apply HD-TXD mapping first, then try base.
@@ -573,6 +653,10 @@ def main() -> int:
                                     y0 = None
                                 if y0 is None:
                                     continue
+                                try:
+                                    gfc.LoadFile(y0)
+                                except Exception:
+                                    pass
                                 if not _ensure_loaded(gfc, y0, max_loops=80):
                                     continue
                                 td0 = getattr(y0, "TextureDict", None)
@@ -589,6 +673,10 @@ def main() -> int:
                 tex = None
 
             if ytd is not None:
+                try:
+                    gfc.LoadFile(ytd)
+                except Exception:
+                    pass
                 if not _ensure_loaded(gfc, ytd, max_loops=160):
                     failed += 1
                     continue
@@ -618,6 +706,30 @@ def main() -> int:
                             tex = gfc.TryFindTextureInParent(h, txdhash)
                     except Exception:
                         tex = None
+                if tex is None and owner_txdhash:
+                    # The initial lookup is HD-first, matching the game for
+                    # normal materials.  Retry the owning base dictionary for
+                    # LOD textures, which are commonly absent from its HD YTD.
+                    try:
+                        base_ytd = gfc.GetYtd(owner_txdhash)
+                    except Exception:
+                        base_ytd = None
+                    if base_ytd is not None:
+                        try:
+                            gfc.LoadFile(base_ytd)
+                        except Exception:
+                            pass
+                        if _ensure_loaded(gfc, base_ytd, max_loops=160):
+                            base_td = getattr(base_ytd, "TextureDict", None)
+                            base_tex = _try_lookup_texture_in_texture_dict(base_td, h)
+                            if base_tex is not None:
+                                ytd = base_ytd
+                                td = base_td
+                                tex = base_tex
+                                try:
+                                    ytd_entry_path = str(_get_gamefile_entry_path_or_namelower(ytd) or "")
+                                except Exception:
+                                    ytd_entry_path = ""
                 if tex is None and arche is not None:
                     # Some drawables carry embedded texture dictionaries that the archetype TXD doesn't contain.
                     tex = _try_find_texture_in_drawable(gfc, arche, h)

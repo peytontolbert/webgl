@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,">
     <title>GTA5 Terrain Viewer</title>
     <style>
         body {
@@ -17,19 +18,57 @@
         }
         #controls {
             position: fixed;
-            top: 20px;
-            left: 20px;
-            background: rgba(0, 0, 0, 0.7);
-            padding: 10px;
-            border-radius: 5px;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(19, 22, 25, 0.97);
+            padding: 0 16px 18px;
             color: white;
             font-family: Arial, sans-serif;
-            z-index: 10;
-            width: 280px;
-            max-height: calc(100vh - 40px);
+            z-index: 101;
+            width: min(380px, calc(100vw - 32px));
             overflow-y: auto;
             overflow-x: hidden;
             -webkit-overflow-scrolling: touch;
+            border-left: 1px solid rgba(255,255,255,0.16);
+            box-shadow: -18px 0 48px rgba(0,0,0,0.38);
+        }
+        #controls[hidden], #settingsBackdrop[hidden] {
+            display: none;
+        }
+        #settingsBackdrop {
+            position: fixed;
+            inset: 0;
+            z-index: 100;
+            background: rgba(0, 0, 0, 0.62);
+        }
+        .settings-header {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin: 0 -16px 14px;
+            padding: 14px 16px;
+            background: #171a1d;
+            border-bottom: 1px solid rgba(255,255,255,0.14);
+        }
+        .settings-header h1 {
+            margin: 0;
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: 0;
+        }
+        #closeSettings {
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 5px;
+            background: #f0f2f4;
+            color: #151719;
+            padding: 7px 12px;
+            cursor: pointer;
+            font-weight: 700;
         }
         .control-group {
             margin: 10px 0;
@@ -128,11 +167,819 @@
             white-space: pre;
             max-width: min(520px, calc(100vw - 40px));
         }
+        #weaponHud {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            z-index: 11;
+            min-width: 128px;
+            padding: 8px 10px;
+            border: 1px solid rgba(255,255,255,0.16);
+            border-radius: 6px;
+            background: rgba(0,0,0,0.72);
+            color: rgba(255,255,255,0.95);
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.35;
+            text-align: right;
+            pointer-events: none;
+        }
+        #vehiclePrompt {
+            position: fixed;
+            left: 50%;
+            bottom: 34px;
+            z-index: 12;
+            transform: translateX(-50%);
+            padding: 8px 12px;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 5px;
+            background: rgba(0,0,0,0.78);
+            color: #fff;
+            font: 700 13px Arial, sans-serif;
+            pointer-events: none;
+        }
+        #weaponHudAmmo {
+            font-size: 18px;
+            font-weight: 700;
+        }
+        #meleeHud {
+            position: fixed;
+            left: 18px;
+            bottom: 18px;
+            z-index: 11;
+            width: 190px;
+            color: #fff;
+            font: 700 11px/1.2 Arial, sans-serif;
+            text-shadow: 0 1px 2px #000;
+            pointer-events: none;
+        }
+        .combat-health-row { margin-top: 7px; }
+        .combat-health-label { display: flex; justify-content: space-between; margin-bottom: 3px; }
+        .combat-health-track { height: 7px; border: 1px solid rgba(255,255,255,0.65); background: rgba(0,0,0,0.68); }
+        .combat-health-fill { height: 100%; width: 100%; background: #67c86f; transition: width 90ms linear; }
+        #meleeTargetRow .combat-health-fill { background: #d85d55; }
+        #glCanvas { transition: filter 500ms ease; }
+        body.player-dead #glCanvas { filter: grayscale(0.9) contrast(0.86) brightness(0.58); }
+        #deathOverlay {
+            position: fixed;
+            inset: 0;
+            z-index: 30;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+            background: rgba(24, 0, 0, 0.12);
+        }
+        #deathOverlay[hidden] { display: none; }
+        #deathOverlayBand {
+            width: 100%;
+            min-height: 132px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.58);
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        #deathTitle {
+            color: #c84d4d;
+            font: 300 64px/1 Arial, Helvetica, sans-serif;
+            letter-spacing: 0;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.85);
+        }
+        #deathCountdown {
+            margin-top: 12px;
+            color: rgba(255, 255, 255, 0.82);
+            font: 700 12px/1 Arial, Helvetica, sans-serif;
+            letter-spacing: 0;
+        }
+        #combatCrosshair {
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            z-index: 11;
+            width: 20px;
+            height: 20px;
+            margin: -10px 0 0 -10px;
+            pointer-events: none;
+        }
+        #combatCrosshair::before,
+        #combatCrosshair::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            background: rgba(255,255,255,0.94);
+            box-shadow: 0 0 2px rgba(0,0,0,0.95);
+        }
+        #combatCrosshair::before { width: 20px; height: 2px; margin: -1px 0 0 -10px; }
+        #combatCrosshair::after { width: 2px; height: 20px; margin: -10px 0 0 -1px; }
+        #weaponInventoryDialog {
+            width: min(360px, calc(100vw - 32px));
+            padding: 0;
+            color: #f5f7f8;
+            background: #171b1f;
+            border: 1px solid #4b535c;
+            border-radius: 6px;
+        }
+        #weaponInventoryDialog::backdrop { background: rgba(0,0,0,0.58); }
+        .inventory-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #363d45; }
+        .inventory-header h2 { margin: 0; font-size: 16px; font-weight: 700; }
+        .inventory-list { padding: 10px; display: grid; gap: 8px; }
+        .inventory-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; min-height: 48px; padding: 9px 10px; border: 1px solid #363d45; border-radius: 5px; }
+        .inventory-item-name { font-size: 14px; font-weight: 700; }
+        .inventory-item-meta { margin-top: 2px; font-size: 12px; color: #b9c1c9; }
+        #assetInspector {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            z-index: 12;
+            display: none;
+            width: min(520px, calc(100vw - 32px));
+            max-height: min(72vh, 720px);
+            overflow: hidden;
+            background: rgba(10, 12, 14, 0.92);
+            border: 1px solid rgba(255,255,255,0.16);
+            border-radius: 8px;
+            box-shadow: 0 14px 44px rgba(0,0,0,0.5);
+            color: rgba(255,255,255,0.95);
+            font-family: Arial, sans-serif;
+        }
+        #assetInspectorHeader {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 9px 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.12);
+        }
+        #assetInspectorTitle {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        #assetInspectorActions {
+            display: flex;
+            gap: 6px;
+            flex: 0 0 auto;
+        }
+        #assetInspector button {
+            border: 1px solid rgba(255,255,255,0.16);
+            background: rgba(255,255,255,0.08);
+            color: #fff;
+            border-radius: 6px;
+            padding: 5px 8px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        #assetInspector button:hover {
+            background: rgba(255,255,255,0.13);
+        }
+        #assetInspectorSummary {
+            padding: 8px 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.10);
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.35;
+            color: rgba(255,255,255,0.86);
+            white-space: pre-wrap;
+        }
+        #assetInspectorBody {
+            margin: 0;
+            padding: 10px;
+            max-height: calc(min(72vh, 720px) - 96px);
+            overflow: auto;
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.32;
+            color: rgba(255,255,255,0.9);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        #characterCreatorDialog {
+            width: min(500px, calc(100vw - 24px));
+            height: calc(100vh - 24px);
+            max-height: 900px;
+            padding: 0;
+            margin: 12px 12px 12px auto;
+            border: 1px solid #3d4248;
+            border-radius: 8px;
+            background: #17191c;
+            color: #f3f4f5;
+            font-family: Arial, sans-serif;
+            box-shadow: 0 18px 56px rgba(0, 0, 0, 0.5);
+        }
+        #characterCreatorDialog::backdrop { background: rgba(0, 0, 0, 0.28); }
+        .character-creator-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-height: 58px;
+            padding: 0 16px;
+            border-bottom: 1px solid #30343a;
+        }
+        .character-creator-header h2 { margin: 0; font-size: 17px; letter-spacing: 0; }
+        .character-creator-icon-button {
+            width: 34px;
+            height: 34px;
+            padding: 0;
+            border: 0;
+            border-radius: 4px;
+            background: transparent;
+            color: #fff;
+            font-size: 22px;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .character-creator-icon-button:hover { background: #2a2e33; }
+        .character-creator-sex {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            padding: 12px 16px;
+            border-bottom: 1px solid #30343a;
+        }
+        .character-creator-sex button, .character-creator-tabs button, .character-creator-footer button {
+            border: 1px solid #454b52;
+            border-radius: 5px;
+            background: #24282d;
+            color: #f5f6f7;
+            min-height: 34px;
+            padding: 7px 11px;
+            cursor: pointer;
+        }
+        .character-creator-sex button[aria-pressed="true"] {
+            border-color: #e6e8ea;
+            background: #e6e8ea;
+            color: #111315;
+        }
+        .character-creator-tabs {
+            display: flex;
+            gap: 4px;
+            padding: 0 16px 12px;
+            border-bottom: 1px solid #30343a;
+            overflow-x: auto;
+        }
+        .character-creator-tabs button { flex: 0 0 auto; border-color: transparent; background: transparent; color: #aeb3b8; }
+        .character-creator-tabs button[aria-selected="true"] { border-color: #555b62; background: #292d32; color: #fff; }
+        .character-creator-body { height: calc(100% - 220px); overflow: auto; padding: 10px 16px 16px; box-sizing: border-box; }
+        .character-creator-panel[hidden] { display: none; }
+        .appearance-grid { display: grid; grid-template-columns: 1fr; gap: 9px; }
+        .appearance-field { display: grid; grid-template-columns: minmax(112px, 1fr) minmax(112px, 1.25fr) 58px; gap: 8px; align-items: center; }
+        .appearance-field input[type="range"] { width: 100%; }
+        .appearance-field input[type="number"], .appearance-field select {
+            min-width: 0;
+            width: 100%;
+            box-sizing: border-box;
+            background: #23282d;
+            color: #fff;
+            border: 1px solid #454b52;
+            border-radius: 4px;
+            padding: 6px;
+        }
+        #characterCreatorComponents > div { min-height: 34px; }
+        .character-clothing-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+        #characterCreatorComponents select {
+            min-width: 0;
+            width: 100%;
+            box-sizing: border-box;
+            background: #23282d;
+            color: #fff;
+            border: 1px solid #454b52;
+            border-radius: 4px;
+            padding: 6px;
+        }
+        .character-creator-footer {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 8px;
+            min-height: 58px;
+            align-items: center;
+            padding: 0 16px;
+            border-top: 1px solid #30343a;
+            box-sizing: border-box;
+        }
+        .character-creator-footer #saveCharacterCreator { background: #e6e8ea; color: #111315; border-color: #e6e8ea; }
+        @media (max-width: 720px) {
+            #characterCreatorDialog { width: calc(100vw - 16px); height: calc(100vh - 16px); margin: 8px; }
+            .appearance-field { grid-template-columns: minmax(100px, 1fr) minmax(100px, 1.2fr) 52px; }
+        }
+
+        /* NexusAI nx-menu visual language, adapted for browser-native controls. */
+        :root {
+            --nx-primary: #f44336;
+            --nx-primary-hover: #ff5549;
+            --nx-on-primary: #ffffff;
+            --nx-surface-lowest: #0f0d13;
+            --nx-surface-low: #1d1b20;
+            --nx-surface: #211f26;
+            --nx-surface-high: #2b2930;
+            --nx-surface-highest: #36343b;
+            --nx-on-surface: #e6e1e5;
+            --nx-muted: #aaa4ad;
+            --nx-outline: #49454f;
+            --nx-focus: #ffb4ab;
+            --nx-font: "Exo 2", "Segoe UI", Arial, sans-serif;
+        }
+        #settingsBackdrop {
+            background: rgba(0, 0, 0, 0.58);
+            backdrop-filter: blur(2px);
+        }
+        #controls {
+            top: 7vh;
+            right: clamp(18px, 4vw, 76px);
+            bottom: 7vh;
+            width: min(350px, calc(100vw - 36px));
+            padding: 0 10px 12px;
+            box-sizing: border-box;
+            background: var(--nx-surface-low);
+            border: 1px solid var(--nx-outline);
+            border-radius: 6px;
+            box-shadow: 0 10px 34px rgba(0, 0, 0, 0.46);
+            color: var(--nx-on-surface);
+            font-family: var(--nx-font);
+            scrollbar-color: var(--nx-surface-highest) var(--nx-surface-lowest);
+            scrollbar-width: thin;
+        }
+        #controls::-webkit-scrollbar { width: 8px; }
+        #controls::-webkit-scrollbar-track { background: var(--nx-surface-lowest); }
+        #controls::-webkit-scrollbar-thumb { background: var(--nx-surface-highest); }
+        .settings-header {
+            min-height: 54px;
+            margin: 0 -10px 8px;
+            padding: 8px 10px;
+            box-sizing: border-box;
+            background: var(--nx-surface-high);
+            border-bottom: 1px solid var(--nx-outline);
+        }
+        .settings-heading { min-width: 0; }
+        .settings-brand {
+            display: block;
+            margin-bottom: 2px;
+            color: var(--nx-primary);
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 1;
+            text-transform: uppercase;
+        }
+        .settings-header h1 {
+            color: var(--nx-on-surface);
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.1;
+        }
+        #closeSettings,
+        #controls button,
+        #assetInspector button,
+        #weaponInventoryDialog button {
+            min-height: 34px;
+            box-sizing: border-box;
+            border: 1px solid var(--nx-outline);
+            border-radius: 4px;
+            background: var(--nx-surface);
+            color: var(--nx-on-surface);
+            font-family: var(--nx-font);
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 90ms linear, border-color 90ms linear, color 90ms linear;
+        }
+        #closeSettings {
+            min-height: 32px;
+            padding: 5px 11px;
+            background: var(--nx-primary);
+            border-color: var(--nx-primary);
+            color: var(--nx-on-primary);
+        }
+        #closeSettings:hover,
+        #controls button:hover,
+        #assetInspector button:hover,
+        #weaponInventoryDialog button:hover {
+            background: var(--nx-primary);
+            border-color: var(--nx-primary);
+            color: var(--nx-on-primary);
+        }
+        #controls button:active,
+        #assetInspector button:active,
+        #weaponInventoryDialog button:active { background: #c62828; }
+        #controls button:focus-visible,
+        #controls input:focus-visible,
+        #controls select:focus-visible,
+        #controls textarea:focus-visible,
+        #assetInspector button:focus-visible,
+        #weaponInventoryDialog button:focus-visible {
+            outline: 2px solid var(--nx-focus);
+            outline-offset: 1px;
+        }
+        .control-group {
+            margin: 8px 0;
+            padding: 10px;
+            box-sizing: border-box;
+            background: var(--nx-surface);
+            border-left: 3px solid transparent;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+        }
+        .control-group:focus-within { border-left-color: var(--nx-primary); }
+        .control-group > label:first-child {
+            margin: 0 0 10px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid var(--nx-outline);
+            color: var(--nx-on-surface);
+            font-size: 14px;
+            font-weight: 600;
+        }
+        #controls label {
+            color: var(--nx-on-surface);
+            font-size: 12px;
+            line-height: 1.3;
+        }
+        #controls input:not([type="checkbox"]):not([type="range"]),
+        #controls select,
+        #controls textarea {
+            min-height: 34px;
+            width: 100%;
+            padding: 6px 8px;
+            box-sizing: border-box;
+            border: 1px solid var(--nx-outline);
+            border-radius: 3px;
+            background: var(--nx-surface-lowest);
+            color: var(--nx-on-surface);
+            font-family: var(--nx-font);
+            font-size: 12px;
+        }
+        #controls input::placeholder,
+        #controls textarea::placeholder { color: var(--nx-muted); }
+        #controls input[type="checkbox"] {
+            width: 15px;
+            height: 15px;
+            margin: 0 7px 0 0;
+            padding: 0;
+            accent-color: var(--nx-primary);
+            vertical-align: -2px;
+        }
+        #controls input[type="range"] {
+            width: 100%;
+            height: 20px;
+            margin: 0 0 5px;
+            padding: 0;
+            accent-color: var(--nx-primary);
+        }
+        #weaponInventoryDialog,
+        #assetInspector {
+            background: var(--nx-surface-low);
+            border-color: var(--nx-outline);
+            border-radius: 6px;
+            color: var(--nx-on-surface);
+            font-family: var(--nx-font);
+        }
+        .inventory-header,
+        #assetInspectorHeader {
+            background: var(--nx-surface-high);
+            border-bottom-color: var(--nx-outline);
+        }
+        .inventory-item {
+            background: var(--nx-surface);
+            border-color: var(--nx-outline);
+            border-radius: 3px;
+        }
+        .inventory-item:hover { border-color: var(--nx-primary); }
+        .inventory-item-meta { color: var(--nx-muted); }
+        #weaponInventoryDialog {
+            width: 100vw;
+            max-width: none;
+            height: 100vh;
+            max-height: none;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: transparent;
+            border: 0;
+            color: #f3f1f2;
+            font-family: var(--nx-font);
+        }
+        #weaponInventoryDialog::backdrop { background: rgba(0, 0, 0, 0.72); }
+        .nx-inventory-shell { display: grid; place-items: center; width: 100%; height: 100%; padding: 24px; box-sizing: border-box; }
+        .nx-inventory-panel { width: min(548px, 48vw); min-width: 460px; overflow: hidden; background: rgba(28, 27, 31, 0.97); border: 1px solid rgba(244,67,54,0.58); border-radius: 4px; box-shadow: 0 18px 60px rgba(0,0,0,0.65); }
+        .nx-inventory-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 54px; padding: 10px 12px 8px; border-bottom: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.18); }
+        .nx-inventory-title { min-width: 0; }
+        .nx-inventory-title h2 { margin: 0; color: #fff; font-size: 17px; line-height: 1.1; font-weight: 700; }
+        .nx-inventory-title span { display: block; margin-top: 4px; color: rgba(255,255,255,0.67); font: 600 11px/1 Arial, sans-serif; }
+        #weaponInventoryDialog .nx-icon-button { width: 30px; min-height: 30px; height: 30px; padding: 0; color: rgba(255,255,255,0.88); background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.18); border-radius: 4px; font-size: 22px; line-height: 1; }
+        #weaponInventoryDialog .nx-icon-button:hover { background: rgba(244,67,54,0.28); border-color: rgba(244,67,54,0.72); color: #fff; }
+        .nx-inventory-weight { height: 5px; background: rgba(0,0,0,0.55); }
+        .nx-inventory-weight span { display: block; width: 0; height: 100%; background: #f44336; transition: width 120ms linear; }
+        .nx-inventory-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; padding: 10px; background: rgba(0,0,0,0.26); }
+        #weaponInventoryDialog .nx-inventory-slot { position: relative; display: block; min-width: 0; min-height: 0; aspect-ratio: 1 / 0.86; padding: 0; color: #eee; background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09); border-radius: 2px; overflow: hidden; }
+        #weaponInventoryDialog .nx-inventory-slot:hover, #weaponInventoryDialog .nx-inventory-slot.is-selected { color: #fff; background: rgba(244,67,54,0.15); border-color: #f44336; }
+        .nx-inventory-slot-key { position: absolute; top: 4px; left: 4px; z-index: 2; min-width: 16px; padding: 1px 3px; color: #fff; background: #f44336; border-radius: 2px; font: 700 10px/1.2 Arial, sans-serif; }
+        .nx-inventory-slot-body { display: grid; place-items: center; width: 100%; height: 100%; }
+        .nx-inventory-slot-icon { width: 72%; height: 72%; object-fit: contain; }
+        .nx-inventory-slot-fallback { color: #f44336; font: 800 11px/1 Arial, sans-serif; }
+        .nx-inventory-slot-label { position: absolute; right: 5px; bottom: 9px; left: 5px; overflow: hidden; color: rgba(255,255,255,0.9); font: 700 10px/1.1 Arial, sans-serif; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+        .nx-inventory-slot-amount { position: absolute; right: 5px; bottom: 5px; color: #fff; font: 700 10px/1 Arial, sans-serif; }
+        .nx-inventory-slot-durability { position: absolute; right: 4px; bottom: 3px; left: 4px; height: 3px; background: rgba(0,0,0,0.7); }
+        .nx-inventory-slot-durability span { display: block; height: 100%; background: #f44336; }
+        .nx-inventory-detail { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 58px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.16); }
+        .nx-inventory-detail-copy { min-width: 0; }
+        .nx-inventory-detail-title { overflow: hidden; color: #fff; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+        .nx-inventory-detail-meta { min-height: 14px; margin-top: 2px; overflow: hidden; color: rgba(255,255,255,0.63); font: 600 11px/1.2 Arial, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+        #weaponInventoryDialog .nx-inventory-action { min-width: 84px; min-height: 32px; padding: 6px 10px; color: #fff; background: #d9362d; border: 1px solid #f44336; border-radius: 3px; font: 700 12px/1 Arial, sans-serif; }
+        #weaponInventoryDialog .nx-inventory-action:hover:not(:disabled) { background: #f44336; color: #fff; }
+        #weaponInventoryDialog .nx-inventory-action:disabled { cursor: default; opacity: 0.42; }
+        .nx-inventory-status { min-height: 15px; padding: 0 12px 10px; color: #ffb4ad; font: 600 11px/1.2 Arial, sans-serif; }
+        .nx-inventory-context { position: fixed; z-index: 2; width: 152px; padding: 3px; background: #242126; border: 1px solid rgba(244,67,54,0.65); border-radius: 3px; box-shadow: 0 8px 28px rgba(0,0,0,0.6); }
+        #weaponInventoryDialog .nx-inventory-context button { width: 100%; min-height: 30px; padding: 8px 9px; color: #fff; background: transparent; border: 0; border-radius: 2px; text-align: left; font: 700 12px/1 Arial, sans-serif; }
+        #weaponInventoryDialog .nx-inventory-context button:hover { background: rgba(244,67,54,0.35); border-color: transparent; color: #fff; }
+        #inventoryHotbar { position: fixed; z-index: 14; left: 50%; bottom: 22px; transform: translateX(-50%); pointer-events: none; }
+        #inventoryHotbar[hidden] { display: none; }
+        .nx-hotbar-slots { display: grid; grid-template-columns: repeat(5, 58px); gap: 4px; }
+        .nx-hotbar-slot { position: relative; display: grid; place-items: center; width: 58px; height: 52px; background: rgba(20,18,22,0.93); border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; overflow: hidden; }
+        .nx-hotbar-slot[data-filled="true"] { border-color: rgba(244,67,54,0.66); }
+        .nx-hotbar-slot img { width: 70%; height: 70%; object-fit: contain; }
+        .nx-hotbar-key { position: absolute; top: 3px; left: 4px; color: rgba(255,255,255,0.9); font: 700 10px/1 Arial, sans-serif; }
+        .nx-hotbar-fallback { color: #f44336; font: 800 9px/1 Arial, sans-serif; }
+        .nx-hotbar-amount { position: absolute; right: 4px; bottom: 3px; color: #fff; font: 700 9px/1 Arial, sans-serif; }
+        #gameChat {
+            position: fixed;
+            top: 30px;
+            left: 28px;
+            z-index: 70;
+            width: min(520px, calc(100vw - 56px));
+            color: #fff;
+            font: 600 14px/1.35 Arial, sans-serif;
+            pointer-events: none;
+            text-shadow: 0 1px 3px #000, 0 1px 1px #000;
+        }
+        #gameChatMessages {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 210px;
+            overflow: hidden;
+            padding: 4px 6px;
+        }
+        .game-chat-message {
+            width: fit-content;
+            max-width: 100%;
+            opacity: 1;
+            overflow-wrap: anywhere;
+            transition: opacity 700ms ease;
+        }
+        .game-chat-message.is-aged { opacity: 0; }
+        #gameChat.is-open .game-chat-message { opacity: 1; }
+        .game-chat-name { margin-right: 6px; color: #ef5350; font-weight: 800; }
+        .game-chat-name::after { content: ':'; }
+        .game-chat-message.is-system .game-chat-text { color: #ffca28; }
+        #gameChatForm {
+            display: none;
+            align-items: center;
+            height: 36px;
+            margin-top: 6px;
+            background: rgba(12, 14, 16, 0.88);
+            border-left: 3px solid #ef5350;
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.42);
+            pointer-events: auto;
+            text-shadow: none;
+        }
+        #gameChat.is-open #gameChatForm { display: flex; }
+        .game-chat-prompt { padding-left: 10px; color: #ef5350; font-weight: 900; }
+        #gameChatInput {
+            min-width: 0;
+            height: 100%;
+            margin: 0;
+            padding: 0 10px;
+            border: 0;
+            outline: 0;
+            background: transparent;
+            color: #fff;
+            font: 600 14px/1 Arial, sans-serif;
+            box-sizing: border-box;
+        }
+        #vehicleMenuDialog, #adminMenuDialog, #emoteMenuDialog {
+            width: min(460px, calc(100vw - 28px));
+            height: min(660px, calc(100vh - 44px));
+            margin: auto 26px auto auto;
+            padding: 0;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 6px;
+            overflow: hidden;
+            background: #15181b;
+            color: #fff;
+            box-shadow: 0 18px 60px rgba(0, 0, 0, 0.62);
+            font-family: Arial, sans-serif;
+        }
+        #vehicleMenuDialog::backdrop, #adminMenuDialog::backdrop, #emoteMenuDialog::backdrop { background: rgba(0, 0, 0, 0.44); }
+        .vehicle-menu-shell { display: grid; grid-template-rows: auto auto 1fr; height: 100%; }
+        .vehicle-menu-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-height: 58px;
+            padding: 0 14px 0 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.11);
+            background: #1b1f23;
+        }
+        .vehicle-menu-brand { color: #ef5350; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+        .vehicle-menu-title { margin-top: 2px; font-size: 18px; font-weight: 800; }
+        #closeVehicleMenu, #closeAdminMenu, #closeEmoteMenu {
+            width: 34px;
+            height: 34px;
+            padding: 0;
+            border: 1px solid rgba(255, 255, 255, 0.17);
+            border-radius: 5px;
+            background: #252a2f;
+            color: #fff;
+            font-size: 22px;
+            cursor: pointer;
+        }
+        .vehicle-menu-tools {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+        }
+        #vehicleMenuSearch, #emoteMenuSearch {
+            width: 100%;
+            min-width: 0;
+            height: 36px;
+            margin: 0;
+            padding: 0 10px;
+            box-sizing: border-box;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 4px;
+            outline: 0;
+            background: #0f1113;
+            color: #fff;
+        }
+        #vehicleMenuSearch:focus, #emoteMenuSearch:focus { border-color: #ef5350; }
+        #vehicleMenuCount, #emoteMenuCount { color: rgba(255, 255, 255, 0.58); font-size: 11px; white-space: nowrap; }
+        #vehicleMenuList, #emoteMenuList { overflow-y: auto; overscroll-behavior: contain; }
+        .vehicle-menu-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 12px;
+            width: 100%;
+            min-height: 58px;
+            padding: 9px 14px 9px 16px;
+            border: 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.065);
+            border-left: 3px solid transparent;
+            background: #15181b;
+            color: #fff;
+            text-align: left;
+            cursor: pointer;
+        }
+        .vehicle-menu-row:hover, .vehicle-menu-row:focus-visible {
+            border-left-color: #ef5350;
+            outline: 0;
+            background: #22272b;
+        }
+        .vehicle-menu-identity { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+        .vehicle-menu-identity strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+        .vehicle-menu-identity span { overflow: hidden; color: rgba(255, 255, 255, 0.56); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+        .vehicle-menu-class { color: rgba(255, 255, 255, 0.48); font-size: 9px; font-weight: 800; }
+        .vehicle-menu-empty { padding: 24px 16px; color: rgba(255, 255, 255, 0.58); text-align: center; }
+        #adminMenuDialog { height: auto; max-height: min(660px, calc(100vh - 44px)); }
+        .admin-menu-shell { display: grid; grid-template-rows: auto 1fr auto; max-height: inherit; }
+        .admin-menu-actions { overflow-y: auto; }
+        .admin-menu-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 14px;
+            width: 100%;
+            min-height: 58px;
+            padding: 9px 14px 9px 16px;
+            border: 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.065);
+            border-left: 3px solid transparent;
+            background: #15181b;
+            color: #fff;
+            text-align: left;
+            cursor: pointer;
+        }
+        .admin-menu-row:hover, .admin-menu-row:focus-visible { border-left-color: #ef5350; outline: 0; background: #22272b; }
+        .admin-menu-row strong { display: block; font-size: 13px; }
+        .admin-menu-row span { display: block; margin-top: 3px; color: rgba(255, 255, 255, 0.56); font-size: 11px; }
+        .admin-menu-row > span:first-child { margin-top: 0; }
+        .admin-menu-row .admin-menu-key { margin-top: 0; color: rgba(255, 255, 255, 0.46); font-size: 10px; font-weight: 800; }
+        #adminMenuStatus { min-height: 38px; padding: 11px 16px; color: rgba(255, 255, 255, 0.64); border-top: 1px solid rgba(255,255,255,.09); font-size: 11px; box-sizing: border-box; }
+        @media (max-width: 720px) {
+            #controls {
+                top: 10px;
+                right: 10px;
+                bottom: 10px;
+                width: calc(100vw - 20px);
+            }
+            #settingsBackdrop { backdrop-filter: none; }
+            .nx-inventory-shell { padding: 10px; }
+            .nx-inventory-panel { width: 100%; min-width: 0; }
+            .nx-inventory-grid { padding: 6px; }
+            .nx-hotbar-slots { grid-template-columns: repeat(5, 50px); }
+            .nx-hotbar-slot { width: 50px; height: 46px; }
+            #gameChat { top: 16px; left: 14px; width: calc(100vw - 28px); }
+            #vehicleMenuDialog, #adminMenuDialog, #emoteMenuDialog { width: calc(100vw - 20px); margin: auto; }
+            #vehicleMenuDialog, #emoteMenuDialog { height: calc(100vh - 20px); }
+        }
     </style>
 </head>
 <body>
-    <canvas id="glCanvas"></canvas>
+    <canvas id="glCanvas" tabindex="0"></canvas>
+    <section id="gameChat" aria-label="Chat">
+        <div id="gameChatMessages" aria-live="polite"></div>
+        <form id="gameChatForm" autocomplete="off">
+            <span class="game-chat-prompt">&gt;</span>
+            <input id="gameChatInput" type="text" maxlength="180" aria-label="Chat message">
+        </form>
+    </section>
+    <dialog id="vehicleMenuDialog" aria-labelledby="vehicleMenuTitle">
+        <div class="vehicle-menu-shell">
+            <header class="vehicle-menu-header">
+                <div><div class="vehicle-menu-brand">NexusAI</div><div id="vehicleMenuTitle" class="vehicle-menu-title">Vehicles</div></div>
+                <button id="closeVehicleMenu" type="button" aria-label="Close vehicle menu" title="Close">&times;</button>
+            </header>
+            <div class="vehicle-menu-tools">
+                <input id="vehicleMenuSearch" type="search" placeholder="Search vehicles" aria-label="Search vehicles">
+                <span id="vehicleMenuCount">0 / 0</span>
+            </div>
+            <div id="vehicleMenuList"></div>
+        </div>
+    </dialog>
+    <dialog id="emoteMenuDialog" aria-labelledby="emoteMenuTitle">
+        <div class="vehicle-menu-shell">
+            <header class="vehicle-menu-header">
+                <div>
+                    <div class="vehicle-menu-brand">Nexus Roleplay</div>
+                    <div id="emoteMenuTitle" class="vehicle-menu-title">Emotes</div>
+                </div>
+                <button id="closeEmoteMenu" type="button" aria-label="Close emote menu">&times;</button>
+            </header>
+            <div class="vehicle-menu-tools">
+                <input id="emoteMenuSearch" type="search" autocomplete="off" placeholder="Search emotes" aria-label="Search emotes">
+                <span id="emoteMenuCount">0</span>
+            </div>
+            <div id="emoteMenuList"></div>
+        </div>
+    </dialog>
+    <dialog id="adminMenuDialog" aria-labelledby="adminMenuTitle">
+        <div class="admin-menu-shell">
+            <header class="vehicle-menu-header">
+                <div><div class="vehicle-menu-brand">NexusAI</div><div id="adminMenuTitle" class="vehicle-menu-title">Admin</div></div>
+                <button id="closeAdminMenu" type="button" aria-label="Close admin menu" title="Close">&times;</button>
+            </header>
+            <div class="admin-menu-actions" data-admin-actions>
+                <button class="admin-menu-row" type="button" data-admin-action="vehicles"><span><strong>Vehicles</strong><span>Browse and spawn custom vehicles</span></span><span class="admin-menu-key">/vehicles</span></button>
+                <button class="admin-menu-row" type="button" data-admin-action="noclip"><span><strong>Noclip</strong><span>Toggle collision-free movement</span></span><span class="admin-menu-key">/noclip</span></button>
+                <button class="admin-menu-row" type="button" data-admin-action="heal"><span><strong>Heal</strong><span>Restore player health</span></span><span class="admin-menu-key">/heal</span></button>
+                <button class="admin-menu-row" type="button" data-admin-action="armor"><span><strong>Armor</strong><span>Set armor to 100</span></span><span class="admin-menu-key">/armor</span></button>
+                <button class="admin-menu-row" type="button" data-admin-action="money"><span><strong>Money</strong><span>Add $10,000 cash</span></span><span class="admin-menu-key">/money</span></button>
+                <button class="admin-menu-row" type="button" data-admin-action="ammo"><span><strong>Pistol ammo</strong><span>Add 100 rounds</span></span><span class="admin-menu-key">/spawn</span></button>
+                <button class="admin-menu-row" type="button" data-admin-action="pistol"><span><strong>Glock-17</strong><span>Add the handgun to inventory</span></span><span class="admin-menu-key">/spawn</span></button>
+            </div>
+            <div id="adminMenuStatus" aria-live="polite">Select an action</div>
+        </div>
+    </dialog>
     <div id="perfHud"></div>
+    <div id="weaponHud" hidden>
+        <div id="weaponHudState"></div>
+        <div id="weaponHudAmmo"></div>
+    </div>
+    <div id="meleeHud" hidden>
+        <div class="combat-health-row">
+            <div class="combat-health-label"><span>Health</span><span id="meleePlayerHealthText">100</span></div>
+            <div class="combat-health-track"><div id="meleePlayerHealth" class="combat-health-fill"></div></div>
+        </div>
+        <div id="meleeTargetRow" class="combat-health-row" hidden>
+            <div class="combat-health-label"><span>Target</span><span id="meleeTargetHealthText">100</span></div>
+            <div class="combat-health-track"><div id="meleeTargetHealth" class="combat-health-fill"></div></div>
+        </div>
+    </div>
+    <div id="combatCrosshair" hidden aria-hidden="true"></div>
+    <div id="inventoryHotbar" hidden aria-hidden="true"><div id="inventoryHotbarSlots" class="nx-hotbar-slots"></div></div>
+    <div id="vehiclePrompt" hidden></div>
+    <div id="deathOverlay" hidden aria-live="assertive">
+        <div id="deathOverlayBand">
+            <div id="deathTitle">WASTED</div>
+            <div id="deathCountdown">RESPAWNING IN 5</div>
+        </div>
+    </div>
+    <div id="assetInspector" aria-live="polite">
+        <div id="assetInspectorHeader">
+            <div id="assetInspectorTitle">Asset metadata</div>
+            <div id="assetInspectorActions">
+                <button id="copyAssetMetadata" type="button">Copy metadata</button>
+                <button id="closeAssetInspector" type="button">Close</button>
+            </div>
+        </div>
+        <div id="assetInspectorSummary"></div>
+        <pre id="assetInspectorBody"></pre>
+    </div>
     <div id="loadingOverlay" style="display: flex;">
         <div id="loadingCard">
             <div id="loadingTitle">Loading world…</div>
@@ -144,10 +991,14 @@
             </div>
         </div>
     </div>
-    <div id="controls">
-        <div class="control-group">
-            <label for="wireframe">Wireframe Mode</label>
-            <input type="checkbox" id="wireframe">
+    <div id="settingsBackdrop" hidden></div>
+    <aside id="controls" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+        <div class="settings-header">
+            <div class="settings-heading">
+                <span class="settings-brand">NexusAI</span>
+                <h1 id="settingsTitle">Settings</h1>
+            </div>
+            <button id="closeSettings" type="button">Resume</button>
         </div>
         <div class="control-group">
             <label>Camera</label>
@@ -164,33 +1015,71 @@
         </div>
         <div class="control-group">
             <label>Ped</label>
-            <button id="spawnCharacter" style="width: 100%; padding: 6px;">Spawn character (GTA camera)</button>
+            <button id="spawnCharacter" style="width: 100%; padding: 6px;">Spawn character (city)</button>
             <button id="spawnPedCity" style="width: 100%; padding: 6px;">Spawn ped (city)</button>
             <label style="margin-top: 8px;">Character model (name or hash)</label>
-            <input id="characterModel" value="player_zero">
+            <input id="characterModel" value="a_m_y_skater_01">
+            <label style="margin-top: 8px;">NexusAI appearance</label>
+            <select id="runtimeAppearanceSelect" style="width: 100%; padding: 5px;">
+                <option value="">Runtime character</option>
+            </select>
+            <button id="openCharacterCreator" type="button" style="width: 100%; padding: 7px; margin-top: 6px;">Design character</button>
+            <div id="runtimeAppearanceComponents" style="margin-top: 6px; max-height: 280px; overflow: auto; font-size: 12px; line-height: 1.35;"></div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px;">
+                <button id="resetRuntimeAppearance" type="button">Reset outfit</button>
+                <button id="copyRuntimeAppearance" type="button">Copy appearance JSON</button>
+            </div>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enableGameplayCamera" checked>
                 Gameplay camera (smooth follow)
             </label>
             <label style="margin-top: 6px;">
+                <input type="checkbox" id="firstPersonCamera">
+                First-person camera (V)
+            </label>
+            <label style="margin-top: 10px;">Vehicle camera</label>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px;">
+                <button id="vehicleCameraCockpit" type="button" aria-pressed="false">Cockpit</button>
+                <button id="vehicleCameraChase" type="button" aria-pressed="true">Chase</button>
+            </div>
+            <input id="vehicleCameraMode" type="hidden" value="chase">
+            <div id="vehicleCameraStatus" style="margin-top: 5px; font-size: 12px; opacity: 0.75; line-height: 1.25;">Enter a vehicle to use cockpit or chase camera.</div>
+            <label style="margin-top: 6px;">
                 <input type="checkbox" id="followPed" checked>
                 Follow ped
             </label>
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="controlPed">
+                <input type="checkbox" id="controlPed" checked>
                 Control ped (WASD)
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="groundPedToTerrain" checked>
-                Ground ped to terrain (if near ground)
+                Use YBN ground collision
             </label>
             <label style="margin-top: 6px;">Ground snap max ΔZ</label>
+            <label style="margin-top: 10px;">Driving physics</label>
+            <select id="vehiclePhysicsMode" style="width: 100%; padding: 5px;">
+                <option value="gta" selected>GTA handling</option>
+                <option value="assetto">Assetto Corsa profile</option>
+            </select>
+            <div id="vehiclePhysicsModeStatus" style="margin-top: 5px; font-size: 12px; opacity: 0.75; line-height: 1.25;">GTA handling is active.</div>
+            <button id="teleportNurburgring" style="width: 100%; padding: 6px; margin-top: 8px;">Drive to Nurburgring</button>
+            <button id="returnToLegion" style="width: 100%; padding: 6px; margin-top: 6px;">Return to Legion Square</button>
+            <div id="nurburgringStatus" style="margin-top: 5px; font-size: 12px; opacity: 0.75; line-height: 1.25;">Local derived track package not loaded.</div>
             <input id="groundPedMaxDelta" type="number" min="0" max="100000" value="25">
             <label style="margin-top: 8px;">PedCoords (vector4)</label>
-            <input id="pedCoords" value="vector4(-562.3726, 154.1684, NaN, 0.0)">
+              <input id="pedCoords" value="vector4(186.9400, -850.8400, 31.1700, 0.0)">
             <label style="margin-top: 6px;">CamCoords (vector4)</label>
-            <input id="camCoords" value="vector4(-562.3726, 254.1684, 176.3396, 0.0)">
+              <input id="camCoords" value="vector4(186.9400, -858.3400, 33.3700, 0.0)">
             <button id="applyPedCam" style="width: 100%; padding: 6px; margin-top: 6px;">Apply ped+cam</button>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px;">
+                <button id="weaponToggle" type="button">Draw Glock-17</button>
+                <button id="weaponReload" type="button">Reload</button>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px;">
+                <button id="weaponInventory" type="button">Inventory</button>
+                <button id="weaponSwitch" type="button">Install Glock switch</button>
+            </div>
             <div id="pedDebug" style="margin-top: 8px; font-size: 12px; opacity: 0.85; line-height: 1.2;"></div>
             <div id="streamDebug" style="margin-top: 6px; font-size: 12px; opacity: 0.85; line-height: 1.2;"></div>
             <div style="margin-top: 10px; font-size: 12px; opacity: 0.9;">
@@ -203,10 +1092,36 @@
             </div>
         </div>
         <div class="control-group">
+            <label>Audio</label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="ambientAudio" checked>
+                Environment audio
+            </label>
+            <label style="margin-top: 6px;">Environment volume</label>
+            <input id="ambientVolume" type="range" min="0" max="1" step="0.01" value="0.28">
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="gameplayAudio" checked>
+                Gameplay sounds
+            </label>
+            <label style="margin-top: 6px;">Effects volume</label>
+            <input id="sfxVolume" type="range" min="0" max="1.5" step="0.01" value="0.8">
+            <label style="margin-top: 8px;">Proximity voice mode</label>
+            <select id="voiceMode">
+                <option value="0">Whisper (3m)</option>
+                <option value="1" selected>Normal (7m)</option>
+                <option value="2">Shouting (15m)</option>
+            </select>
+            <label style="margin-top: 6px;">Voice volume</label>
+            <input id="voiceVolume" type="range" min="0" max="1.5" step="0.01" value="1">
+            <button id="voiceMicToggle" type="button" style="width: 100%; padding: 7px; margin-top: 8px;">Enable microphone</button>
+            <div id="audioStatus" role="status" style="margin-top: 6px; font-size: 12px; opacity: 0.82;">MIC OFF | NORMAL 7M</div>
+        </div>
+        <div class="control-group">
             <label>Scene</label>
-            <div style="margin-top: 6px; font-size: 12px; opacity: 0.75; line-height: 1.25;">
-                Note: collisions (YBN), interiors (MLO), and lights are not implemented in this WebGL viewer.
-            </div>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="assetPicker">
+                Asset picker
+            </label>
             <label style="margin-top: 10px;">Atmosphere</label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enableAtmosphere" checked>
@@ -254,13 +1169,34 @@
             <button id="applyHighDetail" style="width: 100%; padding: 6px; margin-top: 8px;">
                 Apply High Detail (GTA-like)
             </button>
+            <label style="margin-top: 10px; font-weight: 700;">Layer rendering</label>
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="showTerrain" checked>
-                Show terrain (heightmap)
+                <input type="checkbox" id="showPlayer" checked>
+                Show player
             </label>
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="showBuildings" checked>
-                Show buildings/water mesh (OBJ)
+                <input type="checkbox" id="showNpcs" checked>
+                Show NPC pedestrians
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="playerTextured" checked>
+                Player model + textures
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showTerrain">
+                Show spawn-aligned GTA height proxy (debug)
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="terrainTextured">
+                Landscape proxy textures
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="showBuildings">
+                Show buildings/water mesh (OBJ fallback)
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="buildingsTextured">
+                Buildings model + textures
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
                 <input type="checkbox" id="showWater" checked>
@@ -276,10 +1212,14 @@
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="showModels" checked>
-                Show GTA models (experimental)
+                Show GTA objects (streamed drawables)
+            </label>
+            <label style="margin-top: 4px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="objectsTextured">
+                Objects model + textures
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
-                <input type="checkbox" id="crossArchetypeInstancing" checked>
+                <input type="checkbox" id="crossArchetypeInstancing">
                 Cross-archetype instancing (group by mesh + material)
             </label>
             <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
@@ -290,36 +1230,50 @@
                 <input type="checkbox" id="showPlaceholders">
                 Show placeholder meshes for unexported archetypes (NOT textures)
             </label>
+            <label style="margin-top: 6px; margin-left: 14px; opacity: 0.95;">
+                <input type="checkbox" id="showDemoBoundary">
+                Show demo boundary (debug)
+            </label>
             <button id="dumpMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Dump missing archetypes (console)</button>
             <button id="downloadMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Download missing archetypes (json)</button>
+            <button id="resolveMissingArchetypes" style="width: 100%; padding: 6px; margin-top: 6px;">Resolve visible missing archetypes</button>
             <label style="margin-top: 10px;">Streaming radius (chunks)</label>
-            <input id="streamRadius" type="number" min="1" max="24" value="6">
+            <input id="streamRadius" type="number" min="1" max="24" value="1">
             <label style="margin-top: 6px;">Max loaded chunks</label>
-            <input id="maxLoadedChunks" type="number" min="9" max="4000" value="250">
+            <input id="maxLoadedChunks" type="number" min="9" max="4000" value="9">
             <label style="margin-top: 6px;">
-                <input type="checkbox" id="streamFromCamera" checked>
-                Stream around camera (faster first-view)
+                <input type="checkbox" id="streamFromCamera">
+                Use camera focus in free map
             </label>
             <label style="margin-top: 6px;">Max archetypes (instanced meshes) (0 = unlimited)</label>
-            <input id="maxArchetypes" type="number" min="0" value="900">
+            <input id="maxArchetypes" type="number" min="0" value="96">
             <label style="margin-top: 6px;">Model stream distance (data units)</label>
-            <input id="maxModelDistance" type="number" min="0" max="100000" value="1200">
+            <input id="maxModelDistance" type="number" min="0" max="100000" value="320">
+            <label style="margin-top: 6px;">Max visible object instances</label>
+            <input id="maxVisibleInstances" type="number" min="1" max="1000000" value="12000">
+            <label style="margin-top: 6px;">Max instances per archetype</label>
+            <input id="maxInstancesPerArchetype" type="number" min="1" max="100000" value="128">
             <label style="margin-top: 6px;">Mesh loads in flight</label>
-            <input id="maxMeshLoadsInFlight" type="number" min="1" max="64" value="8">
+            <input id="maxMeshLoadsInFlight" type="number" min="1" max="64" value="3">
             <label style="margin-top: 10px;">Streaming preset</label>
             <select id="streamPreset">
-                <option value="game">Game-like</option>
+                <option value="game">Gameplay (low memory)</option>
                 <option value="city">City (heavier)</option>
-                <option value="extreme">Extreme (may hitch/crash)</option>
+                <option value="high">High detail</option>
             </select>
             <button id="applyStreamPreset" style="width: 100%; padding: 6px;">Apply preset</button>
+            <button id="applyMemorySaver" style="width: 100%; padding: 6px; margin-top: 6px;">Memory saver</button>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="frustumCulling" checked>
                 Frustum culling
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enableOcclusionCulling">
-                Occlusion culling (experimental)
+                Occlusion culling (world depth)
+            </label>
+            <label style="margin-top: 6px;">
+                <input type="checkbox" id="enableWebGpuCulling">
+                WebGPU culling (experimental)
             </label>
             <label style="margin-top: 6px;">
                 <input type="checkbox" id="enableShadows">
@@ -338,7 +1292,7 @@
             <div style="margin-top: 10px; font-size: 12px; opacity: 0.9;">
                 <div style="font-weight: 700; margin-bottom: 4px;">Persistence + cache</div>
                 <label style="margin-top: 6px;">
-                    <input type="checkbox" id="restoreOnRefresh" checked>
+                    <input type="checkbox" id="restoreOnRefresh">
                     Restore view on refresh (camera + settings)
                 </label>
                 <label style="margin-top: 6px;">
@@ -356,7 +1310,7 @@
             <select id="textureQuality">
                 <option value="high">High</option>
                 <option value="medium">Medium</option>
-                <option value="low">Low</option>
+                <option value="low" selected>Low</option>
             </select>
         </div>
         <div class="control-group">
@@ -364,7 +1318,7 @@
             <select id="lodLevel">
                 <option value="0">Full Detail</option>
                 <option value="1">Medium</option>
-                <option value="2">Low</option>
+                <option value="2" selected>Low</option>
             </select>
         </div>
         <div class="control-group">
@@ -379,7 +1333,75 @@
             <input id="rpfExtractPath" placeholder="common/data/levels/gta5/..." />
             <button id="rpfExtractBtn" style="width: 100%; padding: 6px; margin-top: 6px;">Extract to download</button>
         </div>
-    </div>
+    </aside>
+    <dialog id="characterCreatorDialog" aria-labelledby="characterCreatorTitle">
+        <div class="character-creator-header">
+            <h2 id="characterCreatorTitle">Illenium Appearance</h2>
+            <button id="closeCharacterCreator" class="character-creator-icon-button" type="button" aria-label="Close character appearance" title="Close">&times;</button>
+        </div>
+        <div class="character-creator-sex" role="group" aria-label="Character sex">
+            <button type="button" data-character-sex="male" aria-pressed="false">Male</button>
+            <button type="button" data-character-sex="female" aria-pressed="false">Female</button>
+        </div>
+        <div class="character-creator-tabs" role="tablist" aria-label="Appearance sections">
+            <button type="button" role="tab" data-character-tab="clothing" aria-selected="true">Clothing</button>
+            <button type="button" role="tab" data-character-tab="heritage" aria-selected="false">Heritage</button>
+            <button type="button" role="tab" data-character-tab="face" aria-selected="false">Face</button>
+            <button type="button" role="tab" data-character-tab="overlays" aria-selected="false">Overlays</button>
+            <button type="button" role="tab" data-character-tab="props" aria-selected="false">Props</button>
+        </div>
+        <div class="character-creator-body">
+            <section class="character-creator-panel" data-character-panel="clothing">
+                <div class="character-clothing-presets" role="group" aria-label="Clothing presets">
+                    <button id="setCharacterShirtless" type="button">Shirtless</button>
+                </div>
+                <div id="characterCreatorComponents"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="heritage" hidden>
+                <div id="characterCreatorHeritage" class="appearance-grid"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="face" hidden>
+                <div id="characterCreatorFace" class="appearance-grid"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="overlays" hidden>
+                <div id="characterCreatorOverlays" class="appearance-grid"></div>
+            </section>
+            <section class="character-creator-panel" data-character-panel="props" hidden>
+                <div id="characterCreatorProps" class="appearance-grid"></div>
+            </section>
+        </div>
+        <div class="character-creator-footer">
+            <button id="cancelCharacterCreator" type="button">Cancel</button>
+            <button id="copyCharacterCreator" type="button">Copy JSON</button>
+            <button id="saveCharacterCreator" type="button">Save appearance</button>
+        </div>
+    </dialog>
+    <dialog id="weaponInventoryDialog" aria-labelledby="weaponInventoryTitle">
+        <div class="nx-inventory-shell">
+            <section class="nx-inventory-panel" aria-label="Player inventory">
+                <header class="nx-inventory-header">
+                    <div class="nx-inventory-title">
+                        <h2 id="weaponInventoryTitle">Inventory</h2>
+                        <span id="inventoryWeight">0.00 / 120 kg</span>
+                    </div>
+                    <button id="closeWeaponInventory" class="nx-icon-button" type="button" aria-label="Close inventory">&times;</button>
+                </header>
+                <div class="nx-inventory-weight"><span id="inventoryWeightFill"></span></div>
+                <div id="inventoryPlayerGrid" class="nx-inventory-grid" aria-label="Inventory slots"></div>
+                <footer class="nx-inventory-detail">
+                    <div class="nx-inventory-detail-copy">
+                        <div id="inventoryDetailTitle" class="nx-inventory-detail-title">Inventory</div>
+                        <div id="inventoryDetailMeta" class="nx-inventory-detail-meta"></div>
+                    </div>
+                    <button id="inventoryUseAction" class="nx-inventory-action" type="button" disabled>Use</button>
+                </footer>
+                <div id="inventoryActionStatus" class="nx-inventory-status" aria-live="polite"></div>
+            </section>
+            <div id="inventoryContextMenu" class="nx-inventory-context" hidden>
+                <button id="inventoryContextUse" type="button">Use</button>
+            </div>
+        </div>
+    </dialog>
     <!-- gl-matrix is imported via ESM in js/glmatrix.js (Vite dev/build). -->
     <div id="fatalOverlay" style="
         position: fixed;
@@ -416,8 +1438,9 @@
         const clamp01 = (v) => Math.max(0, Math.min(1, Number(v)));
         const setLoading = (state) => {
           const s = state || {};
-          const visible = (s.visible === undefined) ? true : !!s.visible;
-          if (loadingOverlayEl) loadingOverlayEl.style.display = visible ? 'flex' : 'none';
+          if (loadingOverlayEl && s.visible !== undefined) {
+            loadingOverlayEl.style.display = s.visible ? 'flex' : 'none';
+          }
           if (loadingTitleEl && s.title !== undefined) loadingTitleEl.textContent = String(s.title || '');
           if (loadingDetailEl && s.detail !== undefined) loadingDetailEl.textContent = String(s.detail || '');
           if (loadingBarInnerEl && s.progress !== undefined) {
@@ -451,5 +1474,6 @@
       })();
     </script>
     <script type="module" src="js/main.js"></script>
+    <script defer src="/nexus_extensions/nexus_laptop.js"></script>
 </body>
-</html> 
+</html>

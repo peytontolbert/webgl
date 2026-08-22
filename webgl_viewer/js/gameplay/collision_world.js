@@ -1,3 +1,5 @@
+import { fetchArrayBufferPreferredCompressed } from '../asset_fetcher.js';
+
 function finite(n, fallback = 0.0) {
     const v = Number(n);
     return Number.isFinite(v) ? v : fallback;
@@ -147,6 +149,8 @@ export class CollisionWorld {
         this.ybnGroundOffset = 0.0;
         this.derivedRoads = [];
         this.derivedRoadError = null;
+        this.derivedTrackGround = null;
+        this.derivedTrackGroundError = null;
         this.movementBounds = null;
         this._triangleClosest = new Float64Array(3);
         this._segmentClosest = new Float64Array(6);
@@ -160,6 +164,10 @@ export class CollisionWorld {
         this._assetColliders = [];
         this._assetCollidersById = new Map();
         this.assetColliderCount = 0;
+        // Kept for the in-game diagnostics panel.  This is intentionally the
+        // authored collider/YBN hit rather than a render proxy so an invisible
+        // blocker can be identified by its exact source and coordinates.
+        this.lastVehicleCollision = null;
         this.ybnCollisionExclusions = [];
         // Drawable bounds are a rendering aid, not authoritative GTA collision.
         // Keeping them out of normal movement avoids turning every streamed sign,
@@ -216,9 +224,12 @@ export class CollisionWorld {
             if (!file) throw new Error('YBN metadata has no binary file');
 
             const dataUrl = new URL(file, new URL(metaUrl, window.location.href)).toString();
-            const dataResponse = await fetch(dataUrl, { cache: 'no-store' });
-            if (!dataResponse.ok) throw new Error(`YBN binary request failed (${dataResponse.status})`);
-            const buffer = await dataResponse.arrayBuffer();
+            // Production deployments package collision binaries as `.gz` only.
+            // This helper falls back to the raw path for old/dev deployments.
+            const buffer = await fetchArrayBufferPreferredCompressed(dataUrl, {
+                usePersistentCache: false,
+                priority: 'high',
+            });
             if (buffer.byteLength < 16) throw new Error('YBN binary is truncated');
 
             const header = new DataView(buffer, 0, 16);
@@ -470,8 +481,11 @@ export class CollisionWorld {
             if (compiled.chunks.has(id)) return;
             let pending = compiled.loading.get(id);
             if (!pending) {
-                pending = fetch(new URL(entry.file, compiled.chunkBaseUrl), { cache: 'force-cache' })
-                    .then((response) => { if (!response.ok) throw new Error(`Compiled collision chunk ${entry.file} request failed (${response.status})`); return response.arrayBuffer(); })
+                const chunkUrl = new URL(entry.file, compiled.chunkBaseUrl).toString();
+                pending = fetchArrayBufferPreferredCompressed(chunkUrl, {
+                    usePersistentCache: true,
+                    priority: 'high',
+                })
                     .then((buffer) => this._decodeCompiledCollisionChunk(buffer, entry, compiled));
                 compiled.loading.set(id, pending);
             }
@@ -599,15 +613,74 @@ export class CollisionWorld {
         }
     }
 
+    async loadDerivedTrackGround(metaUrl = 'assets/tracks/nordschleife/surface_collision.json') {
+        this.derivedTrackGroundError = null;
+        try {
+            const response = await fetch(metaUrl, { cache: 'no-store' });
+            if (response.status === 404) return null;
+            if (!response.ok) throw new Error(`Authored track collision metadata request failed (${response.status})`);
+            const meta = await response.json();
+            if (meta?.schema !== 'webglgta-authored-track-collision-v1' || !meta?.file) throw new Error('Authored track collision metadata is invalid');
+            const dataUrl = new URL(String(meta.file), new URL(metaUrl, window.location.href)).toString();
+            const buffer = await fetchArrayBufferPreferredCompressed(dataUrl, { usePersistentCache: true, priority: 'high' });
+            if (buffer.byteLength < 48) throw new Error('Authored track collision binary is truncated');
+            const header = new DataView(buffer, 0, 48);
+            const magic = String.fromCharCode(header.getUint8(0), header.getUint8(1), header.getUint8(2), header.getUint8(3));
+            const version = header.getUint32(4, true);
+            const vertexCount = header.getUint32(8, true);
+            const indexCount = header.getUint32(12, true);
+            const triangleCount = header.getUint32(16, true);
+            const materialCount = header.getUint32(20, true);
+            if (magic !== 'NCV1' || version !== 1 || indexCount !== triangleCount * 3 || vertexCount < 3 || triangleCount < 1) throw new Error('Authored track collision header is invalid');
+            const minimum = [header.getFloat32(24, true), header.getFloat32(28, true), header.getFloat32(32, true)];
+            const maximum = [header.getFloat32(36, true), header.getFloat32(40, true), header.getFloat32(44, true)];
+            const positionsOffset = 48;
+            const indicesOffset = positionsOffset + vertexCount * 3 * Float32Array.BYTES_PER_ELEMENT;
+            const materialsOffset = indicesOffset + indexCount * Uint32Array.BYTES_PER_ELEMENT;
+            const expected = materialsOffset + triangleCount * Uint16Array.BYTES_PER_ELEMENT;
+            if (![...minimum, ...maximum].every(Number.isFinite) || buffer.byteLength < expected) throw new Error('Authored track collision payload is invalid');
+            const vertices = new Float32Array(buffer, positionsOffset, vertexCount * 3);
+            const indices = new Uint32Array(buffer, indicesOffset, indexCount);
+            const triangleMaterials = new Uint16Array(buffer, materialsOffset, triangleCount);
+            const materialPalette = Array.isArray(meta?.surfaces) ? meta.surfaces.slice(0, materialCount).map((surface) => ({
+                name: String(surface?.name || surface?.key || 'asphalt').toLowerCase(),
+                surface: String(surface?.key || surface?.name || 'asphalt').toLowerCase(),
+                grip: Number(surface?.friction),
+                damping: Number(surface?.damping),
+                validTrack: surface?.validTrack === true,
+                pitlane: surface?.pitlane === true,
+            })) : [];
+            const cellSize = 16.0;
+            const bounds = { minX: minimum[0], minY: minimum[1], minZ: minimum[2], maxX: maximum[0], maxY: maximum[1], maxZ: maximum[2], cellSize };
+            const world = {
+                id: String(meta.id || 'nordschleife-authored-surfaces'), meta,
+                vertices, indices, triangleMaterials, materialPalette, ...bounds,
+            };
+            world.grid = this._buildYbnGrid(vertices, indices, bounds);
+            world.wallGrid = this._buildYbnWallGrid(vertices, indices, bounds);
+            this.derivedTrackGround = world;
+            return world;
+        } catch (error) {
+            this.derivedTrackGround = null;
+            this.derivedTrackGroundError = String(error?.message || error || 'Authored track collision load failed');
+            console.warn('Authored track collision unavailable:', error);
+            return null;
+        }
+    }
+
     getDerivedRoadBounds() {
-        if (!this.derivedRoads.length) return null;
-        return this.derivedRoads.reduce((out, road) => ({
+        const entries = [...this.derivedRoads, ...(this.derivedTrackGround ? [this.derivedTrackGround] : [])];
+        if (!entries.length) return null;
+        return entries.reduce((out, road) => ({
             minX: Math.min(out.minX, road.minX), minY: Math.min(out.minY, road.minY), minZ: Math.min(out.minZ, road.minZ),
             maxX: Math.max(out.maxX, road.maxX), maxY: Math.max(out.maxY, road.maxY), maxZ: Math.max(out.maxZ, road.maxZ),
         }), { minX: Infinity, minY: Infinity, minZ: Infinity, maxX: -Infinity, maxY: -Infinity, maxZ: -Infinity });
     }
 
     getDerivedRoadSpawn(id = null) {
+        const authoredSpawn = this.derivedTrackGround?.meta?.spawn;
+        const authored = [Number(authoredSpawn?.x), Number(authoredSpawn?.y), Number(authoredSpawn?.feetZ)];
+        if (!id && authored.every(Number.isFinite)) return authored;
         const road = this.derivedRoads.find((entry) => !id || entry.id === id) || null;
         if (!road || road.vertices.length < 6) return null;
         return [
@@ -615,6 +688,36 @@ export class CollisionWorld {
             (road.vertices[1] + road.vertices[4]) * 0.5,
             (road.vertices[2] + road.vertices[5]) * 0.5,
         ];
+    }
+
+    getDerivedRoadSpawnFrame(id = null, lookAheadSegments = 10) {
+        const authoredSpawn = this.derivedTrackGround?.meta?.spawn;
+        const authoredPosition = [Number(authoredSpawn?.x), Number(authoredSpawn?.y), Number(authoredSpawn?.feetZ)];
+        const authoredHeading = Number(authoredSpawn?.headingRad);
+        if (!id && authoredPosition.every(Number.isFinite) && Number.isFinite(authoredHeading)) {
+            return { position: authoredPosition, forwardData: [Math.cos(authoredHeading), Math.sin(authoredHeading)], headingRad: authoredHeading };
+        }
+        const road = this.derivedRoads.find((entry) => !id || entry.id === id) || null;
+        if (!road || road.vertices.length < 12) return null;
+        const midpoint = (segment) => {
+            const base = Math.max(0, Math.min(road.segmentCount, segment)) * 6;
+            return [
+                (road.vertices[base] + road.vertices[base + 3]) * 0.5,
+                (road.vertices[base + 1] + road.vertices[base + 4]) * 0.5,
+                (road.vertices[base + 2] + road.vertices[base + 5]) * 0.5,
+            ];
+        };
+        const position = midpoint(0);
+        const ahead = midpoint(Math.max(1, Math.min(road.segmentCount, Math.round(Number(lookAheadSegments) || 10))));
+        const dx = ahead[0] - position[0];
+        const dy = ahead[1] - position[1];
+        const length = Math.hypot(dx, dy);
+        if (!(length > 1e-5)) return { position, forwardData: [1, 0], headingRad: 0 };
+        return {
+            position,
+            forwardData: [dx / length, dy / length],
+            headingRad: Math.atan2(dy, dx),
+        };
     }
 
     _getDerivedRoadContactAtXY(x, y, zHint, maxRise = 1.5) {
@@ -647,6 +750,49 @@ export class CollisionWorld {
         if (!best) return null;
         const surface = best.road.meta?.surface || {};
         return { z: best.z, material: String(surface.name || 'asphalt').toLowerCase(), grip: Number.isFinite(Number(surface.grip)) ? Number(surface.grip) : null, roadId: best.road.id, segment: best.segment };
+    }
+
+    _derivedRoadCenterDistance(x, y) {
+        let best = Number.POSITIVE_INFINITY;
+        for (const road of this.derivedRoads) {
+            if (!road?.grid || !road?.vertices || road.segmentCount < 1) continue;
+            const gx = Math.floor(Number(x) / road.cellSize);
+            const gy = Math.floor(Number(y) / road.cellSize);
+            const tested = new Set();
+            for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+                const candidates = road.grid.get(`${gx + ox}:${gy + oy}`) || [];
+                for (const segment of candidates) {
+                    if (tested.has(segment)) continue;
+                    tested.add(segment);
+                    const base = segment * 6;
+                    const next = Math.min(road.segmentCount, segment + 1) * 6;
+                    const ax = (road.vertices[base] + road.vertices[base + 3]) * 0.5;
+                    const ay = (road.vertices[base + 1] + road.vertices[base + 4]) * 0.5;
+                    const bx = (road.vertices[next] + road.vertices[next + 3]) * 0.5;
+                    const by = (road.vertices[next + 1] + road.vertices[next + 4]) * 0.5;
+                    const dx = bx - ax; const dy = by - ay;
+                    const lengthSq = dx * dx + dy * dy;
+                    const t = lengthSq > 1e-8 ? Math.max(0, Math.min(1, ((Number(x) - ax) * dx + (Number(y) - ay) * dy) / lengthSq)) : 0;
+                    best = Math.min(best, Math.hypot(Number(x) - (ax + dx * t), Number(y) - (ay + dy * t)));
+                }
+            }
+        }
+        return best;
+    }
+
+    _isDerivedTrackCorridorWall(world, triangleOffset, contactX, contactY, contactZ) {
+        if (world !== this.derivedTrackGround || !this.derivedRoads.length || !world?.triangleMaterials) return false;
+        const materialIndex = Number(world.triangleMaterials[Math.floor(Number(triangleOffset) / 3)]);
+        const material = world.materialPalette?.[materialIndex];
+        if (String(material?.surface || material?.name || '').toLowerCase() !== 'wall') return false;
+        const roadContact = this._getYbnGroundContactAtXY(
+            Number(contactX), Number(contactY), Number(contactZ) + 0.8, 1.5,
+            { nearestToHint: true, maxDrop: 2.0 }, world,
+        );
+        if (!roadContact?.validTrack || String(roadContact.material || '').toLowerCase() !== 'trm-nrm') return false;
+        const declaredWidth = Math.max(1, ...this.derivedRoads.map((road) => Number(road.meta?.roadWidthM) || 0));
+        const centerClearance = Math.max(0.9, Math.min(1.35, declaredWidth * 0.12));
+        return this._derivedRoadCenterDistance(contactX, contactY) <= centerClearance;
     }
 
     _buildYbnGrid(vertices, indices, { minX, minY, maxX, maxY, cellSize }) {
@@ -759,8 +905,11 @@ export class CollisionWorld {
         return end > start ? grid.triangleOffsets.subarray(start, end) : null;
     }
 
-    _getYbnGroundContactAtXY(x, y, zHint, maxRise = 1.5) {
-        const world = this.ybnGround;
+    _getYbnGroundContactAtXY(x, y, zHint, maxRise = 1.5, {
+        nearestToHint = false,
+        maxDrop = Number.POSITIVE_INFINITY,
+    } = {}, worldOverride = null) {
+        const world = worldOverride || this.ybnGround;
         if (!world || x < world.minX || x > world.maxX || y < world.minY || y > world.maxY) return null;
         const candidates = this._ybnCellCandidates(
             world,
@@ -771,7 +920,9 @@ export class CollisionWorld {
 
         const hint = Number(zHint);
         const ceiling = Number.isFinite(hint) ? hint + Math.max(0.1, Number(maxRise) || 1.5) : Number.POSITIVE_INFINITY;
+        const floor = Number.isFinite(hint) ? hint - Math.max(0.0, Number(maxDrop) || 0.0) : Number.NEGATIVE_INFINITY;
         let bestZ = Number.NEGATIVE_INFINITY;
+        let bestDistance = Number.POSITIVE_INFINITY;
         let bestOffset = -1;
         for (const offset of candidates) {
             const ia = world.indices[offset] * 3;
@@ -788,8 +939,13 @@ export class CollisionWorld {
             const w = 1.0 - u - v;
             if (u < -1e-4 || v < -1e-4 || w < -1e-4) continue;
             const z = u * az + v * bz + w * cz;
-            if (Number.isFinite(z) && z <= ceiling && z > bestZ) {
+            const distance = Number.isFinite(hint) ? Math.abs(z - hint) : 0.0;
+            const better = nearestToHint
+                ? distance < bestDistance - 1e-5 || (Math.abs(distance - bestDistance) <= 1e-5 && z > bestZ)
+                : z > bestZ;
+            if (Number.isFinite(z) && z >= floor && z <= ceiling && better) {
                 bestZ = z;
+                bestDistance = distance;
                 bestOffset = offset;
             }
         }
@@ -804,6 +960,9 @@ export class CollisionWorld {
             materialIndex: materialIndex >= 0 ? materialIndex : null,
             material: String(materialRecord?.surface || materialRecord?.name || 'asphalt').toLowerCase(),
             grip: Number.isFinite(Number(materialRecord?.grip)) ? Number(materialRecord.grip) : null,
+            damping: Number.isFinite(Number(materialRecord?.damping)) ? Number(materialRecord.damping) : null,
+            validTrack: materialRecord?.validTrack === true,
+            pitlane: materialRecord?.pitlane === true,
             wetGrip: Number.isFinite(Number(materialRecord?.wet_grip)) ? Number(materialRecord.wet_grip) : null,
             tyreDrag: Number.isFinite(Number(materialRecord?.tyre_drag)) ? Number(materialRecord.tyre_drag) : null,
             topSpeedMultiplier: Number.isFinite(Number(materialRecord?.top_speed_mult)) ? Number(materialRecord.top_speed_mult) : null,
@@ -1088,15 +1247,38 @@ export class CollisionWorld {
             const id = String(raw?.id || '');
             const hash = String(raw?.archetypeHash || '');
             const coords = raw?.coords || raw?.origin;
-            if (!id || !hash || !coords) continue;
+            const origin = raw?.origin || coords;
+            if (!id || !hash || !coords || !origin) continue;
+            const x = finite(coords.x, NaN);
+            const y = finite(coords.y, NaN);
+            const z = finite(coords.z, NaN);
+            const originX = finite(origin.x, x);
+            const originY = finite(origin.y, y);
+            const originZ = finite(origin.z, z);
+            if (![x, y].every(Number.isFinite)) continue;
+            // In exported door records, origin is the hinge while coords is the
+            // center of the leaf. The vector therefore runs along the opening,
+            // not through it; its perpendicular is the thin door plane.
+            const tangentDeltaX = x - originX;
+            const tangentDeltaY = y - originY;
+            const tangentLength = Math.hypot(tangentDeltaX, tangentDeltaY);
+            const hasOrientation = tangentLength >= 0.05;
+            const tangentX = hasOrientation ? tangentDeltaX / tangentLength : 1.0;
+            const tangentY = hasOrientation ? tangentDeltaY / tangentLength : 0.0;
             this.doorDefinitions.set(id, {
                 id,
                 archetypeHash: hash,
-                x: finite(coords.x, NaN),
-                y: finite(coords.y, NaN),
-                z: finite(coords.z, NaN),
-                passageRadius: Math.max(0.4, finite(raw?.passageRadius, 0.9)),
-                passageHalfHeight: Math.max(0.8, finite(raw?.passageHalfHeight, 1.3)),
+                x,
+                y,
+                minZ: Math.min(z, originZ) - Math.max(0.8, finite(raw?.passageHalfHeight, 1.3)),
+                maxZ: Math.max(z, originZ) + Math.max(0.8, finite(raw?.passageHalfHeight, 1.3)),
+                passageHalfWidth: Math.max(0.4, finite(raw?.passageRadius, 0.9)),
+                passageHalfDepth: Math.max(0.22, Math.min(0.7, finite(raw?.passageHalfDepth, 0.4))),
+                tangentX,
+                tangentY,
+                normalX: -tangentY,
+                normalY: tangentX,
+                hasOrientation,
             });
             this.doorOpenProgress.set(id, 0.0);
         }
@@ -1112,24 +1294,32 @@ export class CollisionWorld {
         if (!proxy?.archetypeHash) return false;
         for (const door of this.doorDefinitions.values()) {
             if (door.archetypeHash !== proxy.archetypeHash || (this.doorOpenProgress.get(door.id) || 0) < 0.42) continue;
-            if (Math.hypot(finite(proxy.x) - door.x, finite(proxy.y) - door.y) <= Math.max(1.75, door.passageRadius)) return true;
+            if (this._isOpenDoorPassage(proxy.x, proxy.y, proxy.minZ, proxy.maxZ - proxy.minZ, 0.04, door)) return true;
         }
         return false;
     }
 
-    _isOpenDoorPassage(x, y, feetZ, height) {
+    _isOpenDoorPassage(x, y, feetZ, height, radius = 0.0, singleDoor = null) {
         const px = finite(x, NaN);
         const py = finite(y, NaN);
         const capsuleMinZ = finite(feetZ, NaN);
         const capsuleMaxZ = capsuleMinZ + Math.max(0.2, finite(height, 1.8));
         if (![px, py, capsuleMinZ, capsuleMaxZ].every(Number.isFinite)) return false;
-        for (const door of this.doorDefinitions.values()) {
+        const doors = singleDoor ? [singleDoor] : this.doorDefinitions.values();
+        const capsuleRadius = Math.max(0.0, finite(radius));
+        for (const door of doors) {
             if ((this.doorOpenProgress.get(door.id) || 0) < 0.42) continue;
-            if (Math.hypot(px - door.x, py - door.y) > door.passageRadius) continue;
-            if (!Number.isFinite(door.z)) return true;
-            if (capsuleMaxZ >= door.z - door.passageHalfHeight && capsuleMinZ <= door.z + door.passageHalfHeight) {
-                return true;
+            if (capsuleMaxZ < door.minZ || capsuleMinZ > door.maxZ) continue;
+            const dx = px - door.x;
+            const dy = py - door.y;
+            if (!door.hasOrientation) {
+                if (Math.hypot(dx, dy) <= door.passageHalfWidth + capsuleRadius) return true;
+                continue;
             }
+            const alongDoor = dx * door.tangentX + dy * door.tangentY;
+            const throughDoor = dx * door.normalX + dy * door.normalY;
+            if (Math.abs(alongDoor) <= door.passageHalfWidth + capsuleRadius
+                && Math.abs(throughDoor) <= door.passageHalfDepth + capsuleRadius) return true;
         }
         return false;
     }
@@ -1206,32 +1396,61 @@ export class CollisionWorld {
     resolveGround(x, y, zHint = NaN, {
         preferInterior = true,
         maxSnapDistance = 35.0,
+        maxRise = 1.5,
+        maxDrop = Number.POSITIVE_INFINITY,
+        nearestToHint = false,
         applyYbnCalibration = true,
     } = {}) {
         const app = this.app;
-        // A bounded demo ships an explicit YBN collision mesh. Rendered
-        // drawables can contain overlapping visual floors, so they must not
-        // replace that authored collision surface while the demo is active.
-        const ybnOnly = app?.spawnDistrictDemo === true;
+        // City streets use authored YBN as their sole gameplay surface. An
+        // active MLO is different: destination overlays may intentionally have
+        // no YBN at all, so their authored room floor must remain eligible.
+        // Requiring an active interior prevents unrelated streamed drawables
+        // from stealing ground authority elsewhere in the bounded demo.
+        const boundedDemo = app?.spawnDistrictDemo === true;
+        const activeInterior = app?.drawableStreamer?._activeInterior || null;
+        const allowAuthoredInterior = preferInterior && (!boundedDemo || !!activeInterior);
         const rawTerrainZ = app?.terrainRenderer?.getHeightAtXY?.(x, y);
         const groundEnabled = app?.groundPedToTerrain === true;
-        const ybnContact = groundEnabled ? this._getYbnGroundContactAtXY(x, y, zHint, 1.5) : null;
+        const ybnContact = groundEnabled ? this._getYbnGroundContactAtXY(
+            x,
+            y,
+            zHint,
+            Math.max(0.0, finite(maxRise, 1.5)),
+            {
+                nearestToHint: nearestToHint === true,
+                maxDrop: Number.isFinite(Number(maxDrop)) ? Math.max(0.0, Number(maxDrop)) : Number.POSITIVE_INFINITY,
+            },
+        ) : null;
         // Derived circuit roads are a separate sparse mesh. They deliberately
         // coexist with GTA YBN rather than replacing it, so the original map
         // remains fully driveable outside the track bounds.
-        const roadContact = this._getDerivedRoadContactAtXY(x, y, zHint, maxSnapDistance);
+        const authoredTrackContact = this.derivedTrackGround ? this._getYbnGroundContactAtXY(
+            x,
+            y,
+            zHint,
+            Math.max(0.0, finite(maxRise, 1.5)),
+            {
+                nearestToHint: true,
+                maxDrop: Number.isFinite(Number(maxDrop)) ? Math.max(0.0, Number(maxDrop)) : Math.max(3.0, maxSnapDistance),
+            },
+            this.derivedTrackGround,
+        ) : null;
+        // The authored physics mesh owns track contact. The AI ribbon remains
+        // a compatibility fallback for older/local packages only.
+        const roadContact = authoredTrackContact || this._getDerivedRoadContactAtXY(x, y, zHint, maxSnapDistance);
         const rawYbnZ = ybnContact?.z ?? null;
         const ybnOffset = applyYbnCalibration ? (Number(this.ybnGroundOffset) || 0.0) : 0.0;
         const ybnZ = Number.isFinite(rawYbnZ) ? Number(rawYbnZ) + ybnOffset : null;
         let bestZ = Number.isFinite(Number(roadContact?.z)) ? Number(roadContact.z) : (Number.isFinite(ybnZ) ? Number(ybnZ) : null);
         let source = Number.isFinite(Number(roadContact?.z)) ? 'track' : (Number.isFinite(ybnZ) ? 'ybn' : 'none');
         let interior = null;
+        const hint = Number.isFinite(Number(zHint))
+            ? Number(zHint)
+            : (bestZ !== null ? bestZ : 0.0);
 
-        if (preferInterior && !ybnOnly) {
+        if (allowAuthoredInterior) {
             try {
-                const hint = Number.isFinite(Number(zHint))
-                    ? Number(zHint)
-                    : (bestZ !== null ? bestZ : 0.0);
                 interior = app?.drawableStreamer?.getInteriorFloorAtDataPos?.([x, y, hint], {
                     zPadBelow: 14.0,
                     zPadAbove: 8.0,
@@ -1245,7 +1464,10 @@ export class CollisionWorld {
                 const closeToHint = Number.isFinite(hint)
                     ? Math.abs(floorZ - hint) <= Math.max(2.0, maxSnapDistance)
                     : true;
-                if (interior.inRoom || closeToHint || bestZ === null || floorZ > bestZ) {
+                const eligible = boundedDemo
+                    ? interior.inRoom === true
+                    : (interior.inRoom || closeToHint || bestZ === null || floorZ > bestZ);
+                if (eligible) {
                     bestZ = floorZ;
                     source = 'interior';
                 }
@@ -1267,6 +1489,9 @@ export class CollisionWorld {
             source,
             material: source === 'track' ? (roadContact?.material || 'asphalt') : source === 'ybn' ? (ybnContact?.material || 'asphalt') : source === 'interior' ? 'concrete' : source === 'terrain' ? 'dirt' : 'asphalt',
             grip: source === 'track' ? roadContact?.grip ?? null : source === 'ybn' ? ybnContact?.grip ?? null : null,
+            damping: source === 'track' ? roadContact?.damping ?? null : source === 'ybn' ? ybnContact?.damping ?? null : null,
+            validTrack: source === 'track' ? roadContact?.validTrack === true : null,
+            pitlane: source === 'track' ? roadContact?.pitlane === true : null,
             wetGrip: source === 'ybn' ? ybnContact?.wetGrip ?? null : null,
             tyreDrag: source === 'ybn' ? ybnContact?.tyreDrag ?? null : null,
             topSpeedMultiplier: source === 'ybn' ? ybnContact?.topSpeedMultiplier ?? null : null,
@@ -1278,7 +1503,11 @@ export class CollisionWorld {
             ybnZ: Number.isFinite(ybnZ) ? Number(ybnZ) : null,
             rawYbnZ: Number.isFinite(rawYbnZ) ? Number(rawYbnZ) : null,
             ybnCalibrationOffset: ybnOffset,
-            surfacePolicy: source === 'track' ? 'derived_track_road' : ybnOnly ? 'aligned_ybn' : 'aligned_ybn_then_drawable_floor',
+            surfacePolicy: source === 'track'
+                ? 'derived_track_road'
+                : boundedDemo
+                    ? (allowAuthoredInterior ? 'aligned_ybn_then_active_mlo_floor' : 'aligned_ybn')
+                    : 'aligned_ybn_then_drawable_floor',
             interiorFloorZ: interior && Number.isFinite(Number(interior.floorZ)) ? Number(interior.floorZ) : null,
             interior,
         };
@@ -1409,10 +1638,15 @@ export class CollisionWorld {
         maxStepUp = 1.15,
         obstacleStepUp = NaN,
         maxSnapDistance = 35.0,
+        maxGroundRise = maxStepUp,
         applyYbnCalibration = true,
         useDrawableProxies = this.useDrawableCollisionProxies,
     } = {}) {
-        const groundOptions = { maxSnapDistance, applyYbnCalibration };
+        const groundOptions = {
+            maxSnapDistance,
+            maxRise: Math.max(0.0, finite(maxGroundRise, maxStepUp)),
+            applyYbnCalibration,
+        };
         const oldGround = this.resolveGround(x, y, feetZ, groundOptions);
         const rawTx = finite(x) + finite(vx) * Math.max(0.0, finite(dt));
         const rawTy = finite(y) + finite(vy) * Math.max(0.0, finite(dt));
@@ -1420,6 +1654,19 @@ export class CollisionWorld {
         const tx = bounds ? Math.max(bounds.minX, Math.min(bounds.maxX, rawTx)) : rawTx;
         const ty = bounds ? Math.max(bounds.minY, Math.min(bounds.maxY, rawTy)) : rawTy;
         const hitDistrictBoundary = tx !== rawTx || ty !== rawTy;
+        // A stationary grounded ped has no swept path. Avoid a duplicate floor
+        // probe and a full blocker broadphase on every display frame.
+        if (Math.hypot(tx - finite(x), ty - finite(y)) < 1e-8 && !hitDistrictBoundary) {
+            return {
+                x: tx,
+                y: ty,
+                ground: oldGround,
+                blocked: false,
+                reason: '',
+                vx: finite(vx),
+                vy: finite(vy),
+            };
+        }
         const targetGround = this.resolveGround(tx, ty, feetZ, groundOptions);
 
         const stepDelta = targetGround.z - oldGround.z;
@@ -1567,6 +1814,13 @@ export class CollisionWorld {
         const targetGround = this.resolveGround(targetX, targetY, baseZ, groundOptions);
         const wheelStep = Math.max(0.2, Math.min(0.75, finite(maxStepUp, finite(wheelRadius, 0.4) * 1.4)));
         if (targetGround.z - oldGround.z > wheelStep) {
+            this.lastVehicleCollision = {
+                source: 'ground_step',
+                label: 'suspension_step',
+                x: targetX,
+                y: targetY,
+                rise: targetGround.z - oldGround.z,
+            };
             return { x: startX, y: startY, ground: oldGround, blocked: true, reason: 'suspension_step', vx: finite(vx) * 0.12, vy: finite(vy) * 0.12 };
         }
         if (targetX !== rawTargetX || targetY !== rawTargetY) {
@@ -1597,7 +1851,12 @@ export class CollisionWorld {
         const maxX = Math.max(startX, targetX) + broadphasePadding;
         const maxY = Math.max(startY, targetY) + broadphasePadding;
         const sweepOptions = {
-            obstacleStepUp: 0.0,
+            // Road YBNs contain short vertical faces at lane/mesh seams.  The
+            // chassis used to treat every one as a wall (zero permitted rise),
+            // which creates an invisible collision in otherwise flat streets.
+            // The wheel/ground check above still rejects a real step; this only
+            // lets the chassis clear a normal, driveable road seam or curb lip.
+            obstacleStepUp: Math.min(0.28, wheelStep),
             useDrawableProxies: false,
             blockerCandidates: this._queryCircleGrid(this._blockerGrid, this._blockerCellSize, minX, minY, maxX, maxY),
             assetCandidates: this._queryCircleGrid(this._assetColliderGrid, this._assetColliderCellSize, minX, minY, maxX, maxY),
@@ -1620,6 +1879,7 @@ export class CollisionWorld {
 
         const firstSweep = firstVehicleSweep(startX, startY, deltaX, deltaY);
         if (!firstSweep) {
+            this.lastVehicleCollision = null;
             return { x: targetX, y: targetY, ground: targetGround, blocked: false, reason: '', vx: finite(vx), vy: finite(vy), surface: targetGround.material || targetGround.source || 'road' };
         }
 
@@ -1642,6 +1902,15 @@ export class CollisionWorld {
         }
         const ground = this.resolveGround(outX, outY, baseZ, groundOptions);
         const velocityDot = finite(vx) * normalX + finite(vy) * normalY;
+        this.lastVehicleCollision = {
+            source: String(firstSweep.hit?.source || 'collision'),
+            id: firstSweep.hit?.id ? String(firstSweep.hit.id) : null,
+            label: String(firstSweep.hit?.label || 'chassis'),
+            x: outX,
+            y: outY,
+            triangleOffset: Number.isFinite(Number(firstSweep.hit?.triangleOffset)) ? Number(firstSweep.hit.triangleOffset) : null,
+            chassisProbeOffset: firstSweep.probeOffset,
+        };
         return {
             x: outX,
             y: outY,
@@ -1770,7 +2039,7 @@ export class CollisionWorld {
         // A doorway can cut through a neighboring wall/foliage proxy whose
         // conservative OBB overlaps the authored opening. Clear the complete
         // passage while the door is open, not only the moving door collider.
-        if (this._isOpenDoorPassage(x, y, feetZ, height)) return null;
+        if (this._isOpenDoorPassage(x, y, feetZ, height, radius)) return null;
         const r = Math.max(0.05, finite(radius, 0.38));
         const gx0 = Math.floor((finite(x) - r) / cellSize);
         const gy0 = Math.floor((finite(y) - r) / cellSize);
@@ -1977,20 +2246,25 @@ export class CollisionWorld {
     }
 
     _firstYbnWallHit(x, y, feetZ, radius, height = 1.8, maxStepUp = 1.15, moveX = 0.0, moveY = 0.0, obstacleStepUp = NaN) {
-        const world = this.ybnGround;
+        const args = [x, y, feetZ, radius, height, maxStepUp, moveX, moveY, obstacleStepUp];
+        return this._firstTriangleWorldWallHit(this.derivedTrackGround, 0.0, 'track_wall', ...args)
+            || this._firstTriangleWorldWallHit(this.ybnGround, Number(this.ybnGroundOffset) || 0.0, 'ybn_wall', ...args);
+    }
+
+    _firstTriangleWorldWallHit(world, offsetZ, source, x, y, feetZ, radius, height = 1.8, maxStepUp = 1.15, moveX = 0.0, moveY = 0.0, obstacleStepUp = NaN) {
         if (!world?.wallGrid || !world?.vertices || !world?.indices) return null;
         const px = Number(x); const py = Number(y); const pz = Number(feetZ);
         const r = Math.max(0.05, finite(radius, 0.38));
         const capsuleHeight = Math.max(0.2, finite(height, 1.8));
         if (![px, py, pz].every(Number.isFinite)) return null;
-        if (this._isOpenDoorPassage(px, py, pz, capsuleHeight)) return null;
+        if (this._isOpenDoorPassage(px, py, pz, capsuleHeight, r)) return null;
         const gx0 = Math.floor((px - r) / world.cellSize);
         const gy0 = Math.floor((py - r) / world.cellSize);
         const gx1 = Math.floor((px + r) / world.cellSize);
         const gy1 = Math.floor((py + r) / world.cellSize);
         const capsuleMinZ = pz;
         const capsuleMaxZ = pz + capsuleHeight;
-        const offsetZ = Number(this.ybnGroundOffset) || 0.0;
+        const worldOffsetZ = Number(offsetZ) || 0.0;
         const radiusSq = r * r;
         const tested = new Set();
         let best = null;
@@ -2005,9 +2279,9 @@ export class CollisionWorld {
                     const ia = world.indices[offset] * 3;
                     const ib = world.indices[offset + 1] * 3;
                     const ic = world.indices[offset + 2] * 3;
-                    const ax = world.vertices[ia], ay = world.vertices[ia + 1], az = world.vertices[ia + 2] + offsetZ;
-                    const bx = world.vertices[ib], by = world.vertices[ib + 1], bz = world.vertices[ib + 2] + offsetZ;
-                    const cx = world.vertices[ic], cy = world.vertices[ic + 1], cz = world.vertices[ic + 2] + offsetZ;
+                    const ax = world.vertices[ia], ay = world.vertices[ia + 1], az = world.vertices[ia + 2] + worldOffsetZ;
+                    const bx = world.vertices[ib], by = world.vertices[ib + 1], bz = world.vertices[ib + 2] + worldOffsetZ;
+                    const cx = world.vertices[ic], cy = world.vertices[ic + 1], cz = world.vertices[ic + 2] + worldOffsetZ;
                     if (this._isYbnCollisionExcluded(ax, ay, az, bx, by, bz, cx, cy, cz)) continue;
                     const triangleMinZ = Math.min(az, bz, cz);
                     const triangleMaxZ = Math.max(az, bz, cz);
@@ -2024,6 +2298,11 @@ export class CollisionWorld {
                         px, py, pz, r, capsuleHeight,
                         ax, ay, az, bx, by, bz, cx, cy, cz,
                     );
+                    // Tourist-entry gate WALL meshes cross the authored AI
+                    // driving centerline in two places. Treat only the narrow,
+                    // metadata-derived inner corridor over TRM-NRM as open;
+                    // side walls and guardrails retain normal collision.
+                    if (source === 'track_wall' && this._isDerivedTrackCorridorWall(world, offset, contact.triangleX, contact.triangleY, contact.triangleZ)) continue;
                     const distanceSq = contact.bestDistanceSq;
                     if (distanceSq > radiusSq || (best && distanceSq >= best.distanceSq)) continue;
                     let normalX = contact.capsuleX - contact.triangleX;
@@ -2048,7 +2327,7 @@ export class CollisionWorld {
                     }
                     if (Math.hypot(moveX, moveY) > 1e-8 && moveX * normalX + moveY * normalY >= -1e-7) continue;
                     best = {
-                        source: 'ybn_wall',
+                        source,
                         label: 'wall',
                         triangleOffset: Number(offset),
                         distanceSq,
