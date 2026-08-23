@@ -2,6 +2,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 const DOOR_PATTERN = /(?:door|gate|shutter|roller|barrier|hatch)/i;
 const NON_DOOR_PATTERN = /(?:door[_\s-]*frame|door[_\s-]*det(?:al|ail)|barrier[_\s-]*rope)/i;
@@ -29,7 +30,10 @@ function parseArgs(argv) {
 }
 
 function readJson(file) {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (fs.existsSync(`${file}.gz`)) return JSON.parse(zlib.gunzipSync(fs.readFileSync(`${file}.gz`)).toString('utf8'));
+    if (fs.existsSync(`${file}.br`)) return JSON.parse(zlib.brotliDecompressSync(fs.readFileSync(`${file}.br`)).toString('utf8'));
+    throw new Error(`Missing JSON asset (identity/gzip/brotli): ${file}`);
 }
 
 function readEnt1(file) {
@@ -243,6 +247,52 @@ function metadataCoverage(files, roots, childrenByParent, nonRenderable) {
     return { sourceRoots: sourceRoots.length, matchedChildren, omittedNonRenderableChildren, unmatchedRoots, unmatchedChildren };
 }
 
+function collisionCoverage(descriptor, roots, manifestFile) {
+    const manifest = readJson(manifestFile);
+    const compiledNames = new Set((manifest.source_ybn_names || []).map(String));
+    for (const overlay of manifest.destination_overlays || []) {
+        for (const name of overlay.source_ybn_names || []) compiledNames.add(String(name));
+    }
+    const imports = Array.isArray(descriptor.mloRuntime?.collisionImports)
+        ? descriptor.mloRuntime.collisionImports : [];
+    const declaredRoots = new Set();
+    const requiredNames = new Set();
+    const invalidImports = [];
+    for (const item of imports) {
+        const rootHashes = Array.isArray(item?.rootArchetypeHashes) ? item.rootArchetypeHashes.map(String) : [];
+        if (!rootHashes.length || typeof item?.sourceHasCollision !== 'boolean') {
+            invalidImports.push({ id: item?.id || '', reason: 'missing-root-or-source-declaration' });
+        }
+        for (const hash of rootHashes) declaredRoots.add(hash);
+        const sources = Array.isArray(item?.sources) ? item.sources : [];
+        if (item?.sourceHasCollision === true && sources.length === 0) {
+            invalidImports.push({ id: item?.id || '', reason: 'collision-declared-without-sources' });
+        }
+        for (const source of sources) {
+            if (!source?.placement?.mode || !source?.expectedCompiledName) {
+                invalidImports.push({ id: item?.id || '', file: source?.file || '', reason: 'incomplete-source-contract' });
+                continue;
+            }
+            requiredNames.add(String(source.expectedCompiledName));
+        }
+    }
+    const rootHashes = new Set(roots.map((root) => String(root.hash)));
+    const missingRootDeclarations = [...rootHashes].filter((hash) => !declaredRoots.has(hash)).sort((a, b) => Number(a) - Number(b));
+    const missingCompiledSources = [...requiredNames].filter((name) => !compiledNames.has(name)).sort();
+    return {
+        ok: descriptor.mloRuntime?.collisionContractSchema === 'webglgta-mlo-collision-import-v1'
+            && invalidImports.length === 0 && missingRootDeclarations.length === 0 && missingCompiledSources.length === 0,
+        schema: descriptor.mloRuntime?.collisionContractSchema || null,
+        imports: imports.length,
+        declaredRoots: declaredRoots.size,
+        compiledSources: compiledNames.size,
+        requiredSources: requiredNames.size,
+        invalidImports,
+        missingRootDeclarations,
+        missingCompiledSources,
+    };
+}
+
 function main() {
     const args = parseArgs(process.argv);
     for (const key of ['descriptor', 'entities', 'manifest', 'interiors', 'interactables']) {
@@ -312,6 +362,8 @@ function main() {
             children: owned.length,
             uniqueChildArchetypes: new Set(owned.map((child) => child.hash)).size,
             definitionPresent: !!definition,
+            authoritativeContentBounds: !!definition?.contentBounds?.complete,
+            contentBounds: definition?.contentBounds || null,
             portalCoverage: definition ? portalCoverage(root, definition, doors) : null,
         });
     }
@@ -323,6 +375,7 @@ function main() {
         uniqueChildArchetypeCount: ownedHashes.size,
         interiorDefinitionCount: new Set(roots.map((root) => root.hash).filter((hash) => fs.existsSync(path.join(args.interiors, `${hash}.json`)))).size,
     };
+    const collision = args.collisionManifest ? collisionCoverage(descriptor, roots, args.collisionManifest) : null;
     const staleDescriptorFields = {};
     for (const key of ['mloRootCount', 'mloChildCount', 'uniqueChildArchetypeCount', 'interiorDefinitionCount']) {
         const declared = Number(descriptor.mloImport?.[key]);
@@ -349,9 +402,10 @@ function main() {
             && placeholderArchetypes === 0
             && missingMeshFiles.length === 0
             && missingTextures.length === 0
-            && rootReports.every((root) => root.definitionPresent && root.portalCoverage.invalid.length === 0)
+            && rootReports.every((root) => root.definitionPresent && root.authoritativeContentBounds && root.portalCoverage.invalid.length === 0)
             && rootReports.every((root) => root.portalCoverage.boundClosable === root.portalCoverage.closable)
-            && missingDoorInstances.length === 0,
+            && missingDoorInstances.length === 0
+            && (!args.collisionManifest || collision.ok),
         entities: { records: ent.count, stride: ent.stride, ...actualImport },
         descriptor: { staleFields: staleDescriptorFields },
         assets: {
@@ -375,6 +429,7 @@ function main() {
         },
         roots: rootReports,
         metadata: args.metadata.length ? metadataCoverage(args.metadata, roots, childrenByParent, nonRenderable) : null,
+        collision,
     };
     const output = JSON.stringify(report, null, 2) + '\n';
     if (args.output) fs.writeFileSync(args.output, output);

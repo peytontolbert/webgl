@@ -38,6 +38,13 @@ def main() -> int:
     descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
     manifest = assets / str(descriptor.get("manifestFile") or "demo/spawn_district_models_bootstrap_v1.json")
     entities = assets / str(descriptor.get("instanceFile") or "demo/spawn_district_entities_mlo.bin")
+    collision_layers_path = assets / str(descriptor.get("compiledCollisionManifestFile") or "")
+    collision_static_path: Path | None = None
+    if collision_layers_path.is_file():
+        collision_layers = json.loads(collision_layers_path.read_text(encoding="utf-8"))
+        collision_static_path = collision_layers_path.parent / str(
+            ((collision_layers.get("base_layer") or {}).get("static_ybn") or {}).get("manifest") or ""
+        )
 
     checks: dict[str, Any] = {}
     exit_codes: dict[str, int] = {}
@@ -50,6 +57,10 @@ def main() -> int:
             "--interiors", str(assets / "interiors"), "--interactables", str(assets / "demo/interactables.json"),
             "--asset-root", str(assets),
         ],
+        "mloContentBounds": [
+            sys.executable, str(tools / "annotate_mlo_content_bounds.py"),
+            "--descriptor", str(descriptor_path), "--check",
+        ],
         "trackBalanced": [
             sys.executable, str(tools / "audit_track_lod_texture_coverage.py"),
             str(assets / "tracks/nordschleife/scene/scene.json"), "--web-root", str(dist),
@@ -59,6 +70,8 @@ def main() -> int:
             str(assets / "tracks/nordschleife/scene_full_v3/scene.json"), "--web-root", str(dist),
         ],
     }
+    if collision_static_path and collision_static_path.is_file():
+        commands["mlo"].extend(["--collision-manifest", str(collision_static_path)])
     if extensions.is_dir():
         commands["extensionsCompression"] = [
             sys.executable, str(tools / "audit_runtime_compression.py"), str(extensions), "--verify-json",
@@ -82,6 +95,7 @@ def main() -> int:
             "compressionCoverage": checks["compression"].get("sidecarCoverage"),
             "jsonParseErrors": len((checks["compression"].get("jsonVerification") or {}).get("parseErrors") or []),
             "mloCoverage": checks["mlo"].get("ok"),
+            "mloContentBounds": checks["mloContentBounds"].get("ok"),
             "balancedTrackCoverage": checks["trackBalanced"].get("ok"),
             "fullTrackCoverage": checks["trackFull"].get("ok"),
             "extensionsCompressionCoverage": checks.get("extensionsCompression", {}).get("sidecarCoverage"),

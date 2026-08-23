@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -44,7 +45,12 @@ def main() -> int:
     u32_chunks = 0
     for chunk_id, item in (manifest.get("chunks") or {}).items():
         path = root / str(item["file"])
-        data = path.read_bytes()
+        if path.is_file():
+            data = path.read_bytes()
+        elif path.with_suffix(path.suffix + ".gz").is_file():
+            data = gzip.decompress(path.with_suffix(path.suffix + ".gz").read_bytes())
+        else:
+            raise ValueError(f"{chunk_id}: missing identity and gzip chunk")
         if len(data) < HEADER.size:
             raise ValueError(f"{chunk_id}: truncated header")
         magic, version, flags, vertex_count, triangle_count, ground_refs, wall_refs, cell_count = HEADER.unpack_from(data)

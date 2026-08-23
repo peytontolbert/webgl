@@ -144,9 +144,21 @@ def main() -> int:
             handle.writelines(mutable)
         temporary.replace(instance_path)
 
+    descriptor_manifest = assets_dir / str(descriptor.get("manifestFile") or "")
+    manifest = json.loads(descriptor_manifest.read_text(encoding="utf-8")) if descriptor_manifest.is_file() else {}
+    meshes = manifest.get("meshes") or {}
+    nonrenderable = {str(value) for value in (manifest.get("nonRenderableHashes") or [])}
+    metadata_roots = [
+        root_item
+        for _, metadata in metadata_inputs
+        for root_item in (metadata.get("roots") or [])
+        if isinstance(root_item, dict)
+    ]
     interior_count = 0
     for _, metadata in metadata_inputs:
-        interior_count += _write_interior_definitions(metadata.get("interiors") or {}, assets_dir)
+        interior_count += _write_interior_definitions(
+            metadata.get("interiors") or {}, assets_dir, metadata_roots, meshes, nonrenderable
+        )
 
     coverage: dict[str, Any] = {}
     for path in sorted((assets_dir / "interiors").glob("*.json"), key=lambda item: int(item.stem)):
@@ -163,6 +175,7 @@ def main() -> int:
             "roomsWithTimecycle": sum(1 for room in rooms if _u32(room.get("timecycleName"))),
             "portalsWithFlags": sum(1 for portal in portals if "flags" in portal),
             "portalsWithAudioOcclusion": sum(1 for portal in portals if "audioOcclusion" in portal),
+            "authoritativeContentBounds": bool(definition.get("contentBounds", {}).get("complete")),
         }
     revision_digest = hashlib.sha256(instance_path.read_bytes())
     for hash_id in sorted(coverage, key=int):
@@ -184,6 +197,28 @@ def main() -> int:
         (path.stem for path in (assets_dir / "interiors").glob("*.json") if path.stem.isdigit()),
         key=int,
     )
+    root_records = [
+        record for record in records
+        if len(record) >= 64 and (struct.unpack_from("<I", record, 60)[0] & 1)
+    ]
+    child_records = [
+        record for record in records
+        if len(record) >= 64 and struct.unpack_from("<I", record, 52)[0]
+    ]
+    imported_hashes = {str(struct.unpack_from("<I", record, 0)[0]) for record in child_records}
+    # Later import passes may append complete MLO resources after the original
+    # district build. Recompute the authoritative aggregate instead of leaving
+    # the descriptor frozen at whichever resource happened to run first.
+    descriptor["mloImport"] = {
+        **(descriptor.get("mloImport") or {}),
+        "retainedBaseInstanceCount": len(records) - len(root_records) - len(child_records),
+        "mloRootCount": len(root_records),
+        "mloChildCount": len(child_records),
+        "totalInstanceCount": len(records),
+        "interiorDefinitionCount": len(interior_hashes),
+        "uniqueChildArchetypeCount": len(imported_hashes),
+    }
+    descriptor["instanceCount"] = len(records)
     descriptor["mloRuntime"] = {
         "schema": "webglgta-mlo-runtime-v1",
         "enabled": True,

@@ -1374,6 +1374,24 @@ export class DrawableStreamer {
         return Math.hypot(dx, dy, dz);
     }
 
+    _distanceToMloContentBounds(localPosition, definition, xyPadding = 0.0, zPadding = 0.0) {
+        const bounds = definition?.contentBounds;
+        if (bounds?.complete !== true) return Number.POSITIVE_INFINITY;
+        const mn = bounds?.min;
+        const mx = bounds?.max;
+        if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) {
+            return Number.POSITIVE_INFINITY;
+        }
+        const values = [...mn.slice(0, 3), ...mx.slice(0, 3), ...localPosition.slice(0, 3)].map(Number);
+        if (!values.every(Number.isFinite)) return Number.POSITIVE_INFINITY;
+        const px = Math.max(0, Number(xyPadding) || 0);
+        const pz = Math.max(0, Number(zPadding) || 0);
+        const dx = Math.max(values[0] - px - values[6], 0, values[6] - (values[3] + px));
+        const dy = Math.max(values[1] - px - values[7], 0, values[7] - (values[4] + px));
+        const dz = Math.max(values[2] - pz - values[8], 0, values[8] - (values[5] + pz));
+        return Math.hypot(dx, dy, dz);
+    }
+
     _attachMloSpatialBounds(entries, instances) {
         const byParent = new Map();
         for (const instance of (instances || [])) {
@@ -1629,21 +1647,26 @@ export class DrawableStreamer {
                 position[2] - Number(inst.mat16[14]),
             );
             const sentinelBounds = this._hasSentinelRoomBounds(def);
+            const hasContentBounds = Number.isFinite(this._distanceToMloContentBounds(local, def));
             const hasSpatialBounds = Number.isFinite(this._distanceToMloSpatialBounds(position, inst.spatialBounds));
             let insideSpatialEnvelope = false;
-            if (sentinelBounds && hasSpatialBounds) {
-                // The child envelope is the complete authored MLO placement,
-                // unlike a sentinel room box or a single entrance portal.
-                // Small padding covers doorway thresholds and sparse shell
-                // origins without allowing an MLO to claim the wider city.
-                insideSpatialEnvelope = this._distanceToMloSpatialBounds(position, inst.spatialBounds, 4.0, 6.0) === 0;
-                const exteriorDistance = this._distanceToMloSpatialBounds(position, inst.spatialBounds, 0.0, 4.0);
+            if (sentinelBounds && (hasContentBounds || hasSpatialBounds)) {
+                // V3 definitions store this envelope once at import time. The
+                // streamed-child envelope remains a compatibility fallback for
+                // older packages only.
+                const envelopeDistance = hasContentBounds
+                    ? this._distanceToMloContentBounds(local, def, 4.0, 6.0)
+                    : this._distanceToMloSpatialBounds(position, inst.spatialBounds, 4.0, 6.0);
+                insideSpatialEnvelope = envelopeDistance === 0;
+                const exteriorDistance = hasContentBounds
+                    ? this._distanceToMloContentBounds(local, def, 0.0, 4.0)
+                    : this._distanceToMloSpatialBounds(position, inst.spatialBounds, 0.0, 4.0);
                 if (!insideSpatialEnvelope && exteriorDistance > Math.min(40.0, this.interiorExteriorDistance)) continue;
             } else if (rootDistance > this._interiorActivationRadius(def)) {
                 continue;
             }
             const exteriorRoomIndex = this._findExteriorRoomIndex(def);
-            const roomIndex = sentinelBounds && hasSpatialBounds && !insideSpatialEnvelope
+            const roomIndex = sentinelBounds && (hasContentBounds || hasSpatialBounds) && !insideSpatialEnvelope
                 ? exteriorRoomIndex
                 : this._findContainingRoomIndex(def, local);
             if (roomIndex >= 0 && roomIndex !== exteriorRoomIndex && rootDistance < nearestInteriorDistance) {
@@ -1680,6 +1703,30 @@ export class DrawableStreamer {
         return nearestInterior || nearestExterior;
     }
 
+    _resolveVisibleInteriors(instances, position) {
+        const visible = new Map();
+        let active = null;
+        let activeDistance = Number.POSITIVE_INFINITY;
+        for (const instance of instances || []) {
+            const state = this._resolveActiveInterior([instance], position);
+            if (!state) continue;
+            visible.set(Number(state.parentGuid) >>> 0, state);
+            const rootDistance = Math.hypot(
+                position[0] - Number(instance.mat16?.[12]),
+                position[1] - Number(instance.mat16?.[13]),
+                position[2] - Number(instance.mat16?.[14]),
+            );
+            // A containing room owns environment/audio state. If more than one
+            // authored shell overlaps, choose the nearest root deterministically.
+            if (!active || (active.isExterior && !state.isExterior)
+                || (active.isExterior === state.isExterior && rootDistance < activeDistance)) {
+                active = state;
+                activeDistance = rootDistance;
+            }
+        }
+        return { active, visible };
+    }
+
     _filterEntriesForActiveInterior(entries, suppliedMloInstances = null) {
         if (!this.enableInteriors) return entries;
 
@@ -1711,15 +1758,18 @@ export class DrawableStreamer {
         // radii. Both paths therefore use the same MLO activation semantics.
         this._attachMloSpatialBounds(entries, mloInstances);
 
-        const active = this._resolveActiveInterior(mloInstances, this._lastCamDataPos || [0, 0, 0]);
+        const resolved = this._resolveVisibleInteriors(mloInstances, this._lastCamDataPos || [0, 0, 0]);
+        const active = resolved.active;
+        this._visibleMloInteriors = resolved.visible;
 
         const key = active ? `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${active.isExterior ? 1 : 0}:${Array.from(active.visibleRooms).sort((a,b)=>a-b).join(',')}` : '';
         this._activeInterior = active;
         this._activeInteriorKey = key;
         this._publishInteriorRuntimeStatus();
 
-        // If we are not inside any interior, drop all interior-child instances.
-        if (!active) {
+        // If no imported shell is close enough to contribute through its
+        // exterior room/portals, drop all interior-child instances.
+        if (resolved.visible.size === 0) {
             const outEntries = [];
             for (const e of entries) {
                 const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0, e.instanceStrideFloats);
@@ -1736,7 +1786,9 @@ export class DrawableStreamer {
             return outEntries;
         }
 
-        // Inside one interior: only render that interior's children, with room + entity-set gating.
+        // Render every nearby MLO shell using its own room/portal visibility.
+        // Only `active` owns environment/audio; visibility is not globally
+        // collapsed to one interior, which avoids isolated/vanishing MLOs.
         const outEntries = [];
         for (const e of entries) {
             const stride = this._instanceStrideFloatsForLen(e.mats.length ?? 0, e.instanceStrideFloats);
@@ -1748,28 +1800,29 @@ export class DrawableStreamer {
                 const mloSetHash = (a[i + 19] >>> 0);
                 const mloFlags = (a[i + 20] >>> 0);
                 if (mloParentGuid) {
-                    if (mloParentGuid !== (active.parentGuid >>> 0)) continue;
+                    const visibility = resolved.visible.get(mloParentGuid);
+                    if (!visibility) continue;
                     if (!this._isMloSetEnabled(mloParentGuid, mloSetHash, mloFlags)) continue;
 
-                    if (this.enableRoomGating && active.invMat) {
-                        const def = this._mloDefs.get(String(active.archHash));
+                    if (this.enableRoomGating && visibility.invMat) {
+                        const def = this._mloDefs.get(String(visibility.archHash));
                         const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
                         const ownership = this._decodeMloFlags(mloFlags);
                         if (ownership.portalIndex >= 0) {
                             const portal = (def?.portals || [])[ownership.portalIndex];
                             const from = Number(portal?.roomFrom);
                             const to = Number(portal?.roomTo);
-                            if (!active.visibleRooms.has(from) && !active.visibleRooms.has(to)) continue;
+                            if (!visibility.visibleRooms.has(from) && !visibility.visibleRooms.has(to)) continue;
                         } else {
                             let ri = ownership.roomIndex;
                             if (ri < 0) {
                                 const tx = a[i + 12], ty = a[i + 13], tz = a[i + 14];
                                 const v4 = glMatrix.vec4.fromValues(tx, ty, tz, 1.0);
                                 const out = glMatrix.vec4.create();
-                                glMatrix.vec4.transformMat4(out, v4, active.invMat);
+                                glMatrix.vec4.transformMat4(out, v4, visibility.invMat);
                                 ri = this._findContainingRoomIndex(def, [out[0], out[1], out[2]]);
                             }
-                            if (ri >= 0 && ri < rooms.length && !active.visibleRooms.has(ri)) continue;
+                            if (ri >= 0 && ri < rooms.length && !visibility.visibleRooms.has(ri)) continue;
                         }
                     }
                 }
@@ -1782,7 +1835,9 @@ export class DrawableStreamer {
 
     _computeActiveInteriorFromCache() {
         if (!this.enableInteriors) return { active: null, key: '' };
-        const active = this._resolveActiveInterior(this._mloInstancesLast || [], this._lastCamDataPos || [0, 0, 0]);
+        const active = this._resolveVisibleInteriors(
+            this._mloInstancesLast || [], this._lastCamDataPos || [0, 0, 0]
+        ).active;
         const key = active
             ? `${active.parentGuid}:${active.archHash}:${active.roomIndex}:${active.isExterior ? 1 : 0}:${Array.from(active.visibleRooms).sort((a, b) => a - b).join(',')}`
             : '';

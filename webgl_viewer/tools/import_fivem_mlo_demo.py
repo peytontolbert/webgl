@@ -14,6 +14,7 @@ import copy
 import json
 import logging
 import math
+import re
 import struct
 import sys
 from collections import Counter
@@ -834,12 +835,166 @@ def _write_mlo_ent1(base_path: Path, destination: Path, roots: list[dict[str, An
     }
 
 
-def _write_interior_definitions(interiors: dict[str, Any], assets_dir: Path) -> int:
+def _quat_rotate(point: np.ndarray, quaternion: list[float]) -> np.ndarray:
+    """Rotate XYZ using the same x,y,z,w convention as ENT1/gl-matrix."""
+    q = np.asarray(_vec(quaternion, 4, (0.0, 0.0, 0.0, 1.0)), dtype=np.float64)
+    length = float(np.linalg.norm(q))
+    if length <= 1e-12:
+        return np.asarray(point, dtype=np.float64)
+    q /= length
+    xyz = q[:3]
+    value = np.asarray(point, dtype=np.float64)
+    uv = np.cross(xyz, value)
+    uuv = np.cross(xyz, uv)
+    return value + 2.0 * (q[3] * uv + uuv)
+
+
+def _transform_point(position: Any, rotation: Any, scale: Any, point: np.ndarray) -> np.ndarray:
+    translation = np.asarray(_vec(position, 3, (0.0, 0.0, 0.0)), dtype=np.float64)
+    scaling = np.asarray(_vec(scale, 3, (1.0, 1.0, 1.0)), dtype=np.float64)
+    return translation + _quat_rotate(np.asarray(point, dtype=np.float64) * scaling, rotation)
+
+
+def _inverse_transform_point(position: Any, rotation: Any, scale: Any, point: np.ndarray) -> np.ndarray:
+    translation = np.asarray(_vec(position, 3, (0.0, 0.0, 0.0)), dtype=np.float64)
+    scaling = np.asarray(_vec(scale, 3, (1.0, 1.0, 1.0)), dtype=np.float64)
+    if np.any(np.abs(scaling) <= 1e-12):
+        raise ValueError("MLO root has a zero scale component")
+    quaternion = _vec(rotation, 4, (0.0, 0.0, 0.0, 1.0))
+    inverse = [-quaternion[0], -quaternion[1], -quaternion[2], quaternion[3]]
+    return _quat_rotate(np.asarray(point, dtype=np.float64) - translation, inverse) / scaling
+
+
+def _bounds_pair(bounds: Any) -> tuple[np.ndarray, np.ndarray] | None:
+    if not isinstance(bounds, dict):
+        return None
+    minimum = np.asarray(_vec(bounds.get("min"), 3, (float("nan"),) * 3), dtype=np.float64)
+    maximum = np.asarray(_vec(bounds.get("max"), 3, (float("nan"),) * 3), dtype=np.float64)
+    if not (np.all(np.isfinite(minimum)) and np.all(np.isfinite(maximum)) and np.all(maximum >= minimum)):
+        return None
+    return minimum, maximum
+
+
+def _mesh_reference_bounds(assets_dir: Path, reference: Any) -> tuple[np.ndarray, np.ndarray] | None:
+    match = re.fullmatch(r"(.+?)(?:#(\d+):(\d+))?", str(reference or ""))
+    if not match:
+        return None
+    relative = match.group(1).replace("\\", "/")
+    relative = f"demo/{relative[len('@demo-pack/'):]}" if relative.startswith("@demo-pack/") else relative
+    path = assets_dir / relative
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if match.group(2) is not None:
+        offset, length = int(match.group(2)), int(match.group(3))
+        raw = raw[offset:offset + length]
+    if len(raw) < 20 or raw[:4] != b"MSH0":
+        return None
+    _magic, version, vertices, _indices, _flags = struct.unpack_from("<4sIIII", raw, 0)
+    if vertices <= 0:
+        return None
+    if version == 10 and len(raw) >= 44:
+        minimum = np.asarray(struct.unpack_from("<3f", raw, 20), dtype=np.float64)
+        extent = np.asarray(struct.unpack_from("<3f", raw, 32), dtype=np.float64)
+        return minimum, minimum + extent
+    if version == 9 and len(raw) >= 20 + vertices * 6:
+        positions = np.frombuffer(raw, dtype="<f2", count=vertices * 3, offset=20).astype(np.float64).reshape(-1, 3)
+    elif 1 <= version <= 8 and len(raw) >= 20 + vertices * 12:
+        positions = np.frombuffer(raw, dtype="<f4", count=vertices * 3, offset=20).astype(np.float64).reshape(-1, 3)
+    else:
+        return None
+    return positions.min(axis=0), positions.max(axis=0)
+
+
+def _mesh_bounds(mesh: dict[str, Any] | None, assets_dir: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    if not isinstance(mesh, dict):
+        return None
+    direct = _bounds_pair(mesh.get("bounds"))
+    if direct is not None:
+        return direct
+    boxes: list[tuple[np.ndarray, np.ndarray]] = []
+    for lod in (mesh.get("lods") or {}).values():
+        if not isinstance(lod, dict):
+            continue
+        lod_bounds = _bounds_pair(lod.get("bounds"))
+        if lod_bounds is not None:
+            boxes.append(lod_bounds)
+            continue
+        submeshes = lod.get("submeshes") or ([lod] if lod.get("file") else [])
+        for submesh in submeshes:
+            if not isinstance(submesh, dict):
+                continue
+            bounds = _bounds_pair(submesh.get("bounds")) or _mesh_reference_bounds(assets_dir, submesh.get("file"))
+            if bounds is not None:
+                boxes.append(bounds)
+        # One complete LOD is sufficient and avoids opening duplicate LOD geometry.
+        if boxes:
+            break
+    if not boxes:
+        return None
+    return np.min(np.stack([box[0] for box in boxes]), axis=0), np.max(np.stack([box[1] for box in boxes]), axis=0)
+
+
+def _content_bounds_for_archetype(
+    hash_id: str,
+    roots: list[dict[str, Any]],
+    meshes: dict[str, Any],
+    nonrenderable: set[str],
+    assets_dir: Path,
+) -> dict[str, Any] | None:
+    minimum = np.full(3, np.inf, dtype=np.float64)
+    maximum = np.full(3, -np.inf, dtype=np.float64)
+    child_count = mesh_child_count = declared_nonrenderable_count = 0
+    missing_mesh_hashes: set[str] = set()
+    matching_roots = [root for root in roots if str(_u32(root.get("archetypeHash"))) == str(hash_id)]
+    for root in matching_roots:
+        for child in root.get("children") or []:
+            child_count += 1
+            child_hash = str(_u32(child.get("archetypeHash")))
+            bounds = _mesh_bounds(meshes.get(child_hash), assets_dir)
+            if bounds is None:
+                if child_hash in nonrenderable:
+                    declared_nonrenderable_count += 1
+                else:
+                    missing_mesh_hashes.add(child_hash)
+                continue
+            mesh_child_count += 1
+            child_minimum, child_maximum = bounds
+            for x in (child_minimum[0], child_maximum[0]):
+                for y in (child_minimum[1], child_maximum[1]):
+                    for z in (child_minimum[2], child_maximum[2]):
+                        world = _transform_point(child.get("position"), child.get("rotation"), child.get("scale"), np.asarray((x, y, z)))
+                        local = _inverse_transform_point(root.get("position"), root.get("rotation"), root.get("scale"), world)
+                        minimum = np.minimum(minimum, local)
+                        maximum = np.maximum(maximum, local)
+    if not (np.all(np.isfinite(minimum)) and np.all(np.isfinite(maximum))):
+        return None
+    return {
+        "min": [round(float(value), 6) for value in minimum],
+        "max": [round(float(value), 6) for value in maximum],
+        "source": "imported-child-mesh-aabbs",
+        "rootInstances": len(matching_roots),
+        "children": child_count,
+        "childrenWithMesh": mesh_child_count,
+        "declaredNonRenderableChildren": declared_nonrenderable_count,
+        "missingMeshHashes": sorted(missing_mesh_hashes, key=int),
+        "complete": not missing_mesh_hashes and child_count == mesh_child_count + declared_nonrenderable_count,
+    }
+
+
+def _write_interior_definitions(
+    interiors: dict[str, Any],
+    assets_dir: Path,
+    roots: list[dict[str, Any]] | None = None,
+    meshes: dict[str, Any] | None = None,
+    nonrenderable: set[str] | None = None,
+) -> int:
     output_dir = assets_dir / "interiors"
     output_dir.mkdir(parents=True, exist_ok=True)
     for hash_id, definition in interiors.items():
         payload = {
-            "schema": "webglgta-interior-v2",
+            "schema": "webglgta-interior-v3",
             "archetypeHash": str(hash_id),
             "assetHash": str(_u32(definition.get("assetHash"))),
             "rooms": definition.get("rooms") or [],
@@ -847,6 +1002,11 @@ def _write_interior_definitions(interiors: dict[str, Any], assets_dir: Path) -> 
             "entitySets": definition.get("entitySets") or [],
             "timecycleModifiers": definition.get("timecycleModifiers") or [],
         }
+        content_bounds = _content_bounds_for_archetype(
+            str(hash_id), roots or [], meshes or {}, nonrenderable or set(), assets_dir
+        )
+        if content_bounds is not None:
+            payload["contentBounds"] = content_bounds
         (output_dir / f"{hash_id}.json").write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     return len(interiors)
 
@@ -920,6 +1080,14 @@ def main() -> int:
         help="Also export an exterior/resource archetype required by a companion YMAP. Repeatable.",
     )
     parser.add_argument("--external-texture-dir", type=Path, default=None, help="Optional loose texture maps referenced by incomplete MLO resources.")
+    parser.add_argument(
+        "--collision-world-ybn", action="append", default=[], metavar="STEM",
+        help="Declare a resource YBN that is already authored in world space (repeatable).",
+    )
+    parser.add_argument(
+        "--collision-root-local-ybn", action="append", default=[], metavar="STEM",
+        help="Declare a resource YBN placed by the selected MLO root transform (repeatable; requires one root).",
+    )
     args = parser.parse_args()
 
     resource_dir = args.resource_dir.resolve()
@@ -943,6 +1111,21 @@ def main() -> int:
     archetypes = metadata.get("archetypes") or {}
     if not roots or not isinstance(interiors, dict):
         raise SystemExit("MLO metadata contains no roots or interior definitions")
+
+    resource_ybns = sorted(resource_dir.rglob("*.ybn"))
+    ybn_by_stem = {path.stem.lower(): path for path in resource_ybns}
+    world_ybns = {str(value).strip().lower() for value in args.collision_world_ybn if str(value).strip()}
+    local_ybns = {str(value).strip().lower() for value in args.collision_root_local_ybn if str(value).strip()}
+    unknown_dispositions = sorted((world_ybns | local_ybns) - set(ybn_by_stem))
+    duplicate_dispositions = sorted(world_ybns & local_ybns)
+    undisposed_ybns = sorted(set(ybn_by_stem) - world_ybns - local_ybns)
+    if unknown_dispositions or duplicate_dispositions or undisposed_ybns:
+        raise SystemExit(
+            "Every resource YBN requires one explicit placement disposition; "
+            f"unknown={unknown_dispositions} duplicate={duplicate_dispositions} undisposed={undisposed_ybns}"
+        )
+    if local_ybns and len(roots) != 1:
+        raise SystemExit("--collision-root-local-ybn requires exactly one selected MLO root")
 
     descriptor_path = (args.base_descriptor or (assets_dir / "demo" / "spawn_district.json")).resolve()
     descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
@@ -1086,7 +1269,7 @@ def main() -> int:
     allowed_children = set(merged_meshes)
     ent1_path = demo_dir / "spawn_district_entities_mlo.bin"
     instance_stats = _write_mlo_ent1(base_instances_path, ent1_path, roots, allowed_children)
-    interior_count = _write_interior_definitions(interiors, assets_dir)
+    interior_count = _write_interior_definitions(interiors, assets_dir, roots, merged_meshes, nonrenderable)
 
     merged_manifest = copy.deepcopy(base_manifest)
     merged_manifest["schema"] = "webglgta-demo-manifest-mlo-v1"
@@ -1123,6 +1306,35 @@ def main() -> int:
         "meshSources": dict(source_counts),
         "textureCount": texture_count,
         "unresolvedArchetypes": unresolved,
+    }
+    existing_collision_imports = list((descriptor.get("mloRuntime") or {}).get("collisionImports") or [])
+    resource_id = resource_dir.name.lower()
+    existing_collision_imports = [item for item in existing_collision_imports if str(item.get("id")) != resource_id]
+    collision_sources = []
+    for stem, path in sorted(ybn_by_stem.items()):
+        placement: dict[str, Any] = {"mode": "world"}
+        if stem in local_ybns:
+            root = roots[0]
+            placement = {
+                "mode": "root-local",
+                "translation": _vec(root.get("position"), 3, (0.0, 0.0, 0.0)),
+                "rotation": _vec(root.get("rotation"), 4, (0.0, 0.0, 0.0, 1.0)),
+            }
+        collision_sources.append({
+            "file": path.name,
+            "expectedCompiledName": f"FiveM:{path.name}",
+            "placement": placement,
+        })
+    existing_collision_imports.append({
+        "id": resource_id,
+        "rootArchetypeHashes": sorted({str(_u32(root.get("archetypeHash"))) for root in roots}, key=int),
+        "sourceHasCollision": bool(collision_sources),
+        "sources": collision_sources,
+    })
+    output_descriptor["mloRuntime"] = {
+        **(descriptor.get("mloRuntime") or {}),
+        "collisionContractSchema": "webglgta-mlo-collision-import-v1",
+        "collisionImports": existing_collision_imports,
     }
     descriptor_path.write_text(json.dumps(output_descriptor, indent=2) + "\n", encoding="utf-8")
 
