@@ -500,6 +500,7 @@ function main() {
         schema: 'webglgta-mlo-coverage-audit-v1',
         ok: missingManifest.length === 0
             && placeholderArchetypes === 0
+            && Object.keys(staleDescriptorFields).length === 0
             && missingMeshFiles.length === 0
             && missingTextures.length === 0
             && rootReports.every((root) => root.definitionPresent && root.authoritativeContentBounds && root.portalCoverage.invalid.length === 0)
