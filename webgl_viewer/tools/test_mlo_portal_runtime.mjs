@@ -21,7 +21,9 @@ const definition = {
             roomFrom: 1,
             roomTo: 0,
             flags: 64 | 8192,
-            corners: [[0, -1, -1], [0, -1, 1], [0, 1, 1], [0, 1, -1]],
+            // Doors can sit near an edge of a wide authored aperture. Binding
+            // must test the portal plane/extent, not only its center point.
+            corners: [[0, -5, -1], [0, -5, 1], [0, 5, 1], [0, 5, -1]],
         },
         {
             index: 1,
@@ -39,8 +41,8 @@ streamer._mloDefs.set('99', definition);
 streamer._mloInstancesLast = [{ parentGuid: 77, archHash: '99', mat16: identity }];
 
 const doors = [
-    { id: 'left', coords: { x: 0, y: -0.4, z: 0 }, radius: 2.5 },
-    { id: 'right', coords: { x: 0, y: 0.4, z: 0 }, radius: 2.5 },
+    { id: 'left', coords: { x: 0, y: 4.0, z: 0 }, radius: 2.5 },
+    { id: 'right', coords: { x: 0, y: 4.4, z: 0 }, radius: 2.5 },
 ];
 const states = new Map([
     ['left', { progress: 0 }],
@@ -97,5 +99,33 @@ streamer._mloDefs.set('100', sentinelDefinition);
 streamer._mloInstancesLast = [{ parentGuid: 88, archHash: '100', mat16: identity }];
 assert.equal(streamer.getInteriorStateAtDataPos([61, 0, 0]), null);
 assert.equal(streamer.getInteriorStateAtDataPos([0, 0, 0])?.roomIndex, 1);
+
+// Large custom MLOs such as Walmart can extend far from their root and single
+// entrance portal. The authored child envelope must keep the entire structure
+// active, while still refusing to claim unrelated city blocks.
+const boundedRoot = {
+    parentGuid: 88,
+    archHash: '100',
+    mat16: identity,
+    spatialBounds: { min: [-72, -38, -3], max: [42, 38, 12], childCount: 236 },
+};
+streamer._mloInstancesLast = [boundedRoot];
+assert.equal(streamer.getInteriorStateAtDataPos([-65, 0, 1])?.roomIndex, 1);
+assert.equal(streamer.getInteriorStateAtDataPos([48, 0, 1])?.isExterior, true);
+assert.equal(streamer.getInteriorStateAtDataPos([100, 0, 1]), null);
+
+// The non-worker path derives the same envelope from ENT1 child ownership.
+const childMatrix = new Float32Array(22);
+childMatrix.set(identity, 0);
+childMatrix[12] = -65;
+childMatrix[18] = 88;
+streamer._lastCamDataPos = [-65, 0, 1];
+streamer._filterEntriesForActiveInterior([{
+    hash: '200',
+    mats: childMatrix,
+    instanceStrideFloats: 22,
+}], [{ parentGuid: 88, archHash: '100', mat16: identity }]);
+assert.equal(streamer._activeInterior?.parentGuid, 88);
+assert.ok(streamer._mloInstancesLast[0].spatialBounds?.childCount >= 1);
 
 console.log('mlo portal runtime: door binding, traversal, audio, light bleed, and entity sets passed');

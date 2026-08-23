@@ -37,12 +37,14 @@ import { GameAudioSystem } from './gameplay/audio_system.js';
 import { GtaHud } from './gameplay/gta_hud.js';
 import { GroundPickupRenderer } from './ground_pickup_renderer.js';
 import { FragmentDebrisSystem } from './gameplay/fragment_debris_system.js';
+import { TireSmokeSystem } from './gameplay/tire_smoke_system.js';
 import { ChatMenuController } from './gameplay/chat_menu.js';
 import { EmotePaletteController } from './gameplay/emote_palette_controller.js';
 import { PhoneController } from './gameplay/phone_controller.js';
 import { DrivingPerformanceMonitor } from './gameplay/driving_performance.js';
 import { getWebGpuCullingAvailability } from './webgpu_culler.js';
 import { decodeSkinningAnimationPack } from './skinning_animation_codec.js';
+import { pointInWorldConnector, resolveWorldExtensionPlacement } from './world_extension_layout.js';
 
 const _LS_SETTINGS_KEY = 'webglgta.viewer.settings.v1';
 const _LS_VIEW_KEY = 'webglgta.viewer.view.v1';
@@ -862,7 +864,9 @@ export class App {
         // An expansion owns a separate playable region. It must never inherit
         // the city stream, clamp, or resident geometry after activation.
         this._activeWorldExpansion = null;
+        this._attachedWorldExpansion = null;
         this._derivedTrackRegionActive = false;
+        this._attachedTrackStreamingCheckAt = 0;
         this._spawnDistrictDescriptor = null;
         this.interactionSystem = new InteractionSystem();
         this.doorController = new DoorController(this);
@@ -874,6 +878,7 @@ export class App {
         this.emotePalette = new EmotePaletteController(this);
         this.chatMenu = new ChatMenuController(this);
         this.groundPickupRenderer = new GroundPickupRenderer(this.gl);
+        this.tireSmokeSystem = new TireSmokeSystem(this.gl);
         this.audioSystem.attachMultiplayer(this.multiplayer);
         this._lastGameplayAction = null;
         this._gameplayManifestStatus = 'pending';
@@ -1073,6 +1078,7 @@ export class App {
             const demoDescriptor = this.spawnDistrictDemo
                 ? await this._loadSpawnDistrictDescriptor()
                 : null;
+            if (demoDescriptor) await this._configureAttachedWorldExpansion(demoDescriptor);
             const usesCompiledCollision = !!String(demoDescriptor?.compiledCollisionManifestFile || '').trim();
             if (!usesCompiledCollision) {
                 await this.collisionWorld?.loadYbnGround?.();
@@ -1091,7 +1097,10 @@ export class App {
             const authoredTrackGround = await this.collisionWorld?.loadDerivedTrackGround?.();
             const derivedRoad = await this.collisionWorld?.loadDerivedRoad?.();
             if (authoredTrackGround || derivedRoad) {
+                this.collisionWorld?.installWorldExtensionConnector?.(this._attachedWorldExpansion?.connector);
+                this.trackRoadRenderer?.setWorldConnector?.(this._attachedWorldExpansion?.connector);
                 try { await this.trackRoadRenderer?.load?.(); } catch (e) { console.warn('Track road render load failed:', e); }
+                this._refreshAttachedConnectorElevation();
                 // The circuit scenery is expansion-only. Do not parse/upload it
                 // during city boot: it was consuming frame time and GPU memory
                 // even when the player never visited the track.
@@ -1112,6 +1121,9 @@ export class App {
             await this.pedRenderer.init();
             try { await this.groundPickupRenderer.init(this._dataToViewMatrix); } catch (error) {
                 console.warn('Ground pickup renderer init failed:', error);
+            }
+            try { await this.tireSmokeSystem.init(this._dataToViewMatrix); } catch (error) {
+                console.warn('Tire smoke renderer init failed:', error);
             }
             await this._loadRuntimeCharacterProfile({ timeoutMs: 5_000 });
             await this._loadGameplayManifest({ timeoutMs: 900 });
@@ -1181,13 +1193,11 @@ export class App {
                         // Demo warmup is intentionally bounded. The live frame loop
                         // continues refinement; holding it behind the loading shell
                         // for a complete queue drain can otherwise take 90 seconds.
-                        timeoutMs: this.spawnDistrictDemo ? 12000 : 30000,
-                        // Source residency can enqueue thousands of unrelated
-                        // submeshes.  Waiting eight seconds here kept the renderer
-                        // stopped even after the spawn chunks were usable, which made
-                        // a cold refresh look like a ped-only scene.  The animation
-                        // loop reprioritizes the remainder against the active camera.
-                        minWaitMs: this.spawnDistrictDemo ? 4500 : 0,
+                        timeoutMs: this.spawnDistrictDemo ? 18000 : 30000,
+                        // Do not reveal gameplay until the packed local city has
+                        // enough material groups to form a continuous street. The
+                        // remaining work is still reprioritized by the live camera.
+                        minWaitMs: this.spawnDistrictDemo ? 8000 : 0,
                         centerDataPos: spawnWarmupCenter,
                     });
                     // Mesh metadata and skinned bounds are now final, so rebuild the player
@@ -1374,9 +1384,10 @@ export class App {
         let effectiveManifest = manifest;
         if (this.spawnDistrictDemo) {
             try {
-                const interactables = await fetchJSON('assets/demo/interactables.json?rev=mlo-doors-v2', {
+                const interactables = await fetchJSON('assets/demo/interactables.json', {
                     priority: 'high',
                     usePersistentCache: false,
+                    useMemoryCache: false,
                 });
                 if (interactables?.schema === 'webglgta-demo-interactables-v1') {
                     effectiveManifest = { ...manifest, doors: interactables.doors || [], interactableInventory: interactables.inventory || {} };
@@ -1740,7 +1751,7 @@ export class App {
     }
 
     _getSpawnDistrictBounds() {
-        if (this._activeWorldExpansion) {
+        if (this._activeWorldExpansion?.isolateCityWorld) {
             const expansionBounds = this._activeWorldExpansion.bounds || this.collisionWorld?.getDerivedRoadBounds?.();
             const values = [expansionBounds?.minX, expansionBounds?.minY, expansionBounds?.maxX, expansionBounds?.maxY].map(Number);
             if (values.every(Number.isFinite) && values[2] > values[0] && values[3] > values[1]) {
@@ -1752,6 +1763,14 @@ export class App {
                     maxX: Math.ceil(values[2]), maxY: Math.ceil(values[3]),
                 };
             }
+        }
+        const attachedBounds = this._attachedWorldExpansion?.worldBounds;
+        const attachedValues = [attachedBounds?.minX, attachedBounds?.minY, attachedBounds?.maxX, attachedBounds?.maxY].map(Number);
+        if (attachedValues.every(Number.isFinite) && attachedValues[2] > attachedValues[0] && attachedValues[3] > attachedValues[1]) {
+            return {
+                minX: Math.floor(attachedValues[0]), minY: Math.floor(attachedValues[1]),
+                maxX: Math.ceil(attachedValues[2]), maxY: Math.ceil(attachedValues[3]),
+            };
         }
         const authored = this._spawnDistrictDescriptor?.bounds;
         const authoredBounds = {
@@ -1815,7 +1834,9 @@ export class App {
                 recoveryPedZ: NaN,
             };
         }
-        const outsideDistance = Number.isFinite(x) && Number.isFinite(y)
+        const outsideAttachedWorld = Number.isFinite(x) && Number.isFinite(y)
+            && !this._isWithinAttachedPlayableWorld(x, y, 1.0);
+        const outsideDistance = Number.isFinite(x) && Number.isFinite(y) && !outsideAttachedWorld
             ? Math.hypot(
                 x < minX ? minX - x : (x > maxX ? x - maxX : 0.0),
                 y < minY ? minY - y : (y > maxY ? y - maxY : 0.0),
@@ -1924,6 +1945,9 @@ export class App {
         const baseline = active?.baseline || {
             maxLoadsInFlight: Number(stats?.maxLoadsInFlight),
             maxNewLoadsPerFrame: Number(stats?.maxNewLoadsPerFrame),
+            maxMeshLoadsInFlight: Number(this.instancedModelRenderer?.maxMeshLoadsInFlight),
+            maxPackedMeshUploadsPerFrame: Number(this.modelManager?.maxPackedMeshUploadsPerFrame),
+            maxPackedMeshUploadMsPerFrame: Number(this.modelManager?.maxPackedMeshUploadMsPerFrame),
         };
         if (!Number.isFinite(baseline.maxLoadsInFlight) || !Number.isFinite(baseline.maxNewLoadsPerFrame)) {
             this._destinationTextureWarmup = null;
@@ -1933,8 +1957,18 @@ export class App {
         const burst = {
             maxLoadsInFlight: Math.max(16, baseline.maxLoadsInFlight),
             maxNewLoadsPerFrame: Math.max(32, baseline.maxNewLoadsPerFrame),
+            maxMeshLoadsInFlight: Math.max(12, baseline.maxMeshLoadsInFlight || 0),
+            maxPackedMeshUploadsPerFrame: Math.max(12, baseline.maxPackedMeshUploadsPerFrame || 0),
+            maxPackedMeshUploadMsPerFrame: Math.max(12, baseline.maxPackedMeshUploadMsPerFrame || 0),
         };
         streamer.setStreamingConfig(burst);
+        if (this.instancedModelRenderer) {
+            this.instancedModelRenderer.maxMeshLoadsInFlight = burst.maxMeshLoadsInFlight;
+        }
+        if (this.modelManager) {
+            this.modelManager.maxPackedMeshUploadsPerFrame = burst.maxPackedMeshUploadsPerFrame;
+            this.modelManager.maxPackedMeshUploadMsPerFrame = burst.maxPackedMeshUploadMsPerFrame;
+        }
 
         const token = Symbol('destination-texture-warmup');
         const timer = setTimeout(() => {
@@ -1944,6 +1978,23 @@ export class App {
             if (Number(current?.maxLoadsInFlight) === burst.maxLoadsInFlight
                 && Number(current?.maxNewLoadsPerFrame) === burst.maxNewLoadsPerFrame) {
                 streamer.setStreamingConfig(baseline);
+            }
+            // Restore only values still owned by this warmup. A user quality
+            // change made during the burst remains authoritative.
+            if (this.instancedModelRenderer
+                && Number(this.instancedModelRenderer.maxMeshLoadsInFlight) === burst.maxMeshLoadsInFlight
+                && Number.isFinite(baseline.maxMeshLoadsInFlight)) {
+                this.instancedModelRenderer.maxMeshLoadsInFlight = baseline.maxMeshLoadsInFlight;
+            }
+            if (this.modelManager
+                && Number(this.modelManager.maxPackedMeshUploadsPerFrame) === burst.maxPackedMeshUploadsPerFrame
+                && Number.isFinite(baseline.maxPackedMeshUploadsPerFrame)) {
+                this.modelManager.maxPackedMeshUploadsPerFrame = baseline.maxPackedMeshUploadsPerFrame;
+            }
+            if (this.modelManager
+                && Number(this.modelManager.maxPackedMeshUploadMsPerFrame) === burst.maxPackedMeshUploadMsPerFrame
+                && Number.isFinite(baseline.maxPackedMeshUploadMsPerFrame)) {
+                this.modelManager.maxPackedMeshUploadMsPerFrame = baseline.maxPackedMeshUploadMsPerFrame;
             }
             this._destinationTextureWarmup = null;
         }, Math.max(1_000, Number(durationMs) || 12_000));
@@ -2046,28 +2097,25 @@ export class App {
     _activateWorldExpansion(expansion = {}) {
         const id = String(expansion.id || '').trim().toLowerCase();
         if (!id) return false;
-        const bounds = expansion.bounds || this.collisionWorld?.getDerivedRoadBounds?.();
+        const attached = this._attachedWorldExpansion?.id === id ? this._attachedWorldExpansion : null;
+        const bounds = attached?.playableBounds || expansion.bounds || this.collisionWorld?.getDerivedRoadBounds?.();
         const values = [bounds?.minX, bounds?.minY, bounds?.maxX, bounds?.maxY].map(Number);
         if (!values.every(Number.isFinite) || values[2] <= values[0] || values[3] <= values[1]) return false;
         this._activeWorldExpansion = {
             id,
-            label: String(expansion.label || id),
-            isolateCityWorld: expansion.isolateCityWorld !== false,
+            label: String(expansion.label || attached?.label || id),
+            attached: !!attached,
+            isolateCityWorld: attached ? false : expansion.isolateCityWorld !== false,
             bounds: { minX: values[0], minY: values[1], maxX: values[2], maxY: values[3] },
         };
         this._derivedTrackRegionActive = id === 'nordschleife';
-        // Reuse the common district wiring for movement/network stream bounds,
-        // but clear city residency before the first expansion frame.
-        this._setSpawnDistrictDemo(true, { dropResident: true });
-        // The city demo intentionally uses half resolution; the isolated
-        // circuit needs the native canvas resolution.
+        // Attached extensions share the city coordinate space and retain the
+        // resident city neighborhood. Legacy isolated expansions still clear it.
+        this._setSpawnDistrictDemo(true, { dropResident: !attached });
         this.resize();
         if (id === 'nordschleife') {
-            // `_setSpawnDistrictDemo()` applies the generic gameplay Medium
-            // LOD while wiring the expanded bounds. That made `/track` start
-            // on the compact visual package even on a system expressly using
-            // the full circuit. The track scene is isolated from city
-            // streaming, so select its complete authored package directly.
+            // An explicit /track request selects the complete authored package;
+            // physical approach keeps the user's existing quality selection.
             this._setControlValue('lodLevel', '0');
             this._applyLodFromUI?.();
             void this._syncTrackSceneQuality?.();
@@ -2079,12 +2127,12 @@ export class App {
         if (!this._activeWorldExpansion && !this._derivedTrackRegionActive) return;
         this._activeWorldExpansion = null;
         this._derivedTrackRegionActive = false;
-        this._setSpawnDistrictDemo(true, { dropResident: true });
+        this._setSpawnDistrictDemo(true, { dropResident: !this._attachedWorldExpansion });
         this.resize();
     }
 
     _syncTrackSceneQuality() {
-        if (this._activeWorldExpansion?.id !== 'nordschleife') return;
+        if (!this._derivedTrackRegionActive && this._activeWorldExpansion?.id !== 'nordschleife') return;
         const lodLevel = String(document.getElementById('lodLevel')?.value || '2');
         // “Full Detail” must mean the full circuit on its own. Requiring a
         // second texture setting silently kept the compact scene active and
@@ -2104,6 +2152,100 @@ export class App {
         occ.depthEps = 0.006;
         occ.hzbMinScreenPixels = 8.0;
         occ.temporalKeepFrames = 6;
+    }
+
+    async _configureAttachedWorldExpansion(descriptor = this._spawnDistrictDescriptor) {
+        const cityBounds = descriptor?.bounds;
+        if (!cityBounds) return null;
+        try {
+            const metadata = await fetchJSON('assets/tracks/nordschleife/world_placement.json', {
+                priority: 'high',
+                usePersistentCache: false,
+                useMemoryCache: false,
+            });
+            if (metadata?.schema !== 'webglgta-world-extension-placement-v1') throw new Error('invalid world extension placement metadata');
+            const layout = resolveWorldExtensionPlacement(cityBounds, metadata, { citySpawn: descriptor?.spawn });
+            if (!layout) throw new Error('world extension placement could not be resolved');
+            this._attachedWorldExpansion = {
+                ...layout,
+                attached: true,
+                isolateCityWorld: false,
+                bounds: layout.playableBounds,
+            };
+            this.collisionWorld?.setDerivedTrackPlacement?.(layout);
+            this.trackRoadRenderer?.setWorldTranslation?.(layout.translation);
+            this.trackSceneRenderer?.setWorldTranslation?.(layout.translation);
+            console.info(
+                `[demo] Attached ${layout.label} ${layout.side} of city: `
+                + `translation=${layout.translation.map((value) => value.toFixed(3)).join(',')} `
+                + `connector=${Math.hypot(layout.connector.end[0] - layout.connector.start[0], layout.connector.end[1] - layout.connector.start[1]).toFixed(1)}m`,
+            );
+            return this._attachedWorldExpansion;
+        } catch (error) {
+            this._attachedWorldExpansion = null;
+            console.warn('[demo] Attached track placement unavailable; retaining authored expansion coordinates.', error);
+            return null;
+        }
+    }
+
+    _isPointNearAttachedTrack(position, padding = null) {
+        const layout = this._attachedWorldExpansion;
+        const x = Number(position?.[0]); const y = Number(position?.[1]);
+        if (!layout || ![x, y].every(Number.isFinite)) return false;
+        const margin = Math.max(0, Number.isFinite(Number(padding)) ? Number(padding) : Number(layout.preloadMargin) || 700);
+        const bounds = layout.playableBounds;
+        const nearPlayable = x >= bounds.minX - margin && x <= bounds.maxX + margin
+            && y >= bounds.minY - margin && y <= bounds.maxY + margin;
+        return nearPlayable || pointInWorldConnector(x, y, layout.connector, margin);
+    }
+
+    _isWithinAttachedPlayableWorld(x, y, padding = 0) {
+        const layout = this._attachedWorldExpansion;
+        if (!layout) return true;
+        const margin = Math.max(0, Number(padding) || 0);
+        const inside = (bounds) => x >= bounds.minX - margin && x <= bounds.maxX + margin
+            && y >= bounds.minY - margin && y <= bounds.maxY + margin;
+        return inside(layout.cityBounds)
+            || inside(layout.playableBounds)
+            || pointInWorldConnector(x, y, layout.connector, margin);
+    }
+
+    _updateAttachedWorldExpansionStreaming(now = performance.now()) {
+        if (!this._attachedWorldExpansion || now < this._attachedTrackStreamingCheckAt) return;
+        this._attachedTrackStreamingCheckAt = now + 400;
+        const focus = this._getStreamingFocusDataPos?.() || this.ped?.posData;
+        const near = this._isPointNearAttachedTrack(focus);
+        if (near === this._derivedTrackRegionActive) return;
+        this._derivedTrackRegionActive = near;
+        this.resize();
+        if (near) {
+            const lodLevel = String(document.getElementById('lodLevel')?.value || '2');
+            void this.trackSceneRenderer?.setQuality?.(lodLevel === '0' ? 'full' : 'balanced');
+        }
+    }
+
+    _setNurburgringActive(enabled) {
+        if (!this._attachedWorldExpansion && !this.collisionWorld?.getDerivedRoadBounds?.()) return false;
+        this._derivedTrackRegionActive = !!enabled;
+        if (enabled) {
+            const lodLevel = String(document.getElementById('lodLevel')?.value || '2');
+            void this.trackSceneRenderer?.setQuality?.(lodLevel === '0' ? 'full' : 'balanced');
+        }
+        this.resize();
+        return true;
+    }
+
+    _refreshAttachedConnectorElevation() {
+        const connector = this._attachedWorldExpansion?.connector;
+        if (!connector?.start || !connector?.end) return false;
+        const raw = this.collisionWorld?._getYbnGroundAtXY?.(
+            connector.start[0], connector.start[1], connector.start[2] + 64, 256,
+        );
+        const cityGroundZ = Number(raw) + (Number(this.collisionWorld?.ybnGroundOffset) || 0);
+        if (Number.isFinite(cityGroundZ)) connector.start[2] = cityGroundZ;
+        this.collisionWorld?.installWorldExtensionConnector?.(connector);
+        this.trackRoadRenderer?.setWorldConnector?.(connector);
+        return Number.isFinite(cityGroundZ);
     }
 
     _applySpawnDistrictDemoBudget() {
@@ -2279,10 +2421,10 @@ export class App {
         }
         try {
             // This descriptor controls world bounds and names every compact source.
-            // Revision the request so a newly preprocessed district cannot be paired
-            // with an older browser-cached descriptor under the same filename.
+            // It is the single live filename and explicitly bypasses application
+            // caches, so deployments cannot mix it with an older asset set.
             const descriptorPath = spawnDistrictDescriptorPath();
-            const descriptor = await fetchJSON(`${descriptorPath}?rev=mlo-outpost-v1`, {
+            const descriptor = await fetchJSON(descriptorPath, {
                 priority: 'high',
                 usePersistentCache: false,
                 useMemoryCache: false,
@@ -2384,10 +2526,16 @@ export class App {
                             (Number(descriptor?.bounds?.minX) + Number(descriptor?.bounds?.maxX)) * 0.5,
                             (Number(descriptor?.bounds?.minY) + Number(descriptor?.bounds?.maxY)) * 0.5,
                         ];
-                    await Promise.all([
+                    const connectorStart = this._attachedWorldExpansion?.connector?.start;
+                    const collisionJobs = [
                         this.collisionWorld?.streamCompiledStaticCollisionAt?.(streamPoint[0], streamPoint[1]),
                         this.collisionWorld?.streamCompiledAssetCollidersAt?.(streamPoint[0], streamPoint[1]),
-                    ]);
+                    ];
+                    if (Array.isArray(connectorStart)) {
+                        collisionJobs.push(this.collisionWorld?.streamCompiledStaticCollisionAt?.(connectorStart[0], connectorStart[1]));
+                    }
+                    await Promise.all(collisionJobs);
+                    this._refreshAttachedConnectorElevation();
                     this._demoAssetColliderManifest = { compiled: true, layers };
                     console.info('[demo] Installed compiled-only streaming collision layers.');
                 } catch (e) {
@@ -2965,13 +3113,12 @@ export class App {
             const q = stats ? stats.queued : 0;
             const inflight = stats ? stats.inFlight : 0;
             const completedMeshes = stats ? stats.completed : 0;
-            // All nearby district chunks contain roughly 730 material draws.
-            // Starting at 256 meant the player entered while the surrounding
-            // building shells were still absent. 640 keeps the loading overlay
-            // through the stable local scene, without requiring every distant
-            // source submesh to decode before input becomes available.
+            // The packed nearby district uses roughly a thousand material draws.
+            // Releasing after only a few hundred showed the player in a sparse,
+            // ped-only city and made subsequent mesh uploads look like culling
+            // failures. Keep boot bounded, but establish a continuous local scene.
             const demoSize = Math.max(0, Number(this._spawnDistrictDescriptor?.size) || 0);
-            const demoInitialMeshTarget = this.spawnDistrictDemo ? (demoSize >= 900 ? 360 : 260) : 0;
+            const demoInitialMeshTarget = this.spawnDistrictDemo ? (demoSize >= 900 ? 900 : 360) : 0;
             const texStats = this.textureStreamer?.getStats?.() || null;
             const texLoading = texStats?.loading ?? 0;
             const texInFlight = texStats?.loadsInFlight ?? 0;
@@ -7579,7 +7726,7 @@ export class App {
         if (!this.assetPickerEnabled && this._assetInspectorEl) this._assetInspectorEl.style.display = 'none';
     }
 
-    _inspectDemoAssetAtClientPoint(clientX, clientY) {
+    async _inspectDemoAssetAtClientPoint(clientX, clientY) {
         if (!this.assetPickerEnabled || !this.spawnDistrictDemo) return;
         if (!this.canvas) return;
         const rect = this.canvas.getBoundingClientRect();
@@ -7590,11 +7737,11 @@ export class App {
         // city instance renderer.  Query the renderer that produced the
         // visible pixel so /track does not return a false null hit and a set
         // of unrelated zero city statistics.
-        const trackActive = (this._nordschleifeActive || this._activeWorldExpansion?.id === 'nordschleife')
+        const trackActive = (this._nordschleifeActive || this._derivedTrackRegionActive || this._activeWorldExpansion?.id === 'nordschleife')
             && !!this.trackSceneRenderer?.models?.length;
         const pickerRenderer = trackActive ? this.trackSceneRenderer : this.instancedModelRenderer;
         if (!pickerRenderer?.pickAssetAtScreen) return;
-        const report = pickerRenderer.pickAssetAtScreen({
+        const pick = () => pickerRenderer.pickAssetAtScreen({
             x,
             y,
             viewportWidth: this.canvas.width,
@@ -7602,12 +7749,42 @@ export class App {
             viewProjectionMatrix: this.camera?.viewProjectionMatrix,
             maxPixelDistance: 28,
             nearbyLimit: 10,
-        }) || {
+        });
+        let report = pick() || {
             schema: 'webglgta-demo-asset-pick-v1',
             click: { x, y, viewportWidth: this.canvas.width, viewportHeight: this.canvas.height },
             selected: null,
             nearby: [],
         };
+        // The picker can be enabled after the visible meshes have already been
+        // uploaded. Refine bounds-only candidates on demand instead of keeping
+        // CPU triangles for the whole streamed city. This prevents aggregate
+        // submesh AABBs from identifying empty space as a wall or prop.
+        if (!trackActive && report?.selected?.pick?.precision === 'bounds-only') {
+            const files = [];
+            const seen = new Set();
+            for (const record of [report.selected, ...(Array.isArray(report.nearby) ? report.nearby : [])]) {
+                const file = String(record?.identity?.file || '').trim();
+                if (!file || seen.has(file)) continue;
+                seen.add(file);
+                files.push(file);
+                if (files.length >= 12) break;
+            }
+            let hydrated = 0;
+            for (const file of files) {
+                try {
+                    if (await this.modelManager?.ensureMeshPickData?.(file)) hydrated++;
+                } catch { /* retain the original diagnostic report */ }
+            }
+            if (hydrated > 0 && this.assetPickerEnabled) {
+                report = pick() || report;
+                report.pickerRefinement = {
+                    requestedCandidates: files.length,
+                    hydratedCandidates: hydrated,
+                    precision: report?.selected?.pick?.precision || null,
+                };
+            }
+        }
         report.app = this._buildAssetInspectorAppState();
         this._showAssetInspectorReport(report);
     }
@@ -7616,7 +7793,7 @@ export class App {
         const cov = (() => { try { return this.drawableStreamer?.getCoverageStats?.() || null; } catch { return null; } })();
         const tex = (() => { try { return this.textureStreamer?.getStats?.() || null; } catch { return null; } })();
         const occ = (() => { try { return this.occlusionCuller?.getStats?.() || null; } catch { return null; } })();
-        const trackActive = (this._nordschleifeActive || this._activeWorldExpansion?.id === 'nordschleife')
+        const trackActive = (this._nordschleifeActive || this._derivedTrackRegionActive || this._activeWorldExpansion?.id === 'nordschleife')
             && !!this.trackSceneRenderer?.models?.length;
         const activeRenderer = trackActive ? this.trackSceneRenderer : this.instancedModelRenderer;
         const renderStats = (() => { try { return activeRenderer?.getRenderStats?.() || null; } catch { return null; } })();
@@ -9633,7 +9810,7 @@ export class App {
     resize() {
         // Keep CSS at native size while reducing the demo's internal pixel count.
         // This cuts fragment shading and texture bandwidth without touching world geometry.
-        const scale = this._activeWorldExpansion?.id === 'nordschleife'
+        const scale = this._derivedTrackRegionActive || this._activeWorldExpansion?.id === 'nordschleife'
             ? 1.0
             : (this.spawnDistrictDemo ? SPAWN_DEMO_RENDER_SCALE : 1.0);
         this.renderScale = scale;
@@ -9662,6 +9839,7 @@ export class App {
         const dt = Math.min(0.05, wallDt);
         this._lastFrameMs = now;
         this._lastUpdateDt = dt;
+        this._updateAttachedWorldExpansionStreaming(now);
 
         // Perf HUD timing
         this._perfDtMs = wallDt * 1000.0;
@@ -9688,6 +9866,11 @@ export class App {
             }));
         } catch {
             // ignore
+        }
+        try {
+            this.tireSmokeSystem?.update?.(dt, this.vehicleController?.vehicle, !!this.vehicleController?.inVehicle);
+        } catch {
+            // Tire smoke is presentation-only; vehicle simulation must fail open.
         }
         try { this.doorController?.update?.({ posData: this.ped?.posData || null, action: gameplayAction, dt }); } catch { /* ignore */ }
         try { this.bankingController?.handleInteraction?.(gameplayAction); } catch { /* ignore */ }
@@ -10159,7 +10342,8 @@ export class App {
             });
         }
 
-        if (this._activeWorldExpansion?.id === 'nordschleife' && this.trackSceneRenderer?.ready && this.trackSceneRenderer.models?.length) {
+        const attachedTrackVisible = this._derivedTrackRegionActive || this._activeWorldExpansion?.id === 'nordschleife';
+        if (attachedTrackVisible && this.trackSceneRenderer?.ready && this.trackSceneRenderer.models?.length) {
             try {
                 this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
                 this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -10176,11 +10360,16 @@ export class App {
         // over the imported road after the principal visual sector is ready.
         const fullTrackPrimaryVisible = !!this.trackSceneRenderer?.stats?.primaryLoaded
             && (this.trackSceneRenderer?.models?.length || 0) > 0;
-        if (this._activeWorldExpansion?.id === 'nordschleife' && !fullTrackPrimaryVisible && this.trackRoadRenderer?.ready && this.trackRoadRenderer.vertexCount > 0) {
+        if (attachedTrackVisible && this.trackRoadRenderer?.ready
+            && (this.trackRoadRenderer.vertexCount > 0 || this.trackRoadRenderer.connectorVertexCount > 0)) {
             try {
                 this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
                 this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-                this.trackRoadRenderer.render(this.camera.viewProjectionMatrix, { fastStateRestore: !!this.spawnDistrictDemo });
+                this.trackRoadRenderer.render(this.camera.viewProjectionMatrix, {
+                    fastStateRestore: !!this.spawnDistrictDemo,
+                    includeRoad: !fullTrackPrimaryVisible,
+                    includeConnector: true,
+                });
             } catch (error) {
                 console.warn('Track road render failed:', error);
             }
@@ -10223,14 +10412,20 @@ export class App {
             // safe budget path and ramps detail back in once the frame recovers.
             const previousFrameMs = Math.max(0, Number(this._cpuFrameMs || this._perfDtMs) || 0);
             let adaptiveDrawBudget = Math.max(
-                360,
+                SPAWN_DEMO_MIN_SAFE_DRAW_ITEMS,
                 Math.min(SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS, Number(this._adaptiveDrawBudget) || SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS),
             );
             if (this.spawnDistrictDemo && activelyDriving) {
-                if (previousFrameMs > 30.0) adaptiveDrawBudget -= 96;
-                else if (previousFrameMs > 22.0) adaptiveDrawBudget -= 48;
-                else if (previousFrameMs < 17.0) adaptiveDrawBudget += 16;
-                adaptiveDrawBudget = Math.max(360, Math.min(SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS, adaptiveDrawBudget));
+                // Preserve the complete near street while driving. We only
+                // trade distant, proven-safe prop groups after sustained frame
+                // pressure, and recover them gradually once the frame settles.
+                if (previousFrameMs > 42.0) adaptiveDrawBudget -= 64;
+                else if (previousFrameMs > 30.0) adaptiveDrawBudget -= 24;
+                else if (previousFrameMs < 18.0) adaptiveDrawBudget += 24;
+                adaptiveDrawBudget = Math.max(
+                    SPAWN_DEMO_MIN_SAFE_DRAW_ITEMS,
+                    Math.min(SPAWN_DEMO_MAX_SAFE_DRAW_ITEMS, adaptiveDrawBudget),
+                );
                 this._adaptiveDrawBudget = adaptiveDrawBudget;
             } else if (this.spawnDistrictDemo) {
                 // At rest the local district is a fixed residency set. Holding a
@@ -10540,6 +10735,18 @@ export class App {
                 }));
             } catch (error) {
                 console.warn('Vehicle model render failed:', error);
+            }
+        }
+
+        // Native GTA-style wheel smoke sits behind the car's body but remains
+        // depth-tested against the street and nearby city geometry.
+        if (this.tireSmokeSystem?.ready) {
+            try {
+                this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, sceneFbo || null);
+                this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+                this.tireSmokeSystem.render(this.camera.viewProjectionMatrix, this.camera, { outputSrgb });
+            } catch (error) {
+                console.warn('Tire smoke render failed:', error);
             }
         }
 

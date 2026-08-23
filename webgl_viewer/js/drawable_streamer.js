@@ -630,7 +630,18 @@ export class DrawableStreamer {
                     mat16[i] = value;
                 }
                 if (!valid) continue;
-                mloInstances.push({ parentGuid, archHash, mat16 });
+                let spatialBounds = null;
+                if (packedRoot.length >= 25) {
+                    const values = packedRoot.slice(18, 24).map(Number);
+                    if (values.every(Number.isFinite)) {
+                        spatialBounds = {
+                            min: values.slice(0, 3),
+                            max: values.slice(3, 6),
+                            childCount: Math.max(0, Number(packedRoot[24]) || 0),
+                        };
+                    }
+                }
+                mloInstances.push({ parentGuid, archHash, mat16, spatialBounds });
                 void this._ensureMloDefLoaded(archHash);
             }
 
@@ -1261,7 +1272,13 @@ export class DrawableStreamer {
         try {
             const revision = encodeURIComponent(this._mloDefinitionRevision || 'v1');
             const def = await fetchJSON(`assets/interiors/${h}.json?rev=${revision}`);
-            if (def && typeof def === 'object') this._mloDefs.set(h, def);
+            if (def && typeof def === 'object') {
+                this._mloDefs.set(h, def);
+                // A definition can finish after the resident instance set was
+                // built. Re-run gating immediately instead of waiting for the
+                // next chunk or camera transition to reveal the interior.
+                this._dirty = true;
+            }
         } catch {
             // ignore missing interiors defs
         } finally {
@@ -1331,10 +1348,9 @@ export class DrawableStreamer {
         return Math.hypot(dx, dy, dz);
     }
 
-    _interiorActivationRadius(def) {
-        const configured = Math.max(1.0, Number(this.interiorMaxRootDistance) || 120.0);
+    _hasSentinelRoomBounds(def) {
         const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
-        const hasSentinelBounds = rooms.some((room) => {
+        return rooms.some((room) => {
             const mn = room?.bbMin;
             const mx = room?.bbMax;
             if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) return false;
@@ -1342,6 +1358,75 @@ export class DrawableStreamer {
                 || Math.abs(Number(mx[1]) - Number(mn[1])) > 200.0
                 || Math.abs(Number(mx[2]) - Number(mn[2])) > 50.0;
         });
+    }
+
+    _distanceToMloSpatialBounds(position, bounds, xyPadding = 0.0, zPadding = 0.0) {
+        const mn = bounds?.min;
+        const mx = bounds?.max;
+        if (!Array.isArray(mn) || !Array.isArray(mx) || mn.length < 3 || mx.length < 3) {
+            return Number.POSITIVE_INFINITY;
+        }
+        const px = Math.max(0.0, Number(xyPadding) || 0.0);
+        const pz = Math.max(0.0, Number(zPadding) || 0.0);
+        const dx = Math.max(Number(mn[0]) - px - position[0], 0, position[0] - (Number(mx[0]) + px));
+        const dy = Math.max(Number(mn[1]) - px - position[1], 0, position[1] - (Number(mx[1]) + px));
+        const dz = Math.max(Number(mn[2]) - pz - position[2], 0, position[2] - (Number(mx[2]) + pz));
+        return Math.hypot(dx, dy, dz);
+    }
+
+    _attachMloSpatialBounds(entries, instances) {
+        const byParent = new Map();
+        for (const instance of (instances || [])) {
+            const parentGuid = Number(instance?.parentGuid) >>> 0;
+            if (!parentGuid) continue;
+            const existing = instance?.spatialBounds;
+            const mn = existing?.min;
+            const mx = existing?.max;
+            byParent.set(parentGuid, {
+                instance,
+                min: Array.isArray(mn) ? mn.slice(0, 3).map(Number) : [Infinity, Infinity, Infinity],
+                max: Array.isArray(mx) ? mx.slice(0, 3).map(Number) : [-Infinity, -Infinity, -Infinity],
+                childCount: Math.max(0, Number(existing?.childCount) || 0),
+            });
+        }
+        for (const entry of (entries || [])) {
+            const mats = entry?.mats;
+            const stride = this._instanceStrideFloatsForLen(mats?.length ?? 0, entry?.instanceStrideFloats);
+            if (!mats || stride < 21) continue;
+            const radiusRaw = Number(this.modelManager?.getApproxRadiusForHash?.(entry.hash, null, 0));
+            const radius = Number.isFinite(radiusRaw) ? Math.max(0, Math.min(80, radiusRaw)) : 0;
+            for (let offset = 0; offset + stride <= mats.length; offset += stride) {
+                const parentGuid = Number(mats[offset + 18]) >>> 0;
+                const target = byParent.get(parentGuid);
+                if (!target) continue;
+                const x = Number(mats[offset + 12]);
+                const y = Number(mats[offset + 13]);
+                const z = Number(mats[offset + 14]);
+                if (![x, y, z].every(Number.isFinite)) continue;
+                const extent = radius * this._instanceMaxScale(mats, offset);
+                target.min[0] = Math.min(target.min[0], x - extent);
+                target.min[1] = Math.min(target.min[1], y - extent);
+                target.min[2] = Math.min(target.min[2], z - extent);
+                target.max[0] = Math.max(target.max[0], x + extent);
+                target.max[1] = Math.max(target.max[1], y + extent);
+                target.max[2] = Math.max(target.max[2], z + extent);
+                target.childCount++;
+            }
+        }
+        for (const target of byParent.values()) {
+            if (!target.min.every(Number.isFinite) || !target.max.every(Number.isFinite)) continue;
+            target.instance.spatialBounds = {
+                min: target.min,
+                max: target.max,
+                childCount: target.childCount,
+            };
+        }
+        return instances;
+    }
+
+    _interiorActivationRadius(def) {
+        const configured = Math.max(1.0, Number(this.interiorMaxRootDistance) || 120.0);
+        const hasSentinelBounds = this._hasSentinelRoomBounds(def);
         if (!hasSentinelBounds) return configured;
 
         // Some loose FiveM MLOs use a map-sized sentinel AABB for every room.
@@ -1383,22 +1468,47 @@ export class DrawableStreamer {
     }
 
     _portalCenterData(instance, portal) {
+        const corners = this._portalCornersData(instance, portal);
+        if (!corners.length) return null;
+        return [0, 1, 2].map((axis) => corners.reduce((sum, corner) => sum + corner[axis], 0) / corners.length);
+    }
+
+    _portalCornersData(instance, portal) {
         const corners = Array.isArray(portal?.corners) ? portal.corners : [];
-        if (!instance?.mat16 || corners.length === 0) return null;
-        const local = [0, 0, 0];
-        let count = 0;
+        if (!instance?.mat16 || corners.length === 0) return [];
+        const output = [];
         for (const corner of corners) {
             if (!Array.isArray(corner) || corner.length < 3) continue;
-            local[0] += Number(corner[0]) || 0;
-            local[1] += Number(corner[1]) || 0;
-            local[2] += Number(corner[2]) || 0;
-            count++;
+            const point = glMatrix.vec4.fromValues(Number(corner[0]) || 0, Number(corner[1]) || 0, Number(corner[2]) || 0, 1);
+            const transformed = glMatrix.vec4.create();
+            glMatrix.vec4.transformMat4(transformed, point, instance.mat16);
+            output.push([transformed[0], transformed[1], transformed[2]]);
         }
-        if (!count) return null;
-        const point = glMatrix.vec4.fromValues(local[0] / count, local[1] / count, local[2] / count, 1);
-        const output = glMatrix.vec4.create();
-        glMatrix.vec4.transformMat4(output, point, instance.mat16);
-        return [output[0], output[1], output[2]];
+        return output;
+    }
+
+    _distanceToPortalAperture(point, corners) {
+        if (!Array.isArray(point) || !Array.isArray(corners) || corners.length < 3) return Number.POSITIVE_INFINITY;
+        const center = [0, 1, 2].map((axis) => corners.reduce((sum, corner) => sum + corner[axis], 0) / corners.length);
+        let radius = 0;
+        for (const corner of corners) radius = Math.max(radius, Math.hypot(corner[0] - center[0], corner[1] - center[1], corner[2] - center[2]));
+        const edgeA = [corners[1][0] - corners[0][0], corners[1][1] - corners[0][1], corners[1][2] - corners[0][2]];
+        const edgeB = [corners[2][0] - corners[0][0], corners[2][1] - corners[0][1], corners[2][2] - corners[0][2]];
+        const normal = [
+            edgeA[1] * edgeB[2] - edgeA[2] * edgeB[1],
+            edgeA[2] * edgeB[0] - edgeA[0] * edgeB[2],
+            edgeA[0] * edgeB[1] - edgeA[1] * edgeB[0],
+        ];
+        const normalLength = Math.hypot(...normal);
+        if (normalLength < 1e-6) return Math.hypot(point[0] - center[0], point[1] - center[1], point[2] - center[2]);
+        const planeDistance = Math.abs(
+            (point[0] - center[0]) * normal[0]
+            + (point[1] - center[1]) * normal[1]
+            + (point[2] - center[2]) * normal[2]
+        ) / normalLength;
+        const centerDistance = Math.hypot(point[0] - center[0], point[1] - center[1], point[2] - center[2]);
+        const radialOverflow = Math.max(0, centerDistance - radius);
+        return Math.hypot(planeDistance, radialOverflow);
     }
 
     syncMloPortalDoors(doors = [], states = new Map()) {
@@ -1407,18 +1517,17 @@ export class DrawableStreamer {
             const def = this._mloDefs.get(String(instance.archHash));
             for (const portal of (def?.portals || [])) {
                 if (((Number(portal?.flags) >>> 0) & MLO_PORTAL_FLAG_HIDE_WHEN_DOOR_CLOSED) === 0) continue;
-                const center = this._portalCenterData(instance, portal);
-                if (!center) continue;
+                const corners = this._portalCornersData(instance, portal);
+                if (!corners.length) continue;
                 let progress = -1;
                 for (const door of (Array.isArray(doors) ? doors : [])) {
                     const coords = door?.coords;
                     if (!coords) continue;
-                    const distance = Math.hypot(
-                        center[0] - Number(coords.x),
-                        center[1] - Number(coords.y),
-                        center[2] - Number(coords.z),
+                    const distance = this._distanceToPortalAperture(
+                        [Number(coords.x), Number(coords.y), Number(coords.z)],
+                        corners,
                     );
-                    const bindRadius = Math.max(2.5, Math.min(4.5, Number(door?.radius) || 0));
+                    const bindRadius = Math.max(1.5, Math.min(3.0, Number(door?.radius) || 0));
                     if (!(distance <= bindRadius)) continue;
                     progress = Math.max(progress, Number(states?.get?.(door.id)?.progress) || 0);
                 }
@@ -1519,9 +1628,24 @@ export class DrawableStreamer {
                 position[1] - Number(inst.mat16[13]),
                 position[2] - Number(inst.mat16[14]),
             );
-            if (rootDistance > this._interiorActivationRadius(def)) continue;
+            const sentinelBounds = this._hasSentinelRoomBounds(def);
+            const hasSpatialBounds = Number.isFinite(this._distanceToMloSpatialBounds(position, inst.spatialBounds));
+            let insideSpatialEnvelope = false;
+            if (sentinelBounds && hasSpatialBounds) {
+                // The child envelope is the complete authored MLO placement,
+                // unlike a sentinel room box or a single entrance portal.
+                // Small padding covers doorway thresholds and sparse shell
+                // origins without allowing an MLO to claim the wider city.
+                insideSpatialEnvelope = this._distanceToMloSpatialBounds(position, inst.spatialBounds, 4.0, 6.0) === 0;
+                const exteriorDistance = this._distanceToMloSpatialBounds(position, inst.spatialBounds, 0.0, 4.0);
+                if (!insideSpatialEnvelope && exteriorDistance > Math.min(40.0, this.interiorExteriorDistance)) continue;
+            } else if (rootDistance > this._interiorActivationRadius(def)) {
+                continue;
+            }
             const exteriorRoomIndex = this._findExteriorRoomIndex(def);
-            const roomIndex = this._findContainingRoomIndex(def, local);
+            const roomIndex = sentinelBounds && hasSpatialBounds && !insideSpatialEnvelope
+                ? exteriorRoomIndex
+                : this._findContainingRoomIndex(def, local);
             if (roomIndex >= 0 && roomIndex !== exteriorRoomIndex && rootDistance < nearestInteriorDistance) {
                 nearestInteriorDistance = rootDistance;
                 nearestInterior = {
@@ -1581,6 +1705,11 @@ export class DrawableStreamer {
             }
         }
         this._mloInstancesLast = mloInstances;
+
+        // Worker roots carry the complete pre-cull child envelope. The
+        // fallback path enriches it from resident render entries and mesh
+        // radii. Both paths therefore use the same MLO activation semantics.
+        this._attachMloSpatialBounds(entries, mloInstances);
 
         const active = this._resolveActiveInterior(mloInstances, this._lastCamDataPos || [0, 0, 0]);
 
@@ -3323,10 +3452,11 @@ export class DrawableStreamer {
             const buckets = new Map();
 
             for (const e of keep) {
-                // The active MLO is gameplay space, not a distant city prop.
-                // Destination warmup budgets and waits for these high-detail
-                // children before exposing the destination to gameplay.
-                const lod = e.activeInteriorChild ? 'high' : this._chooseLod(e.hash, e.d);
+                // The active MLO is gameplay space, not a distant city prop,
+                // but it must still honor the selected quality profile. Forcing
+                // every interior child to high made medium/low queue hundreds
+                // of unnecessary submeshes and delayed the structural shell.
+                const lod = this._chooseLod(e.hash, e.d);
                 const interiorPriority = Number(e.activeInteriorPriority) || (e.activeInteriorChild ? 5000 : 0);
                 const metaEntry = this.modelManager?.manifest?.meshes?.[String(e.hash)];
                 const entryMat = metaEntry?.material ?? null;
@@ -3409,7 +3539,7 @@ export class DrawableStreamer {
         // Remove stale instance entries (hash:lod) that are no longer desired.
         const desiredKeys = new Set();
         for (const e of keep) {
-            const lod = e.activeInteriorChild ? 'high' : this._chooseLod(e.hash, e.d);
+            const lod = this._chooseLod(e.hash, e.d);
             desiredKeys.add(`${String(e.hash)}:${String(lod)}`);
             const mats = (e.mats instanceof Float32Array) ? e.mats : new Float32Array(e.mats);
             void this.modelRenderer.setInstancesForArchetype(e.hash, lod, mats, e.d, {

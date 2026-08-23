@@ -689,6 +689,7 @@ self.onmessage = async (e) => {
       const infos = new Map();
       const mloInstanceEntries = [];
       const seenMloInstances = new Set();
+      const mloChildBounds = new Map();
 
       for (const k0 of keys) {
         const k = String(k0 || '').trim();
@@ -710,6 +711,26 @@ self.onmessage = async (e) => {
           const end = Math.min(arr.length, off + len);
           for (let i = off; i + (stride - 1) < end; i += stride) {
             const flags = Number(arr[i + 20]) >>> 0;
+            const mloParentGuid = Number(arr[i + 18]) >>> 0;
+            if (mloParentGuid) {
+              const x = Number(arr[i + 12]);
+              const y = Number(arr[i + 13]);
+              const z = Number(arr[i + 14]);
+              if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+                let bounds = mloChildBounds.get(mloParentGuid);
+                if (!bounds) {
+                  bounds = [x, y, z, x, y, z, 0];
+                  mloChildBounds.set(mloParentGuid, bounds);
+                }
+                bounds[0] = Math.min(bounds[0], x);
+                bounds[1] = Math.min(bounds[1], y);
+                bounds[2] = Math.min(bounds[2], z);
+                bounds[3] = Math.max(bounds[3], x);
+                bounds[4] = Math.max(bounds[4], y);
+                bounds[5] = Math.max(bounds[5], z);
+                bounds[6]++;
+              }
+            }
             if ((flags & 1) === 0) continue;
             const parentGuid = Number(arr[i + 17]) >>> 0;
             if (!parentGuid) continue;
@@ -731,6 +752,16 @@ self.onmessage = async (e) => {
           info.totalLen += len;
           info.slices.push({ arr, off, len });
         }
+      }
+
+      // MLO room AABBs are not consistently usable: a number of otherwise
+      // valid FiveM resources publish map-sized sentinel boxes. Carry the
+      // authored child transform envelope beside each root so the main thread
+      // can activate the complete interior without guessing from one portal.
+      for (const packedRoot of mloInstanceEntries) {
+        const parentGuid = Number(packedRoot?.[1]) >>> 0;
+        const bounds = mloChildBounds.get(parentGuid);
+        if (bounds) packedRoot.push(...bounds);
       }
 
       let sourceInstances = 0;

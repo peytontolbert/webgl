@@ -19,17 +19,26 @@ globalThis.fetch = async (requested) => {
     catch { return new Response('missing', { status: 404 }); }
 };
 const first = Object.values(manifest.chunks)[0];
-const x = (Number(first.bounds.min_x) + Number(first.bounds.max_x)) * 0.5;
-const y = (Number(first.bounds.min_y) + Number(first.bounds.max_y)) * 0.5;
-const world = new CollisionWorld({});
+const requestedX = Number(process.argv[4]);
+const requestedY = Number(process.argv[5]);
+const x = Number.isFinite(requestedX) ? requestedX : (Number(first.bounds.min_x) + Number(first.bounds.max_x)) * 0.5;
+const y = Number.isFinite(requestedY) ? requestedY : (Number(first.bounds.min_y) + Number(first.bounds.max_y)) * 0.5;
+const world = new CollisionWorld({ groundPedToTerrain: true });
 await world.loadCompiledStaticCollision(url);
 const streamed = await world.streamCompiledStaticCollisionAt(x, y, 0);
 if (!world.ybnGround?.vertices?.length || !world.ybnGround?.indices?.length || !world.ybnGround?.grid?.size) {
     throw new Error('compiled loader decoded an empty collision world');
 }
+const ground = world.resolveGround(x, y, Number(process.argv[6]), {
+    preferInterior: true,
+    maxSnapDistance: 40,
+    applyYbnCalibration: false,
+});
+const rawYbnZ = world._getYbnGroundAtXY?.(x, y, Number(process.argv[6]), 80);
 console.log(JSON.stringify({
     valid: true,
     ...streamed,
+    query: { x, y, rawYbnZ: Number.isFinite(Number(rawYbnZ)) ? Number(rawYbnZ) : null, ground },
     vertices: world.ybnGround.vertices.length / 3,
     triangles: world.ybnGround.indices.length / 3,
     gridCells: world.ybnGround.grid.size,
