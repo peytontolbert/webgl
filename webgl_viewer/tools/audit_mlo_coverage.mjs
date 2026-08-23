@@ -8,6 +8,12 @@ const DOOR_PATTERN = /(?:door|gate|shutter|roller|barrier|hatch)/i;
 const NON_DOOR_PATTERN = /(?:door[_\s-]*frame|door[_\s-]*det(?:al|ail)|barrier[_\s-]*rope)/i;
 const IMAGE_PATTERN = /\.(?:webp|png|jpe?g|ktx2|dds)(?:$|[?#])/i;
 const HIDE_WHEN_DOOR_CLOSED = 64;
+const PORTAL_FLAG_NAMES = new Map([
+    [1, 'oneWay'], [2, 'linkInteriors'], [4, 'mirror'], [8, 'disableTimecycleModifier'],
+    [16, 'mirrorExpensiveShaders'], [32, 'lowLodOnly'], [64, 'hideWhenDoorClosed'],
+    [128, 'mirrorDirectional'], [256, 'mirrorPortalTraversal'], [512, 'mirrorFloor'],
+    [1024, 'mirrorExteriorView'], [2048, 'waterSurface'], [4096, 'waterHorizon'], [8192, 'lightBleed'],
+]);
 
 function parseArgs(argv) {
     const out = { metadata: [] };
@@ -16,6 +22,8 @@ function parseArgs(argv) {
         const value = argv[index + 1];
         if (key === '--repair-descriptor') {
             out.repairDescriptor = true;
+        } else if (key === '--require-native-parity') {
+            out.requireNativeParity = true;
         } else if (key === '--quiet') {
             out.quiet = true;
         } else if (key === '--metadata') {
@@ -168,6 +176,7 @@ function portalCoverage(root, definition, doors) {
     const invalid = [];
     let closable = 0;
     let boundClosable = 0;
+    const flagCounts = {};
     for (let arrayIndex = 0; arrayIndex < portals.length; arrayIndex++) {
         const portal = portals[arrayIndex] || {};
         const index = Number(portal.index);
@@ -175,6 +184,10 @@ function portalCoverage(root, definition, doors) {
         const to = Number(portal.roomTo);
         const corners = Array.isArray(portal.corners) ? portal.corners : [];
         const reasons = [];
+        const flags = Number(portal.flags) >>> 0;
+        for (const [bit, name] of PORTAL_FLAG_NAMES) {
+            if ((flags & bit) !== 0) flagCounts[name] = (flagCounts[name] || 0) + 1;
+        }
         if (!Number.isInteger(index) || index < 0 || indices.has(index)) reasons.push('invalid-or-duplicate-index');
         indices.add(index);
         if (index !== arrayIndex) reasons.push('index-array-order-mismatch');
@@ -195,7 +208,15 @@ function portalCoverage(root, definition, doors) {
         });
         if (bound) boundClosable++;
     }
-    return { rooms: rooms.length, portals: portals.length, invalid, closable, boundClosable };
+    return {
+        rooms: rooms.length,
+        portals: portals.length,
+        entitySets: Array.isArray(definition?.entitySets) ? definition.entitySets.length : 0,
+        flagCounts,
+        invalid,
+        closable,
+        boundClosable,
+    };
 }
 
 function metadataCoverage(files, roots, childrenByParent, nonRenderable) {
@@ -376,6 +397,36 @@ function main() {
         interiorDefinitionCount: new Set(roots.map((root) => root.hash).filter((hash) => fs.existsSync(path.join(args.interiors, `${hash}.json`)))).size,
     };
     const collision = args.collisionManifest ? collisionCoverage(descriptor, roots, args.collisionManifest) : null;
+    const semanticRequirements = rootReports.reduce((total, root) => {
+        const coverage = root.portalCoverage || {};
+        total.portals += Number(coverage.portals) || 0;
+        total.entitySets += Number(coverage.entitySets) || 0;
+        for (const [name, count] of Object.entries(coverage.flagCounts || {})) {
+            total.portalFlags[name] = (total.portalFlags[name] || 0) + Number(count || 0);
+        }
+        return total;
+    }, { portals: 0, entitySets: 0, portalFlags: {} });
+    semanticRequirements.mirrorPortals = Number(semanticRequirements.portalFlags.mirror) || 0;
+    semanticRequirements.dynamicCollisionImports = (descriptor?.mloRuntime?.collisionImports || [])
+        .filter((item) => String(item?.placement || '').toLowerCase() === 'dynamic').length;
+    const runtimeCapabilities = {
+        aperturePortalPvs: true,
+        instanceScopedPortalMutations: true,
+        doorBoundPortalVisibility: true,
+        dynamicOrientedDoorCollision: true,
+        entitySetActivation: true,
+        authoredPhysicsMaterialResponse: true,
+        planarMirrorScenePass: false,
+        dynamicCompoundYbn: false,
+    };
+    const unsupportedRequirements = [];
+    if (semanticRequirements.mirrorPortals && !runtimeCapabilities.planarMirrorScenePass) {
+        unsupportedRequirements.push({ capability: 'planarMirrorScenePass', count: semanticRequirements.mirrorPortals });
+    }
+    if (semanticRequirements.dynamicCollisionImports && !runtimeCapabilities.dynamicCompoundYbn) {
+        unsupportedRequirements.push({ capability: 'dynamicCompoundYbn', count: semanticRequirements.dynamicCollisionImports });
+    }
+    const nativeParityOk = unsupportedRequirements.length === 0;
     const staleDescriptorFields = {};
     for (const key of ['mloRootCount', 'mloChildCount', 'uniqueChildArchetypeCount', 'interiorDefinitionCount']) {
         const declared = Number(descriptor.mloImport?.[key]);
@@ -430,11 +481,19 @@ function main() {
         roots: rootReports,
         metadata: args.metadata.length ? metadataCoverage(args.metadata, roots, childrenByParent, nonRenderable) : null,
         collision,
+        runtimeSemantics: {
+            nativeParityOk,
+            requirements: semanticRequirements,
+            capabilities: runtimeCapabilities,
+            unsupportedRequirements,
+        },
     };
     const output = JSON.stringify(report, null, 2) + '\n';
     if (args.output) fs.writeFileSync(args.output, output);
     if (!args.quiet) process.stdout.write(output);
-    process.exitCode = report.ok && (!report.metadata || (!report.metadata.unmatchedRoots.length && !report.metadata.unmatchedChildren.length)) ? 0 : 1;
+    process.exitCode = report.ok
+        && (!args.requireNativeParity || nativeParityOk)
+        && (!report.metadata || (!report.metadata.unmatchedRoots.length && !report.metadata.unmatchedChildren.length)) ? 0 : 1;
 }
 
 main();

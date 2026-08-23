@@ -148,6 +148,7 @@ export class DrawableStreamer {
         // upper bytes of the ENT1 MLO flags field by the demo preprocessor.
         this.enableInteriors = true;
         this.enableRoomGating = true;         // portal/room gating
+        this.enableMloPortalApertureCulling = true; // conservative recursive portal PVS
         this.interiorPortalDepth = 3;         // BFS depth through portals from current room
         this.interiorExteriorDistance = 80.0; // retain nearby interiors through exterior portals
         // Some custom MLOs export sentinel room bounds hundreds of metres wide. Limit those
@@ -161,6 +162,7 @@ export class DrawableStreamer {
         this._mloSetOverrides = new Map();    // key `${parentGuid}:${setHash}` -> boolean
         this._mloSetDefaults = new Map();     // key `${parentGuid}:${setHash}` -> authored default
         this._mloPortalOpenOverrides = new Map(); // key `${parentGuid}:${portalIndex}` -> door progress
+        this._mloPortalDefinitionOverrides = new Map(); // instance-scoped FiveM portal mutations
         this._activeInterior = null;          // { parentGuid, archHash, roomIndex, visibleRooms:Set<number> }
         this._activeInteriorKey = '';         // cached change detector
         this._mloInstancesLast = [];          // last discovered MLO instances (from last rebuild)
@@ -1472,7 +1474,13 @@ export class DrawableStreamer {
         return `${Number(parentGuid) >>> 0}:${Number(portal?.index) >>> 0}`;
     }
 
+    _runtimePortal(parentGuid, portal) {
+        const patch = this._mloPortalDefinitionOverrides.get(this._portalKey(parentGuid, portal));
+        return patch ? { ...portal, ...patch } : portal;
+    }
+
     _isPortalOpen(parentGuid, portal) {
+        portal = this._runtimePortal(parentGuid, portal);
         const flags = Number(portal?.flags) >>> 0;
         if ((flags & MLO_PORTAL_FLAG_HIDE_WHEN_DOOR_CLOSED) === 0) return true;
         const progress = this._portalOpenProgress(parentGuid, portal);
@@ -1483,6 +1491,41 @@ export class DrawableStreamer {
     _portalOpenProgress(parentGuid, portal) {
         const progress = this._mloPortalOpenOverrides.get(this._portalKey(parentGuid, portal));
         return progress === undefined ? 1 : Math.max(0, Math.min(1, Number(progress) || 0));
+    }
+
+    _portalVisibleThroughAperture(eye, aperture, candidate) {
+        if (!this.enableMloPortalApertureCulling || !Array.isArray(eye) || eye.length < 3) return true;
+        const source = Array.isArray(aperture?.corners) ? aperture.corners : [];
+        const target = Array.isArray(candidate?.corners) ? candidate.corners : [];
+        if (source.length < 3 || target.length < 3) return true;
+        const valid = (point) => Array.isArray(point) && point.length >= 3
+            && [Number(point[0]), Number(point[1]), Number(point[2])].every(Number.isFinite);
+        if (!source.every(valid) || !target.every(valid)) return true;
+        const center = [0, 1, 2].map((axis) => source.reduce((sum, point) => sum + Number(point[axis]), 0) / source.length);
+        const targetPoints = [...target, [0, 1, 2].map((axis) => target.reduce((sum, point) => sum + Number(point[axis]), 0) / target.length)];
+        const planes = [];
+        for (let index = 0; index < source.length; index++) {
+            const a = source[index];
+            const b = source[(index + 1) % source.length];
+            const ax = Number(a[0]) - eye[0]; const ay = Number(a[1]) - eye[1]; const az = Number(a[2]) - eye[2];
+            const bx = Number(b[0]) - eye[0]; const by = Number(b[1]) - eye[1]; const bz = Number(b[2]) - eye[2];
+            let nx = ay * bz - az * by;
+            let ny = az * bx - ax * bz;
+            let nz = ax * by - ay * bx;
+            const length = Math.hypot(nx, ny, nz);
+            if (length < 1e-7) continue;
+            const centerDot = nx * (center[0] - eye[0]) + ny * (center[1] - eye[1]) + nz * (center[2] - eye[2]);
+            if (centerDot < 0) { nx = -nx; ny = -ny; nz = -nz; }
+            planes.push([nx / length, ny / length, nz / length]);
+        }
+        if (planes.length < 3) return true;
+        // Conservative polygon/cone test. A generous angular epsilon keeps
+        // touching portal edges and imprecise custom-MLO corners fail-open.
+        return targetPoints.some((point) => planes.every((plane) => (
+            plane[0] * (Number(point[0]) - eye[0])
+            + plane[1] * (Number(point[1]) - eye[1])
+            + plane[2] * (Number(point[2]) - eye[2])
+        ) >= -0.075));
     }
 
     _portalCenterData(instance, portal) {
@@ -1533,7 +1576,8 @@ export class DrawableStreamer {
         const next = new Map();
         for (const instance of this._mloInstancesLast || []) {
             const def = this._mloDefs.get(String(instance.archHash));
-            for (const portal of (def?.portals || [])) {
+            for (const authoredPortal of (def?.portals || [])) {
+                const portal = this._runtimePortal(instance.parentGuid, authoredPortal);
                 if (((Number(portal?.flags) >>> 0) & MLO_PORTAL_FLAG_HIDE_WHEN_DOOR_CLOSED) === 0) continue;
                 const corners = this._portalCornersData(instance, portal);
                 if (!corners.length) continue;
@@ -1567,7 +1611,7 @@ export class DrawableStreamer {
         return next.size;
     }
 
-    _computeVisibleRooms(def, startRoomIdx, parentGuid = 0) {
+    _computeVisibleRooms(def, startRoomIdx, parentGuid = 0, localViewPosition = null) {
         const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
         const portals = Array.isArray(def?.portals) ? def.portals : [];
         const maxDepth = Math.max(0, Math.min(8, Math.floor(this.interiorPortalDepth || 0)));
@@ -1579,7 +1623,8 @@ export class DrawableStreamer {
         // Build adjacency from portals.
         /** @type {Map<number, Array<{ room:number, portal:object }>>} */
         const adj = new Map();
-        for (const p of portals) {
+        for (const authoredPortal of portals) {
+            const p = this._runtimePortal(parentGuid, authoredPortal);
             const a = Number(p?.roomFrom);
             const b = Number(p?.roomTo);
             if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
@@ -1593,21 +1638,22 @@ export class DrawableStreamer {
             }
         }
 
-        /** @type {Array<{r:number,d:number}>} */
-        const q = [{ r: startRoomIdx, d: 0 }];
+        /** @type {Array<{r:number,d:number,aperture:object|null}>} */
+        const q = [{ r: startRoomIdx, d: 0, aperture: null }];
         while (q.length) {
-            const { r, d } = q.shift();
+            const { r, d, aperture } = q.shift();
             if (d >= maxDepth) continue;
             const ns = adj.get(r) || [];
             for (const edge of ns) {
                 const n = edge.room;
                 if (vis.has(n)) continue;
+                if (aperture && !this._portalVisibleThroughAperture(localViewPosition, aperture, edge.portal)) continue;
                 const nextDepth = d + 1;
                 const exteriorDepth = Number(rooms[n]?.exteriorVisibilityDepth);
                 if (startRoomIdx === this._findExteriorRoomIndex(def)
                     && Number.isFinite(exteriorDepth) && exteriorDepth >= 0 && nextDepth > exteriorDepth) continue;
                 vis.add(n);
-                q.push({ r: n, d: nextDepth });
+                q.push({ r: n, d: nextDepth, aperture: edge.portal });
             }
         }
         return vis;
@@ -1677,7 +1723,7 @@ export class DrawableStreamer {
                     roomIndex,
                     exteriorRoomIndex,
                     isExterior: false,
-                    visibleRooms: this._computeVisibleRooms(def, roomIndex, inst.parentGuid),
+                    visibleRooms: this._computeVisibleRooms(def, roomIndex, inst.parentGuid, local),
                     invMat: inv,
                     mat16: inst.mat16,
                     localPosition: local,
@@ -1693,7 +1739,7 @@ export class DrawableStreamer {
                     roomIndex: exteriorRoomIndex,
                     exteriorRoomIndex,
                     isExterior: true,
-                    visibleRooms: this._computeVisibleRooms(def, exteriorRoomIndex, inst.parentGuid),
+                    visibleRooms: this._computeVisibleRooms(def, exteriorRoomIndex, inst.parentGuid, local),
                     invMat: inv,
                     mat16: inst.mat16,
                     localPosition: local,
@@ -1809,7 +1855,10 @@ export class DrawableStreamer {
                         const rooms = Array.isArray(def?.rooms) ? def.rooms : [];
                         const ownership = this._decodeMloFlags(mloFlags);
                         if (ownership.portalIndex >= 0) {
-                            const portal = (def?.portals || [])[ownership.portalIndex];
+                            const portal = this._runtimePortal(
+                                mloParentGuid,
+                                (def?.portals || [])[ownership.portalIndex],
+                            );
                             const from = Number(portal?.roomFrom);
                             const to = Number(portal?.roomTo);
                             if (!visibility.visibleRooms.has(from) && !visibility.visibleRooms.has(to)) continue;
@@ -1868,7 +1917,8 @@ export class DrawableStreamer {
         while (queue.length) {
             const current = queue.shift();
             if (current.path.length >= 12) continue;
-            for (const portal of portals) {
+            for (const authoredPortal of portals) {
+                const portal = this._runtimePortal(parentGuid, authoredPortal);
                 if (!this._isPortalOpen(parentGuid, portal)) continue;
                 const a = Number(portal?.roomFrom);
                 const b = Number(portal?.roomTo);
@@ -2207,6 +2257,69 @@ export class DrawableStreamer {
             const pg = (Number(parentGuid) >>> 0);
             for (const k of Array.from(this._mloSetOverrides.keys())) {
                 if (String(k).startsWith(`${pg}:`)) this._mloSetOverrides.delete(k);
+            }
+        }
+        this._dirty = true;
+    }
+
+    getMloPortals(parentGuid = null) {
+        const wantedParent = parentGuid === null || parentGuid === undefined ? null : (Number(parentGuid) >>> 0);
+        const result = [];
+        for (const instance of this._mloInstancesLast || []) {
+            const pg = Number(instance.parentGuid) >>> 0;
+            if (wantedParent !== null && pg !== wantedParent) continue;
+            const def = this._mloDefs.get(String(instance.archHash));
+            for (const authoredPortal of (def?.portals || [])) {
+                const portal = this._runtimePortal(pg, authoredPortal);
+                result.push({
+                    parentGuid: pg,
+                    archetypeHash: String(instance.archHash),
+                    index: Number(portal?.index) >>> 0,
+                    roomFrom: Number(portal?.roomFrom),
+                    roomTo: Number(portal?.roomTo),
+                    flags: Number(portal?.flags) >>> 0,
+                    mirrorPriority: Number(portal?.mirrorPriority) || 0,
+                    opacity: Number(portal?.opacity) || 0,
+                    audioOcclusion: Number(portal?.audioOcclusion) || 0,
+                    overridden: this._mloPortalDefinitionOverrides.has(this._portalKey(pg, authoredPortal)),
+                });
+            }
+        }
+        return result;
+    }
+
+    setMloPortalDefinition(parentGuid, portalIndex, patch = {}) {
+        const pg = Number(parentGuid) >>> 0;
+        const index = Number(portalIndex) >>> 0;
+        const instance = (this._mloInstancesLast || []).find((entry) => (Number(entry.parentGuid) >>> 0) === pg);
+        const def = instance ? this._mloDefs.get(String(instance.archHash)) : null;
+        const authoredPortal = (def?.portals || []).find((portal) => (Number(portal?.index) >>> 0) === index);
+        if (!pg || !authoredPortal) return false;
+        const current = this._mloPortalDefinitionOverrides.get(this._portalKey(pg, authoredPortal)) || {};
+        const next = { ...current };
+        for (const key of ['roomFrom', 'roomTo', 'flags']) {
+            if (!(key in patch)) continue;
+            const value = Number(patch[key]);
+            if (!Number.isFinite(value) || value < 0) return false;
+            next[key] = key === 'flags' ? value >>> 0 : Math.floor(value);
+        }
+        this._mloPortalDefinitionOverrides.set(this._portalKey(pg, authoredPortal), next);
+        this._dirty = true;
+        try {
+            window.dispatchEvent(new CustomEvent('webglgta:mlo-portal-changed', {
+                detail: { parentGuid: pg, portalIndex: index, ...next },
+            }));
+        } catch { /* non-browser tests */ }
+        return true;
+    }
+
+    clearMloPortalOverrides(parentGuid = null) {
+        if (parentGuid === null || parentGuid === undefined) {
+            this._mloPortalDefinitionOverrides.clear();
+        } else {
+            const prefix = `${Number(parentGuid) >>> 0}:`;
+            for (const key of Array.from(this._mloPortalDefinitionOverrides.keys())) {
+                if (String(key).startsWith(prefix)) this._mloPortalDefinitionOverrides.delete(key);
             }
         }
         this._dirty = true;
