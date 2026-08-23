@@ -19,6 +19,7 @@ const definition = {
 streamer._mloDefs.set('99', definition);
 streamer._mloInstancesLast = [{ parentGuid: 77, archHash: '99', mat16: identity }];
 
+streamer.enableMloPortalApertureCulling = true;
 assert.deepEqual(
     [...streamer._computeVisibleRooms(definition, 0, 77, [-2, 0, 0])],
     [0, 1],
@@ -26,7 +27,6 @@ assert.deepEqual(
 );
 streamer.enableMloPortalApertureCulling = false;
 assert.deepEqual([...streamer._computeVisibleRooms(definition, 0, 77, [-2, 0, 0])], [0, 1, 2]);
-streamer.enableMloPortalApertureCulling = true;
 
 assert.equal(streamer.setMloPortalDefinition(77, 1, { flags: 1 }), true);
 assert.equal(streamer.getMloPortals(77).find((portal) => portal.index === 1)?.flags, 1);

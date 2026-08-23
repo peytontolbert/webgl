@@ -177,6 +177,7 @@ function portalCoverage(root, definition, doors) {
     let closable = 0;
     let boundClosable = 0;
     const flagCounts = {};
+    const adjacency = Array.from({ length: rooms.length }, () => []);
     for (let arrayIndex = 0; arrayIndex < portals.length; arrayIndex++) {
         const portal = portals[arrayIndex] || {};
         const index = Number(portal.index);
@@ -193,6 +194,10 @@ function portalCoverage(root, definition, doors) {
         if (index !== arrayIndex) reasons.push('index-array-order-mismatch');
         if (!Number.isInteger(from) || from < 0 || from >= rooms.length) reasons.push('invalid-roomFrom');
         if (!Number.isInteger(to) || to < 0 || to >= rooms.length) reasons.push('invalid-roomTo');
+        if (Number.isInteger(from) && Number.isInteger(to) && from >= 0 && to >= 0 && from < rooms.length && to < rooms.length) {
+            adjacency[from].push(to);
+            adjacency[to].push(from);
+        }
         if (corners.length < 4 || corners.some((corner) => !Array.isArray(corner) || corner.length < 3 || corner.some((number) => !Number.isFinite(Number(number))))) {
             reasons.push('invalid-corners');
         }
@@ -208,9 +213,24 @@ function portalCoverage(root, definition, doors) {
         });
         if (bound) boundClosable++;
     }
+    let graphDiameter = 0;
+    for (let start = 0; start < rooms.length; start++) {
+        const distances = Array(rooms.length).fill(-1);
+        const queue = [start];
+        distances[start] = 0;
+        for (let cursor = 0; cursor < queue.length; cursor++) {
+            for (const next of adjacency[queue[cursor]]) {
+                if (distances[next] >= 0) continue;
+                distances[next] = distances[queue[cursor]] + 1;
+                queue.push(next);
+            }
+        }
+        graphDiameter = Math.max(graphDiameter, ...distances);
+    }
     return {
         rooms: rooms.length,
         portals: portals.length,
+        graphDiameter,
         entitySets: Array.isArray(definition?.entitySets) ? definition.entitySets.length : 0,
         flagCounts,
         invalid,
@@ -401,11 +421,12 @@ function main() {
         const coverage = root.portalCoverage || {};
         total.portals += Number(coverage.portals) || 0;
         total.entitySets += Number(coverage.entitySets) || 0;
+        total.maxPortalGraphDepth = Math.max(total.maxPortalGraphDepth, Number(coverage.graphDiameter) || 0);
         for (const [name, count] of Object.entries(coverage.flagCounts || {})) {
             total.portalFlags[name] = (total.portalFlags[name] || 0) + Number(count || 0);
         }
         return total;
-    }, { portals: 0, entitySets: 0, portalFlags: {} });
+    }, { portals: 0, entitySets: 0, maxPortalGraphDepth: 0, portalFlags: {} });
     semanticRequirements.mirrorPortals = Number(semanticRequirements.portalFlags.mirror) || 0;
     semanticRequirements.dynamicCollisionImports = (descriptor?.mloRuntime?.collisionImports || [])
         .filter((item) => String(item?.placement || '').toLowerCase() === 'dynamic').length;
@@ -420,8 +441,17 @@ function main() {
         && mirrorRuntimeSource.includes('clipPlane');
     const hasPrioritizedMirrorTraversal = mirrorIntegrationSource.includes('getVisibleMloMirrorPortal')
         && mirrorIntegrationSource.includes('_mloMirrorNextRenderAt');
+    const portalDepthMatch = mirrorIntegrationSource.match(/interiorPortalDepth\s*=\s*(\d+)/)
+        || mirrorRuntimeSource.match(/interiorPortalDepth\s*=\s*(\d+)/);
+    let drawableRuntimeSource = '';
+    try { drawableRuntimeSource = fs.readFileSync(new URL('../js/drawable_streamer.js', import.meta.url), 'utf8'); } catch { /* reported below */ }
+    const drawablePortalDepthMatch = drawableRuntimeSource.match(/interiorPortalDepth\s*=\s*(\d+)/);
+    const portalTraversalDepth = Number(drawablePortalDepthMatch?.[1] || portalDepthMatch?.[1] || 0);
     const runtimeCapabilities = {
-        aperturePortalPvs: true,
+        aperturePortalPvs: false,
+        conservativePortalConnectivity: true,
+        exactPortalRasterClipping: false,
+        portalTraversalDepth,
         instanceScopedPortalMutations: true,
         doorBoundPortalVisibility: true,
         dynamicOrientedDoorCollision: true,
@@ -435,6 +465,12 @@ function main() {
     const unsupportedRequirements = [];
     if (semanticRequirements.mirrorPortals && !runtimeCapabilities.planarMirrorScenePass) {
         unsupportedRequirements.push({ capability: 'planarMirrorScenePass', count: semanticRequirements.mirrorPortals });
+    }
+    if (semanticRequirements.maxPortalGraphDepth > runtimeCapabilities.portalTraversalDepth) {
+        unsupportedRequirements.push({ capability: 'portalTraversalDepth', required: semanticRequirements.maxPortalGraphDepth, actual: runtimeCapabilities.portalTraversalDepth });
+    }
+    if (semanticRequirements.portals && !runtimeCapabilities.exactPortalRasterClipping) {
+        unsupportedRequirements.push({ capability: 'exactPortalRasterClipping', count: semanticRequirements.portals });
     }
     if (semanticRequirements.dynamicCollisionImports && !runtimeCapabilities.dynamicCompoundYbn) {
         unsupportedRequirements.push({ capability: 'dynamicCompoundYbn', count: semanticRequirements.dynamicCollisionImports });

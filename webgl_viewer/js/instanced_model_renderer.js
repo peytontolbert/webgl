@@ -4877,6 +4877,24 @@ void main() {
         return true;
     }
 
+    updateInstanceMatricesForBucket(bucketId, matricesFloat32, opts = {}) {
+        const entry = this.buckets.get(String(bucketId || ''));
+        if (!this.ready || !entry || !matricesFloat32?.length) return false;
+        const stride = resolveInstanceStride(matricesFloat32.length, opts?.instanceStrideFloats);
+        if (entry.instanceStrideFloats && entry.instanceStrideFloats !== stride) {
+            try { if (entry.vao) this.gl.deleteVertexArray(entry.vao); } catch { /* ignore */ }
+            entry.vao = null;
+        }
+        entry.instanceStrideFloats = stride;
+        entry.instanceCount = Math.floor(matricesFloat32.length / stride);
+        const changed = this._updateInstanceData(entry, matricesFloat32);
+        if (changed) this._uploadInstanceBuffer(entry, matricesFloat32);
+        if ((changed || !entry._instBounds) && opts?.skipInstanceBounds !== true) {
+            entry._instBounds = this._computeInstanceBoundsFromMatrices(matricesFloat32);
+        }
+        return true;
+    }
+
     async setInstancesForBucket(bucketId, lod, file, material, matricesFloat32, minDist = null, explicitStride = null, opts = {}) {
         const id = String(bucketId || '');
         const l = String(lod || 'high').toLowerCase();
@@ -4912,6 +4930,7 @@ void main() {
                 mesh: null,
                 vao: null,
                 loadPriority: 0,
+                sourceHashes: [],
             };
             this.buckets.set(id, entry);
         } else {
@@ -4928,6 +4947,7 @@ void main() {
 
         const loadPriority = Number(opts?.loadPriority);
         entry.loadPriority = Number.isFinite(loadPriority) ? loadPriority : (Number(entry.loadPriority) || 0);
+        entry.sourceHashes = Array.isArray(opts?.sourceHashes) ? opts.sourceHashes.map(String) : [];
 
         {
             const d = Number(minDist);

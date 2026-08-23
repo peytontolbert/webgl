@@ -149,8 +149,14 @@ export class DrawableStreamer {
         // upper bytes of the ENT1 MLO flags field by the demo preprocessor.
         this.enableInteriors = true;
         this.enableRoomGating = true;         // portal/room gating
-        this.enableMloPortalApertureCulling = true; // conservative recursive portal PVS
-        this.interiorPortalDepth = 3;         // BFS depth through portals from current room
+        // Portal connectivity remains authoritative, but the approximate cone
+        // test can reject valid custom-MLO portals whose winding differs from
+        // Rockstar's native raster clipper. Fail open until exact polygon
+        // clipping is available so authored rooms never disappear.
+        this.enableMloPortalApertureCulling = false;
+        // Imported interiors currently contain connected room graphs with a
+        // diameter of up to five portals. Three silently removed valid rooms.
+        this.interiorPortalDepth = 8;
         this.interiorExteriorDistance = 80.0; // retain nearby interiors through exterior portals
         // Some custom MLOs export sentinel room bounds hundreds of metres wide. Limit those
         // claims to their actual district and rank overlaps by distance to the MLO root.
@@ -3697,6 +3703,7 @@ export class DrawableStreamer {
                             minDist: e.d,
                             stride,
                             loadPriority: interiorPriority,
+                            sourceHashes: new Set([String(e.hash)]),
                         };
                         buckets.set(bucketId, b);
                     } else {
@@ -3705,6 +3712,7 @@ export class DrawableStreamer {
                         const nextD = Number(e.d);
                         if (!Number.isFinite(prevD) || (Number.isFinite(nextD) && nextD < prevD)) b.minDist = nextD;
                         if (e.activeInteriorChild) b.loadPriority = Math.max(interiorPriority, Number(b.loadPriority) || 0);
+                        b.sourceHashes.add(String(e.hash));
                     }
                     // Append this archetype's instance matrices into this bucket.
                     for (let i = 0; i < e.mats.length; i++) b.mats.push(e.mats[i]);
@@ -3731,7 +3739,7 @@ export class DrawableStreamer {
             for (const [bid, b] of buckets.entries()) {
                 void this.modelRenderer.setInstancesForBucket(
                     bid, b.lod, b.file, b.material, new Float32Array(b.mats), b.minDist, b.stride,
-                    { loadPriority: Number(b.loadPriority) || 0 },
+                    { loadPriority: Number(b.loadPriority) || 0, sourceHashes: Array.from(b.sourceHashes) },
                 );
             }
             this._prevDesiredBucketIds = desiredBucketIds;

@@ -81,6 +81,26 @@ assert.deepEqual(streamer._filterEntriesForActiveInterior([], [
 assert.equal(streamer._mloInstancesLast.length, 1);
 assert.equal(streamer._activeInterior?.roomIndex, 1);
 
+// Current imported MLOs contain valid room paths deeper than the old three-hop
+// cap. Every connected authored room must remain reachable by default.
+const deepRooms = Array.from({ length: 6 }, (_, index) => ({
+    index,
+    name: index ? `room${index}` : 'limbo',
+    bbMin: [index * 4, -2, -2],
+    bbMax: [index * 4 + 4, 2, 2],
+}));
+const deepDefinition = {
+    rooms: deepRooms,
+    portals: Array.from({ length: 5 }, (_, index) => ({
+        index,
+        roomFrom: index,
+        roomTo: index + 1,
+        flags: 0,
+        corners: [[index * 4 + 4, -1, -1], [index * 4 + 4, 1, -1], [index * 4 + 4, 1, 1]],
+    })),
+};
+assert.deepEqual([...streamer._computeVisibleRooms(deepDefinition, 0, 91)], [0, 1, 2, 3, 4, 5]);
+
 // Malformed loose-MLO room bounds must not keep an interior active out in the
 // surrounding city. Portal metadata provides the authored shell scale.
 const sentinelDefinition = {

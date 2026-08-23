@@ -7848,6 +7848,20 @@ export class App {
                 workerFrustumPadding: this.drawableStreamer?.workerFrustumPadding ?? null,
             },
             coverage: cov,
+            mloRuntime: {
+                activeInterior: this.drawableStreamer?._activeInterior ? {
+                    parentGuid: Number(this.drawableStreamer._activeInterior.parentGuid) >>> 0,
+                    archetypeHash: String(this.drawableStreamer._activeInterior.archHash || ''),
+                    roomIndex: Number(this.drawableStreamer._activeInterior.roomIndex),
+                    exteriorRoomIndex: Number(this.drawableStreamer._activeInterior.exteriorRoomIndex),
+                    isExterior: !!this.drawableStreamer._activeInterior.isExterior,
+                    visibleRooms: Array.from(this.drawableStreamer._activeInterior.visibleRooms || []).sort((a, b) => a - b),
+                } : null,
+                portalTraversalDepth: Number(this.drawableStreamer?.interiorPortalDepth) || 0,
+                apertureCullingEnabled: !!this.drawableStreamer?.enableMloPortalApertureCulling,
+                visibleInteriorInstances: Number(this.drawableStreamer?._visibleMloInteriors?.size) || 0,
+                doors: this.doorController?.getRuntimeDiagnostics?.() || null,
+            },
             activeRenderer: trackActive ? 'TrackSceneRenderer' : 'InstancedModelRenderer',
             trackCoverage: trackActive ? {
                 descriptorLoaded: !!this.trackSceneRenderer?.sceneUrl,

@@ -23,6 +23,7 @@ export class DoorController {
         this.states = new Map();
         this._entryCaches = new WeakMap();
         this._networkTouchAt = new Map();
+        this._renderBoundDoorIds = new Set();
     }
 
     setManifest(manifest) {
@@ -121,6 +122,17 @@ export class DoorController {
         return this.states.get(String(id || '')) || null;
     }
 
+    getRuntimeDiagnostics() {
+        const geometryDoors = this.doors.filter((door) => door.archetypeHash !== '0');
+        return {
+            definitions: this.doors.length,
+            geometryDefinitions: geometryDoors.length,
+            states: this.states.size,
+            renderBound: this._renderBoundDoorIds.size,
+            unboundDoorIds: geometryDoors.map((door) => door.id).filter((id) => !this._renderBoundDoorIds.has(id)),
+        };
+    }
+
     _setDoorTarget(door, open, { network = false, automatic = false } = {}) {
         const state = this.states.get(door.id);
         if (!state) return;
@@ -142,48 +154,68 @@ export class DoorController {
 
     _applyAnimatedMatrices() {
         const renderer = this.app?.instancedModelRenderer;
-        if (!renderer?.ready || !renderer.instances?.size) return;
-        for (const [hash, doors] of this.byHash) {
-            for (const [key, entry] of renderer.instances) {
-                if (!key.startsWith(`${hash}:`) || !(entry?.instanceData instanceof Float32Array)) continue;
-                const stride = Math.max(16, Math.floor(finite(entry.instanceStrideFloats, 16)));
-                let cache = this._entryCaches.get(entry);
-                if (!cache || cache.base.length !== entry.instanceData.length || cache.stride !== stride) {
-                    cache = { base: new Float32Array(entry.instanceData), stride, indices: new Map(), lastKey: '' };
-                    for (const door of doors) {
-                        let bestOffset = -1;
-                        let bestDistance = 0.12;
-                        for (let offset = 0; offset + 15 < cache.base.length; offset += stride) {
-                            const d = Math.hypot(
-                                cache.base[offset + 12] - finite(door.origin.x),
-                                cache.base[offset + 13] - finite(door.origin.y),
-                                cache.base[offset + 14] - finite(door.origin.z),
-                            );
-                            if (d < bestDistance) { bestDistance = d; bestOffset = offset; }
-                        }
-                        if (bestOffset >= 0) cache.indices.set(door.id, bestOffset);
-                    }
-                    this._entryCaches.set(entry, cache);
-                }
-                const progressKey = doors.map((door) => finite(this.states.get(door.id)?.progress).toFixed(3)).join('|');
-                if (progressKey === cache.lastKey) continue;
-                const output = new Float32Array(cache.base);
+        if (!renderer?.ready || (!renderer.instances?.size && !renderer.buckets?.size)) return;
+        const renderEntries = [
+            ...Array.from(renderer.instances || [], ([key, entry]) => ({ key, entry, bucket: false })),
+            ...Array.from(renderer.buckets || [], ([key, entry]) => ({ key, entry, bucket: true })),
+        ];
+        const boundThisFrame = new Set();
+        for (const { key, entry, bucket } of renderEntries) {
+            if (!(entry?.instanceData instanceof Float32Array)) continue;
+            const hashes = bucket
+                ? (Array.isArray(entry.sourceHashes) ? entry.sourceHashes : [])
+                : [String(key).split(':', 1)[0]];
+            const doors = hashes.flatMap((hash) => this.byHash.get(String(hash)) || []);
+            if (!doors.length) continue;
+            const stride = Math.max(16, Math.floor(finite(entry.instanceStrideFloats, 16)));
+            let cache = this._entryCaches.get(entry);
+            if (!cache || cache.base.length !== entry.instanceData.length || cache.stride !== stride) {
+                cache = { base: new Float32Array(entry.instanceData), stride, indices: new Map(), lastKey: '' };
                 for (const door of doors) {
-                    const offset = cache.indices.get(door.id);
-                    const progress = finite(this.states.get(door.id)?.progress);
-                    if (offset === undefined || progress <= 0.0001) continue;
-                    const matrix = output.subarray(offset, offset + 16);
-                    if (door.motion === 'slide') {
-                        glMatrix.mat4.translate(matrix, matrix, [door.openSign * door.openAmount * progress, 0, 0]);
-                    } else if (door.motion === 'lift') {
-                        glMatrix.mat4.rotateY(matrix, matrix, door.openSign * door.openAmount * progress);
-                    } else {
-                        glMatrix.mat4.rotateZ(matrix, matrix, door.openSign * door.openAmount * progress);
+                    let bestOffset = -1;
+                    let bestDistance = 0.12;
+                    for (let offset = 0; offset + 15 < cache.base.length; offset += stride) {
+                        const d = Math.hypot(
+                            cache.base[offset + 12] - finite(door.origin.x),
+                            cache.base[offset + 13] - finite(door.origin.y),
+                            cache.base[offset + 14] - finite(door.origin.z),
+                        );
+                        if (d < bestDistance) { bestDistance = d; bestOffset = offset; }
                     }
+                    if (bestOffset >= 0) cache.indices.set(door.id, bestOffset);
                 }
-                cache.lastKey = progressKey;
-                renderer.updateInstanceMatricesForArchetype(entry.hash, entry.lod, output, entry.minDist, { skipInstanceBounds: true });
+                this._entryCaches.set(entry, cache);
+            }
+            for (const door of doors) if (cache.indices.has(door.id)) boundThisFrame.add(door.id);
+            const progressKey = doors.map((door) => finite(this.states.get(door.id)?.progress).toFixed(3)).join('|');
+            if (progressKey === cache.lastKey) continue;
+            const output = new Float32Array(cache.base);
+            for (const door of doors) {
+                const offset = cache.indices.get(door.id);
+                const progress = finite(this.states.get(door.id)?.progress);
+                if (offset === undefined || progress <= 0.0001) continue;
+                const matrix = output.subarray(offset, offset + 16);
+                if (door.motion === 'slide') {
+                    glMatrix.mat4.translate(matrix, matrix, [door.openSign * door.openAmount * progress, 0, 0]);
+                } else if (door.motion === 'lift') {
+                    glMatrix.mat4.rotateY(matrix, matrix, door.openSign * door.openAmount * progress);
+                } else {
+                    glMatrix.mat4.rotateZ(matrix, matrix, door.openSign * door.openAmount * progress);
+                }
+            }
+            cache.lastKey = progressKey;
+            if (bucket) {
+                renderer.updateInstanceMatricesForBucket(key, output, {
+                    instanceStrideFloats: stride,
+                    skipInstanceBounds: true,
+                });
+            } else {
+                renderer.updateInstanceMatricesForArchetype(entry.hash, entry.lod, output, entry.minDist, {
+                    instanceStrideFloats: stride,
+                    skipInstanceBounds: true,
+                });
             }
         }
+        this._renderBoundDoorIds = boundThisFrame;
     }
 }

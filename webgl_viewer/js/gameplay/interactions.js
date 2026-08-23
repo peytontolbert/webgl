@@ -59,12 +59,15 @@ export class InteractionSystem {
 
         let nearest = null;
         let nearestD2 = Infinity;
+        let nearestPriority = -1;
         for (const spot of this.spots) {
             const d2 = distSq3(posData, spot.coords);
             const r = finite(spot.radius, 2.5);
-            if (d2 <= r * r && d2 < nearestD2) {
+            const priority = spot.type === 'door' ? 2 : 1;
+            if (d2 <= r * r && (priority > nearestPriority || (priority === nearestPriority && d2 < nearestD2))) {
                 nearest = { ...spot, distance: Math.sqrt(d2) };
                 nearestD2 = d2;
+                nearestPriority = priority;
             }
         }
         this.active = nearest;
