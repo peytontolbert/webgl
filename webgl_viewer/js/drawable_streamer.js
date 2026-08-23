@@ -8,6 +8,7 @@ const MLO_FLAG_ENTITY_SET_DEFAULT = 8;
 const MLO_ROOM_SHIFT = 8;
 const MLO_PORTAL_SHIFT = 16;
 const MLO_PORTAL_FLAG_ONE_WAY = 1;
+const MLO_PORTAL_FLAG_MIRROR = 4;
 const MLO_PORTAL_FLAG_HIDE_WHEN_DOOR_CLOSED = 64;
 const MLO_PORTAL_FLAG_LIGHT_BLEED = 8192;
 
@@ -2286,6 +2287,52 @@ export class DrawableStreamer {
             }
         }
         return result;
+    }
+
+    getVisibleMloMirrorPortal({ maxDistance = 80 } = {}) {
+        const camera = this._lastCamDataPos || [0, 0, 0];
+        let best = null;
+        for (const instance of this._mloInstancesLast || []) {
+            const parentGuid = Number(instance.parentGuid) >>> 0;
+            const visibility = this._visibleMloInteriors?.get?.(parentGuid);
+            if (!visibility) continue;
+            const def = this._mloDefs.get(String(instance.archHash));
+            for (const authoredPortal of (def?.portals || [])) {
+                const portal = this._runtimePortal(parentGuid, authoredPortal);
+                if (((Number(portal?.flags) >>> 0) & MLO_PORTAL_FLAG_MIRROR) === 0) continue;
+                const from = Number(portal?.roomFrom);
+                const to = Number(portal?.roomTo);
+                if (!visibility.visibleRooms?.has?.(from) && !visibility.visibleRooms?.has?.(to)) continue;
+                const corners = this._portalCornersData(instance, portal);
+                if (corners.length < 3) continue;
+                const center = [0, 1, 2].map((axis) => corners.reduce((sum, corner) => sum + corner[axis], 0) / corners.length);
+                const distance = Math.hypot(center[0] - camera[0], center[1] - camera[1], center[2] - camera[2]);
+                if (distance > Math.max(4, Number(maxDistance) || 80)) continue;
+                const direction = this._lastCamDataDir || [0, 0, -1];
+                const facing = distance > 1e-5
+                    ? ((center[0] - camera[0]) * direction[0]
+                        + (center[1] - camera[1]) * direction[1]
+                        + (center[2] - camera[2]) * direction[2]) / distance
+                    : 1;
+                if (facing < -0.15) continue;
+                const priority = Number(portal?.mirrorPriority) || 0;
+                const score = distance - priority * 2;
+                if (!best || score < best.score) {
+                    best = {
+                        parentGuid,
+                        archetypeHash: String(instance.archHash),
+                        portalIndex: Number(portal?.index) >>> 0,
+                        flags: Number(portal?.flags) >>> 0,
+                        mirrorPriority: priority,
+                        cornersData: corners,
+                        centerData: center,
+                        distance,
+                        score,
+                    };
+                }
+            }
+        }
+        return best;
     }
 
     setMloPortalDefinition(parentGuid, portalIndex, patch = {}) {

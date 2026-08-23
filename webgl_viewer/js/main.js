@@ -8,6 +8,7 @@ import { BuildingRenderer } from './building_renderer.js';
 import { ModelManager } from './model_manager.js';
 import { InstancedModelRenderer } from './instanced_model_renderer.js';
 import { DrawableStreamer } from './drawable_streamer.js';
+import { MloMirrorRenderer } from './mlo_mirror_renderer.js';
 import { TextureStreamer } from './texture_streamer.js';
 import { SkyRenderer } from './sky_renderer.js';
 import { joaat } from './joaat.js';
@@ -695,6 +696,9 @@ export class App {
             modelManager: this.modelManager,
             modelRenderer: this.instancedModelRenderer,
         });
+        this.mloMirrorRenderer = new MloMirrorRenderer(this.gl);
+        this._mloMirrorPortalKey = '';
+        this._mloMirrorNextRenderAt = 0;
         // When sharded manifest shards load, rebuild instance selection so real meshes pop in quickly.
         this.modelManager.onManifestUpdated = () => {
             if (this.drawableStreamer) this.drawableStreamer._dirty = true;
@@ -10508,6 +10512,73 @@ export class App {
                 this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
             } catch { /* ignore */ }
 
+            const mirrorPortal = this.drawableStreamer?.getVisibleMloMirrorPortal?.({ maxDistance: 70 }) || null;
+            const mirrorKey = mirrorPortal
+                ? `${mirrorPortal.parentGuid}:${mirrorPortal.portalIndex}`
+                : '';
+            const mirrorNow = performance.now();
+            const mirrorChanged = mirrorKey !== this._mloMirrorPortalKey;
+            const mirrorDue = !!mirrorPortal && (mirrorChanged || mirrorNow >= this._mloMirrorNextRenderAt);
+            if (mirrorDue && this.mloMirrorRenderer) {
+                const drivingFast = !!this.vehicleController?.inVehicle
+                    && Math.abs(Number(this.vehicleController?.vehicle?.speed) || 0) > 4;
+                this._mloMirrorPortalKey = mirrorKey;
+                this._mloMirrorNextRenderAt = mirrorNow + (drivingFast ? 100 : 50);
+                try {
+                    this.mloMirrorRenderer.renderReflection({
+                        portal: mirrorPortal,
+                        camera: this.camera,
+                        dataToViewMatrix: this._dataToViewMatrix || this.entityRenderer.modelMatrix,
+                        size: String(this.textureStreamer?.quality || 'medium').toLowerCase() === 'high' ? 768 : 512,
+                        clearColor: fogColorLinear,
+                        restoreFramebuffer: sceneFbo || null,
+                        restoreWidth: this.canvas.width,
+                        restoreHeight: this.canvas.height,
+                        drawScene: (reflectionViewProjection, reflectionCameraPosition, reflectionFbo, reflectionSize) => {
+                            this.instancedModelRenderer.render(reflectionViewProjection, true, reflectionCameraPosition, {
+                                enabled: this.atmosphereEnabled && this.fogEnabled,
+                                color: fogColorLinear,
+                                start: this.fogStart,
+                                end: this.fogEnd,
+                                lightDir: sunDir,
+                                lightColor,
+                                ambientIntensity,
+                                showWater: !!this.showWater,
+                                shadowEnabled: false,
+                                occlusion: null,
+                                coarseFrustumCulling: false,
+                                gpuFrustumCulling: true,
+                                gpuFrustumPadding: 8,
+                                fastStateRestore: true,
+                                alphaToCoverageEnabled: false,
+                                secondaryMapDistance: 80,
+                                projectedSizeSafeOnly: true,
+                                minProjectedRadiusPx: 0.8,
+                                maxAlphaDistance: 90,
+                                maxDecalDistance: 90,
+                                maxAdditiveDistance: 90,
+                                safeDrawBudgetOnly: true,
+                                groupDrawBudgetMinDistance: 18,
+                                maxDrawItems: 384,
+                                restoreFramebuffer: reflectionFbo,
+                                restoreViewportWidth: reflectionSize,
+                                restoreViewportHeight: reflectionSize,
+                                viewportWidth: reflectionSize,
+                                viewportHeight: reflectionSize,
+                                outputSrgb,
+                                wireframe: false,
+                            });
+                        },
+                    });
+                } catch (error) {
+                    this._mloMirrorNextRenderAt = mirrorNow + 2000;
+                    globalThis.__viewerWarnOnce?.('mlo-mirror-render', 'MLO planar reflection pass unavailable.', error);
+                }
+            } else if (!mirrorPortal) {
+                this._mloMirrorPortalKey = '';
+                this.mloMirrorRenderer.state = null;
+            }
+
             this._measureDrivingPhase('worldRender', () => this.instancedModelRenderer.render(this.camera.viewProjectionMatrix, this.showModels, this.camera.position, {
                 enabled: this.atmosphereEnabled && this.fogEnabled,
                 color: fogColorLinear,
@@ -10592,6 +10663,18 @@ export class App {
                 wireframe: objectsWireframe,
                 wireframeColor: [0.82, 0.92, 1.0],
             }));
+
+            if (mirrorPortal && this.mloMirrorRenderer?.state) {
+                try {
+                    this.mloMirrorRenderer.renderSurface(this.camera.viewProjectionMatrix, {
+                        restoreFramebuffer: sceneFbo || null,
+                        restoreWidth: this.canvas.width,
+                        restoreHeight: this.canvas.height,
+                    });
+                } catch (error) {
+                    globalThis.__viewerWarnOnce?.('mlo-mirror-surface', 'MLO mirror surface unavailable.', error);
+                }
+            }
 
             // Kick texture streaming even if the first few frames are mesh-bound or camera is far away.
             // This also helps diagnose "Tex cache stays 0" quickly: if we have submeshes with diffuse paths,
@@ -11467,6 +11550,7 @@ export class App {
         try { this.audioSystem?.destroy?.(); } catch { /* ignore */ }
         try { this.gtaHud?.destroy?.(); } catch { /* ignore */ }
         try { this.drawableStreamer?.destroy?.(); } catch { /* ignore */ }
+        try { this.mloMirrorRenderer?.destroy?.(); } catch { /* ignore */ }
         try { this._clearRemotePlayerMeshes(); } catch { /* ignore */ }
         try { this.remotePlayerRenderer?.destroy?.(); } catch { /* ignore */ }
         try { this._clearVehicleModelMesh(); } catch { /* ignore */ }

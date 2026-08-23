@@ -409,6 +409,17 @@ function main() {
     semanticRequirements.mirrorPortals = Number(semanticRequirements.portalFlags.mirror) || 0;
     semanticRequirements.dynamicCollisionImports = (descriptor?.mloRuntime?.collisionImports || [])
         .filter((item) => String(item?.placement || '').toLowerCase() === 'dynamic').length;
+    let mirrorRuntimeSource = '';
+    let mirrorIntegrationSource = '';
+    try { mirrorRuntimeSource = fs.readFileSync(new URL('../js/mlo_mirror_renderer.js', import.meta.url), 'utf8'); } catch { /* reported by capability gate */ }
+    try { mirrorIntegrationSource = fs.readFileSync(new URL('../js/main.js', import.meta.url), 'utf8'); } catch { /* reported by capability gate */ }
+    const hasMirrorScenePass = mirrorRuntimeSource.includes('renderReflection(')
+        && mirrorIntegrationSource.includes('mloMirrorRenderer.renderReflection(')
+        && mirrorIntegrationSource.includes('mloMirrorRenderer.renderSurface(');
+    const hasObliqueMirrorClip = mirrorRuntimeSource.includes('function obliqueProjection(')
+        && mirrorRuntimeSource.includes('clipPlane');
+    const hasPrioritizedMirrorTraversal = mirrorIntegrationSource.includes('getVisibleMloMirrorPortal')
+        && mirrorIntegrationSource.includes('_mloMirrorNextRenderAt');
     const runtimeCapabilities = {
         aperturePortalPvs: true,
         instanceScopedPortalMutations: true,
@@ -416,7 +427,9 @@ function main() {
         dynamicOrientedDoorCollision: true,
         entitySetActivation: true,
         authoredPhysicsMaterialResponse: true,
-        planarMirrorScenePass: false,
+        planarMirrorScenePass: hasMirrorScenePass,
+        obliqueMirrorPortalClipping: hasObliqueMirrorClip,
+        prioritizedMirrorTraversal: hasPrioritizedMirrorTraversal,
         dynamicCompoundYbn: false,
     };
     const unsupportedRequirements = [];
