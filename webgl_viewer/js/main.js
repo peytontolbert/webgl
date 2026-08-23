@@ -1857,17 +1857,28 @@ export class App {
     activateDemoDestination(destination = {}) {
         const x = Number(destination.x);
         const y = Number(destination.y);
-        if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+        const feetZ = Number(destination.z);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(feetZ)) return false;
 
-        // Switch movement ownership before the authoritative position arrives,
-        // otherwise spawnPedAt() clamps the player back into the Legion cell.
+        // All city MLOs retain the authored 4,000 x 4,000 city bounds. Older
+        // destination handling created isolated 150 m cells around interiors,
+        // which prevented walking back into the surrounding city.
+        const integratedCity = destination.integratedCity === true || String(destination.district || '') === 'demo';
         const halfSize = Math.max(80, Math.min(250, Number(destination.halfSize) || 150));
-        const bounds = {
-            minX: x - halfSize,
-            minY: y - halfSize,
-            maxX: x + halfSize,
-            maxY: y + halfSize,
-        };
+        const districtBounds = this._getSpawnDistrictBounds() || this._spawnDistrictDescriptor?.bounds;
+        const bounds = integratedCity && districtBounds
+            ? {
+                minX: Number(districtBounds.minX),
+                minY: Number(districtBounds.minY),
+                maxX: Number(districtBounds.maxX),
+                maxY: Number(districtBounds.maxY),
+            }
+            : {
+                minX: x - halfSize,
+                minY: y - halfSize,
+                maxX: x + halfSize,
+                maxY: y + halfSize,
+            };
         this._activeWorldExpansion = null;
         this._derivedTrackRegionActive = false;
         this.spawnDistrictDemo = true;
@@ -1882,10 +1893,21 @@ export class App {
                 return Number.isFinite(Number(raw)) ? Number(raw) + offset : NaN;
             });
         }
+
+        // The server result is authoritative for destination teleports. Bounds
+        // activation alone only changed what was streamed and left the ped at
+        // the previous location (normally Legion), making /recording and
+        // /walmart appear to alias /legion. Move both the ped and follow camera
+        // after installing the destination bounds so spawn constraints use the
+        // correct world region. The controlled-ped ground probe will settle the
+        // authored feet Z onto the YBN/interior floor as collision becomes ready.
+        const eye = Number(this.pedEyeHeightData) || 1.2;
+        this.spawnPedAt([x, y, feetZ + eye], { groundSource: 'destination_teleport' });
+        this._setGtaThirdPersonRigForPed?.(this._getSpawnDistrictCameraRig?.());
         this._runtimeSpawnInfo = {
             kind: 'destination_teleport',
             source: String(destination.label || destination.destination || 'destination'),
-            ped: [x, y, Number(destination.z) || 0, 0],
+            ped: [x, y, feetZ, 0],
         };
         this._startDestinationTextureWarmup();
         return true;
